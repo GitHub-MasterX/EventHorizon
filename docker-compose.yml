@@ -20,6 +20,9 @@ services:
       - ${TELNET_PORT}:${TELNET_PORT}
     volumes:
       - tarpit-sock:/tmp  # Share socket with prometheus-exporter
+      - ./logs:/var/log/eventhorizon
+    environment:
+      - EVENTHORIZON_SESSION_LOG=/var/log/eventhorizon/eventhorizon.jsonl
     ulimits:
       nofile:
         soft: "${TELNET_MAX_NO_CLIENTS}"
@@ -53,6 +56,9 @@ services:
       - ${MQTT_PORT}:${MQTT_PORT}
     volumes:
       - tarpit-sock:/tmp  # Share socket with prometheus-exporter
+      - ./logs:/var/log/eventhorizon
+    environment:
+      - EVENTHORIZON_SESSION_LOG=/var/log/eventhorizon/eventhorizon.jsonl
     ulimits:
       nofile:
         soft: "${MQTT_MAX_NO_CLIENTS}"
