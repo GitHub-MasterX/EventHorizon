@@ -59,6 +59,28 @@ void initializeStats(){
     statsMqtt.mostConcurrentConnections = 0;
 }
 
+static const char *mqttVersionString(enum MqttVersion version) {
+    switch (version) {
+        case V5:
+            return "v5";
+        case V311:
+            return "v3.1.1";
+        case V31:
+            return "v3.1";
+        default:
+            return "unknown";
+    }
+}
+
+static const char *boolString(bool value) {
+    return value ? "true" : "false";
+}
+
+static void emitMqttAction(struct mqttClient *client, const char *action, const char *fields) {
+    client->interactionDepth += 1;
+    session_events_write_action("mqtt", client->sessionId, action, fields);
+}
+
 bool decodeVarint(const uint8_t* buffer, uint32_t packetEnd, uint32_t* offset, uint32_t* value) {
     uint32_t result = 0;
     int multiplier = 1;
@@ -182,7 +204,9 @@ uint8_t readConnreq(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct
 
     // Username
     char username[256] = {0};
+    bool usernamePresent = false;
     if (connect_flags & 0b10000000) {
+        usernamePresent = true;
         if (offset + 2 > packetEnd) {
             fprintf(stderr, "Username flag supplied, but with no username");
             return 0x80;
@@ -203,7 +227,9 @@ uint8_t readConnreq(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct
 
     // Password
     char password[256] = {0};
+    bool passwordPresent = false;
     if (connect_flags & 0b1000000) {
+        passwordPresent = true;
         if (offset + 2 > packetEnd) {
             fprintf(stderr, "Password flag supplied, but with no password");
             return 0x80;
@@ -228,10 +254,21 @@ uint8_t readConnreq(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct
         SERVER_ID, username, password);
     printf("%s", msg);
     sendMetric(msg);
+
+    char fields[256];
+    snprintf(fields, sizeof(fields),
+        "\"mqtt_version\":\"%s\",\"client_id_present\":%s,\"username_present\":%s,\"password_present\":%s,\"keep_alive_seconds\":%d,\"interaction_depth\":%u",
+        mqttVersionString(client->version),
+        boolString(clientIdLength > 0),
+        boolString(usernamePresent),
+        boolString(passwordPresent),
+        keepAlive,
+        client->interactionDepth + 1);
+    emitMqttAction(client, "CONNECT", fields);
     return 0x00; // Success
 }
 
-void readSubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, enum MqttVersion version) {
+void readSubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct mqttClient* client) {
     // syslog(LOG_INFO, "Reading SUBSCRIBE request");
     if (offset + 2 > packetEnd) {
         fprintf(stderr, "SUBSCRIBE request too short for fixed header");
@@ -240,7 +277,7 @@ void readSubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, enum Mq
 
     // *packetId = (buffer[offset] << 8) | buffer[offset + 1];
     offset += 2; // packetId
-    if (version == V5) {
+    if (client->version == V5) {
         uint32_t varint;
         bool decodeSuccess = decodeVarint(buffer, packetEnd, &offset, &varint);
         if(!decodeSuccess) {
@@ -279,6 +316,12 @@ void readSubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, enum Mq
         SERVER_ID, topic, qos);
     printf("%s", msg);
     sendMetric(msg);
+
+    char fields[160];
+    snprintf(fields, sizeof(fields),
+        "\"qos\":%d,\"topic_present\":%s,\"interaction_depth\":%u",
+        qos, boolString(topicLength > 0), client->interactionDepth + 1);
+    emitMqttAction(client, "SUBSCRIBE", fields);
 
     // syslog(LOG_INFO, "Successfully read SUBSCRIBE request with topic: %s and QoS %d", topic, qos);
     return;
@@ -351,7 +394,7 @@ bool sendConnack(struct mqttClient* client, uint8_t reasonCode) {
     return true;
 }
 
-void readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, enum MqttVersion version) {
+void readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct mqttClient* client) {
     if (offset + 2 > packetEnd) {
         fprintf(stderr, "PUBLISH packet too short for topic length");
         return;
@@ -375,7 +418,7 @@ void readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, enum Mqtt
         offset += 2; // packet id (don't care)
     }
 
-    if(version == V5) {        
+    if(client->version == V5) {        
         uint32_t varint;
         bool decodeSuccess = decodeVarint(buffer, packetEnd, &offset, &varint);
         if(!decodeSuccess) {
@@ -399,6 +442,11 @@ void readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, enum Mqtt
     snprintf(msg, sizeof(msg), "%s PUBLISH %.100s %d\n",
         SERVER_ID, topic, qos);
     sendMetric(msg);
+    char fields[192];
+    snprintf(fields, sizeof(fields),
+        "\"qos\":%d,\"topic_present\":%s,\"payload_present\":%s,\"interaction_depth\":%u",
+        qos, boolString(topicLen > 0), boolString(payloadLen > 0), client->interactionDepth + 1);
+    emitMqttAction(client, "PUBLISH", fields);
     printf("PUBLISH received. Topic: %s, Payload: %s, QoS: %d\n", topic, payload, qos);
 }
 
@@ -597,6 +645,9 @@ void readPubrec(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct mqt
     snprintf(msg, sizeof(msg), "%s PUBREC\n",
         SERVER_ID);
     sendMetric(msg);
+    char fields[64];
+    snprintf(fields, sizeof(fields), "\"interaction_depth\":%u", client->interactionDepth + 1);
+    emitMqttAction(client, "PUBREC", fields);
     // syslog(LOG_INFO, "Received PUBREC for fd=%d and packet ID: %d\n", client->fd, packetId);
 }
 
@@ -658,7 +709,7 @@ bool sendPingresp(struct mqttClient* client) {
     return true;
 }
 
-void disconnectClient(struct mqttClient* client, int epollFd, long long now){
+void disconnectClient(struct mqttClient* client, int epollFd, long long now, const char *reason){
     long long wastedTime = now - client->timeOfConnection;
 
     char msg[256];
@@ -667,6 +718,7 @@ void disconnectClient(struct mqttClient* client, int epollFd, long long now){
 
     printf("%s", msg);
     sendMetric(msg);
+    session_events_write_disconnect("mqtt", client->sessionId, wastedTime, reason, client->interactionDepth);
 
     epoll_ctl(epollFd, EPOLL_CTL_DEL, client->fd, NULL);
     deleteClient(client);
@@ -779,6 +831,7 @@ int main(int argc, char* argv[]) {
     maxNoClients = atoi(argv[6]);
     // openlog("mqtt_tarpit", LOG_PID | LOG_CONS, LOG_USER);
     initializeStats();
+    session_events_init(NULL);
     setFdLimit(maxNoClients);
     signal(SIGPIPE, SIG_IGN);
     
@@ -841,11 +894,14 @@ int main(int argc, char* argv[]) {
                 statsMqtt.totalConnects += 1;
                 newClient->fd = clientFd;
                 strncpy(newClient->ipaddr, inet_ntoa(clientAddr.sin_addr), INET_ADDRSTRLEN);
+                newClient->ipaddr[INET_ADDRSTRLEN - 1] = '\0';
                 newClient->bytesWrittenToBuffer = 0;
                 newClient->lastActivityMs = now;
                 newClient->timeOfConnection = now;
                 newClient->lastPubrelMs = now;
                 newClient->keepAlive = 0; // Initial value. Will be updated after connect
+                newClient->interactionDepth = 0;
+                session_events_make_id(newClient->sessionId, sizeof(newClient->sessionId), "mqtt", newClient->timeOfConnection, newClient->fd);
                 memset(newClient->buffer, 0, sizeof(newClient->buffer)); // Maybe not necessary
                 // ev.events = EPOLLIN | EPOLLET;
                 // ev.data.fd = clientFd;
@@ -866,6 +922,7 @@ int main(int argc, char* argv[]) {
                     SERVER_ID, newClient->ipaddr);
                 printf("%s", msg);
                 sendMetric(msg);
+                session_events_write_connect("mqtt", newClient->sessionId);
                 // if(statsMqtt.mostConcurrentConnections < HASH_COUNT(clients)) {
                 //     statsMqtt.mostConcurrentConnections = HASH_COUNT(clients);
                 // }
@@ -885,7 +942,13 @@ int main(int argc, char* argv[]) {
                         continue;
                     }
                     fprintf(stderr, "Failed reading. Disconnecting client. error: %s", strerror(errno));
-                    disconnectClient(client, epollfd, now);
+                    disconnectClient(client, epollfd, now, "read_error");
+                    continue;
+                }
+
+                if(bytesRead == 0) {
+                    fprintf(stderr, "Client closed connection. Disconnecting client.");
+                    disconnectClient(client, epollfd, now, "client_disconnect");
                     continue;
                 }
 
@@ -893,7 +956,7 @@ int main(int argc, char* argv[]) {
 
                 if (client->bytesWrittenToBuffer >= sizeof(client->buffer)) {
                     fprintf(stderr, "Buffer full. Disconnecting client.");
-                    disconnectClient(client, epollfd, now);
+                    disconnectClient(client, epollfd, now, "read_error");
                     continue;
                 }
 
@@ -931,32 +994,32 @@ int main(int argc, char* argv[]) {
                             bool ackSuccess = sendConnack(client, reasonCodeConn);
                             if(!ackSuccess) {
                                 fprintf(stderr, "Disconnecting client due to CONNACK failure");
-                                disconnectClient(client, epollfd, now);
+                                disconnectClient(client, epollfd, now, "write_error");
                                 clientDisconnected = true;
                                 break;
                             }
                             pubSuccess = sendPublish(client, "$SYS/credentials", "username=admin password=admin");
                             if(!pubSuccess) {
                                 fprintf(stderr, "Disconnecting client due to publish failure");
-                                disconnectClient(client, epollfd, now);
+                                disconnectClient(client, epollfd, now, "write_error");
                                 clientDisconnected = true;
                             }
                             break;
                         case SUBSCRIBE:
-                            readSubscribe(client->buffer, packetEnd, packetStart, client->version);
+                            readSubscribe(client->buffer, packetEnd, packetStart, client);
                             break;
                         case PUBREC:
                             readPubrec(client->buffer, packetEnd, packetStart, client);
                             break;
                         case PUBLISH:
-                            readPublish(client->buffer, packetEnd, packetStart, client->version);
+                            readPublish(client->buffer, packetEnd, packetStart, client);
                             break;
                         case PUBCOMP:
                             readPubcomp(packetEnd, packetStart);
                             pubSuccess = sendPublish(client, "$SYS/confidential", "username=admin123 password=admin321");
                             if(!pubSuccess) {
                                 fprintf(stderr, "Disconnecting client due to publish failure");
-                                disconnectClient(client, epollfd, now);
+                                disconnectClient(client, epollfd, now, "write_error");
                                 clientDisconnected = true;
                             }
                             break;
@@ -967,14 +1030,14 @@ int main(int argc, char* argv[]) {
                             bool pingSuccess = sendPingresp(client);
                             if(!pingSuccess){
                                 fprintf(stderr, "Disconnecting client due to ping failure");
-                                disconnectClient(client, epollfd, now);
+                                disconnectClient(client, epollfd, now, "write_error");
                                 clientDisconnected = true;
                                 break;
                             }
                             break;
                         case DISCONNECT:
                             fprintf(stderr, "Disconnecting client due to receiving DISCONNECT");
-                            disconnectClient(client, epollfd, now);
+                            disconnectClient(client, epollfd, now, "client_disconnect");
                             clientDisconnected = true;
                             break;
                         default:
@@ -1005,7 +1068,7 @@ int main(int argc, char* argv[]) {
 
                 if(!success) {
                     fprintf(stderr, "Disconnecting client due to inactivity");
-                    disconnectClient(c, epollfd, now);
+                    disconnectClient(c, epollfd, now, "inactivity");
                     continue;
                 }
             }

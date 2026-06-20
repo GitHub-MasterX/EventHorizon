@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -g -pthread
 
-STRUCTS = shared/structs.c
+STRUCTS = shared/structs.c shared/session_events.c
 
 TELNET_TARGET = bin/telnet_pit
 UPNP_TARGET = bin/upnp_pit

@@ -62,6 +62,27 @@ void initializeStats(){
     statsTelnet.mostConcurrentConnections = 0;
 }
 
+static void emitSessionDisconnect(struct telnetAndUpnpClient *client, long long now, const char *reason) {
+    long long durationMs = now - client->sessionStartMs;
+    session_events_write_disconnect("telnet", client->sessionId, durationMs, reason, client->interactionDepth);
+}
+
+static void emitTelnetWriteEvent(struct telnetAndUpnpClient *client, const char *result, int delayMs, ssize_t bytesSent) {
+    char fields[256];
+    snprintf(fields, sizeof(fields),
+        "\"delay_ms\":%d,\"write_result\":\"%s\",\"bytes_sent\":%zd,\"interaction_depth\":%u",
+        delayMs, result, bytesSent > 0 ? bytesSent : 0, client->interactionDepth);
+    session_events_write_action("telnet", client->sessionId, "write", fields);
+}
+
+static void emitTelnetInputEvent(struct telnetAndUpnpClient *client, ssize_t bytesReceived) {
+    char fields[128];
+    snprintf(fields, sizeof(fields),
+        "\"bytes_received\":%zd,\"interaction_depth\":%u",
+        bytesReceived > 0 ? bytesReceived : 0, client->interactionDepth);
+    session_events_write_action("telnet", client->sessionId, "input", fields);
+}
+
 int main(int argc, char *argv[]) {
     setbuf(stdout, NULL);
 
@@ -76,6 +97,7 @@ int main(int argc, char *argv[]) {
     delay = atoi(argv[2]);
     maxNoClients = atoi(argv[3]);
     initializeStats();
+    session_events_init(NULL);
     setFdLimit(maxNoClients);
     signal(SIGPIPE, SIG_IGN); // Ignore
     queue_init(&clientQueueTelnet);
@@ -118,6 +140,7 @@ int main(int argc, char *argv[]) {
                         c->base.sendNext = now + delay;
                         c->base.timeConnected += delay;
                         statsTelnet.totalWastedTime += delay;
+                        emitTelnetWriteEvent(c, "would_block", delay, 0);
                         queue_append(&clientQueueTelnet, (struct baseClient *)c);
                     } else {
                         long long timeTrapped = c->base.timeConnected;
@@ -126,6 +149,8 @@ int main(int argc, char *argv[]) {
                             SERVER_ID, c->base.ipaddr, timeTrapped);
                         printf("%s", msg);
                         sendMetric(msg);
+                        emitTelnetWriteEvent(c, "write_error", delay, 0);
+                        emitSessionDisconnect(c, now, "write_error");
                         close(c->fd);
                         free(c);
                     }
@@ -133,6 +158,8 @@ int main(int argc, char *argv[]) {
                     c->base.sendNext = now + delay;
                     c->base.timeConnected += delay;
                     statsTelnet.totalWastedTime += delay;
+                    c->interactionDepth += 1;
+                    emitTelnetWriteEvent(c, "success", delay, out);
                     char buf[65];
                     ssize_t r=read(c->fd, buf, sizeof(buf)-1);
                     if(r<0){
@@ -143,6 +170,7 @@ int main(int argc, char *argv[]) {
                             SERVER_ID, c->base.ipaddr, c->base.timeConnected);
                         printf("%s", msg);
                         sendMetric(msg);
+                        emitSessionDisconnect(c, now, "client_disconnect");
                         close(c->fd);
                         free(c);
                         continue;
@@ -161,6 +189,8 @@ int main(int argc, char *argv[]) {
                         printf("%s", msg);
 
                         sendMetric(msg);
+                        c->interactionDepth += 1;
+                        emitTelnetInputEvent(c, r);
                     }
                     queue_append(&clientQueueTelnet, (struct baseClient *)c);
                 }
@@ -198,7 +228,10 @@ int main(int argc, char *argv[]) {
             newClient->fd = clientFd;
             newClient->base.sendNext = now + delay;
             newClient->base.timeConnected = 0;
+            newClient->sessionStartMs = now;
+            newClient->interactionDepth = 0;
             snprintf(newClient->base.ipaddr, INET_ADDRSTRLEN, "%s", inet_ntoa(clientAddr.sin_addr));
+            session_events_make_id(newClient->sessionId, sizeof(newClient->sessionId), "telnet", newClient->sessionStartMs, newClient->fd);
             queue_append(&clientQueueTelnet, (struct baseClient*)newClient);
 
             if(statsTelnet.mostConcurrentConnections < clientQueueTelnet.length) {
@@ -210,6 +243,7 @@ int main(int argc, char *argv[]) {
                 SERVER_ID, newClient->base.ipaddr);
             printf("%s", msg);
             sendMetric(msg);
+            session_events_write_connect("telnet", newClient->sessionId);
         }
     }
 

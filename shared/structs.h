@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <stdbool.h>
 #include "uthash.h"
+#include "session_events.h"
 
 enum Request { CONNECT, PING, SUBSCRIBE, PUBREC, DISCONNECT, PUBLISH, UNSUBSCRIBE, PUBCOMP, UNSUPPORTED_REQUEST };
 enum MqttVersion { V5, V311, V31 };
@@ -20,6 +21,9 @@ struct baseClient {
 struct telnetAndUpnpClient {
     struct baseClient base;
     int fd;
+    long long sessionStartMs;
+    unsigned int interactionDepth;
+    char sessionId[SESSION_EVENT_ID_LEN];
 };
 
 struct coapClient {
@@ -40,6 +44,8 @@ struct coapClient {
 struct mqttClient {
     int fd;
     char ipaddr[INET_ADDRSTRLEN];
+    char sessionId[SESSION_EVENT_ID_LEN];
+    unsigned int interactionDepth;
     uint8_t buffer[1024];
     uint16_t bytesWrittenToBuffer;
     uint16_t keepAlive;
