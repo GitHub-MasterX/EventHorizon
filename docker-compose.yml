@@ -40,6 +40,9 @@ services:
       - ${UPNP_HTTP_PORT}:${UPNP_HTTP_PORT}
     volumes:
       - tarpit-sock:/tmp  # Share socket with prometheus-exporter
+      - ./logs:/var/log/eventhorizon
+    environment:
+      - EVENTHORIZON_SESSION_LOG=/var/log/eventhorizon/eventhorizon.jsonl
     ulimits:
       nofile:
         soft: "${UPNP_MAX_NO_CLIENTS}"
@@ -75,6 +78,9 @@ services:
       - ${COAP_PORT}:${COAP_PORT}/udp
     volumes:
       - tarpit-sock:/tmp  # Share socket with prometheus-exporter
+      - ./logs:/var/log/eventhorizon
+    environment:
+      - EVENTHORIZON_SESSION_LOG=/var/log/eventhorizon/eventhorizon.jsonl
     command: ["start", "coap", "${COAP_PORT}", "${COAP_DELAY_MS}", "${COAP_ACK_TIMEOUT_MS}", "${COAP_MAX_RETRANSMIT}", "${COAP_MAX_NO_CLIENTS}"]
     depends_on:
       - prometheus-exporter

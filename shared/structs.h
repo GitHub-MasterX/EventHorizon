@@ -28,6 +28,8 @@ struct telnetAndUpnpClient {
 
 struct coapClient {
     struct baseClient base;
+    char sessionId[SESSION_EVENT_ID_LEN];
+    unsigned int interactionDepth;
     bool receivedAck;
     bool receivedRst;
     bool receivedGet;

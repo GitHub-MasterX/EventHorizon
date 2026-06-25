@@ -22,6 +22,61 @@ int ssdpPort;
 int delay;
 int maxNoClients;
 
+static pthread_mutex_t upnpEventCounterLock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned long upnpEventCounter = 0;
+
+static void makeUpnpEventId(char *buffer, size_t len, long long eventMs) {
+    pthread_mutex_lock(&upnpEventCounterLock);
+    unsigned long counter = ++upnpEventCounter;
+    pthread_mutex_unlock(&upnpEventCounterLock);
+    session_events_make_request_id(buffer, len, "upnp", counter, eventMs);
+}
+
+static const char *httpRouteClass(const char *method, const char *url) {
+    if (strcmp(method, "GET") == 0 && strcmp(url, "/hue-device.xml") == 0) {
+        return "device_description";
+    }
+    if (!method[0] || !url[0]) {
+        return "malformed";
+    }
+    return "other";
+}
+
+static const char *httpMethodClass(const char *method) {
+    return strcmp(method, "GET") == 0 ? "GET" : "other";
+}
+
+static void emitUpnpAction(const char *eventId, const char *action, const char *fields) {
+    session_events_write_action("upnp", eventId, action, fields);
+}
+
+static ssize_t readHttpRequestWithTimeout(int clientFd, char *buffer, size_t len, int timeoutMs) {
+    struct pollfd clientPoll;
+    memset(&clientPoll, 0, sizeof(clientPoll));
+    clientPoll.fd = clientFd;
+    clientPoll.events = POLLIN;
+
+    int ready;
+    do {
+        ready = poll(&clientPoll, 1, timeoutMs);
+    } while (ready < 0 && errno == EINTR);
+
+    if (ready <= 0 || !(clientPoll.revents & POLLIN)) {
+        return 0;
+    }
+
+    ssize_t bytesReceived;
+    do {
+        bytesReceived = read(clientFd, buffer, len);
+    } while (bytesReceived < 0 && errno == EINTR);
+
+    if (bytesReceived < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return 0;
+    }
+
+    return bytesReceived;
+}
+
 // Can use Chunked Transfer Coding from rfc 2616 section 3.6.1
 // Required to be a HTTP GET request (Section 2.1 from specifications)
 const char *FAKE_DEVICE_DESCRIPTION =
@@ -156,21 +211,38 @@ void *ssdpListener(void *arg) {
     while (1) {
         memset(buffer, 0, sizeof(buffer));
 
-        if (recvfrom(sockFd, buffer, sizeof(buffer), 0,
-                     (struct sockaddr *)&client_addr, &addrLen) <= 0) {
+        ssize_t bytesReceived = recvfrom(sockFd, buffer, sizeof(buffer), 0,
+                     (struct sockaddr *)&client_addr, &addrLen);
+        if (bytesReceived <= 0) {
             fprintf(stderr, "Error receiving SSDP request");
             continue;
         }
+        long long requestStartMs = currentTimeMs();
+
+        char eventId[SESSION_EVENT_ID_LEN];
+        makeUpnpEventId(eventId, sizeof(eventId), requestStartMs);
 
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, INET_ADDRSTRLEN);
         
         char msg[256];
         int isMSearch = strstr(buffer, "M-SEARCH") != NULL;
+        char fields[256];
+        snprintf(fields, sizeof(fields),
+            "\"transport\":\"udp\",\"bytes_received\":%zd,\"upnp_request_type\":\"%s\",\"handling_duration_ms\":0",
+            bytesReceived, isMSearch ? "m_search" : "unknown");
+        emitUpnpAction(eventId, isMSearch ? "ssdp_probe" : "unknown", fields);
 
         if (isMSearch) {
-            sendto(sockFd, response, strlen(response), 0,
+            ssize_t bytesSent = sendto(sockFd, response, strlen(response), 0,
                 (struct sockaddr *)&client_addr, sizeof(client_addr));
+            long long handlingDurationMs = currentTimeMs() - requestStartMs;
+            snprintf(fields, sizeof(fields),
+                "\"transport\":\"udp\",\"bytes_sent\":%zd,\"write_result\":\"%s\",\"handling_duration_ms\":%lld",
+                bytesSent > 0 ? bytesSent : 0,
+                bytesSent >= 0 ? "success" : "write_error",
+                handlingDurationMs);
+            emitUpnpAction(eventId, "response_sent", fields);
             
             snprintf(msg, sizeof(msg), "%s M-SEARCH %s\n", 
                 SERVER_ID, client_ip);
@@ -183,7 +255,7 @@ void *ssdpListener(void *arg) {
         sendMetric(msg);
     }
 
-    free(ssdpResponse);
+    free(response);
     close(sockFd);
     return NULL;
 }
@@ -228,12 +300,17 @@ void *httpServer(void *arg) {
                 write(c->fd, chunk_size, strlen(chunk_size));
                 write(c->fd, FAKE_CHUNK, strlen(FAKE_CHUNK));
                 ssize_t out = write(c->fd, "\r\n", 2);
+                char fields[256];
                 
                 if (out == -1) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) { // Avoid blocking
                         c->base.sendNext = now + delay;
                         c->base.timeConnected += delay;
                         statsUpnp.totalWastedTime += delay;
+                        snprintf(fields, sizeof(fields),
+                            "\"transport\":\"tcp\",\"write_result\":\"would_block\",\"bytes_sent\":0,\"interaction_depth\":%u",
+                            c->interactionDepth);
+                        emitUpnpAction(c->sessionId, "response_chunk_sent", fields);
                         queue_append(&clientQueueUpnp, (struct baseClient *)c);
                     } else {
                         long long timeTrapped = c->base.timeConnected;
@@ -244,6 +321,10 @@ void *httpServer(void *arg) {
                         printf("%s", msg);
                         sendMetric(msg);
 
+                        snprintf(fields, sizeof(fields),
+                            "\"transport\":\"tcp\",\"write_result\":\"write_error\",\"bytes_sent\":0,\"interaction_depth\":%u,\"handling_duration_ms\":%lld",
+                            c->interactionDepth, now - c->sessionStartMs);
+                        emitUpnpAction(c->sessionId, "response_stream_closed", fields);
                         close(c->fd);
                         free(c);
                     }
@@ -251,6 +332,11 @@ void *httpServer(void *arg) {
                     c->base.sendNext = now + delay;
                     c->base.timeConnected += delay;
                     statsUpnp.totalWastedTime += delay;
+                    c->interactionDepth += 1;
+                    snprintf(fields, sizeof(fields),
+                        "\"transport\":\"tcp\",\"write_result\":\"success\",\"bytes_sent\":%zd,\"interaction_depth\":%u",
+                        out > 0 ? out : 0, c->interactionDepth);
+                    emitUpnpAction(c->sessionId, "response_chunk_sent", fields);
                     queue_append(&clientQueueUpnp, (struct baseClient *)c);
                 }
             } else {
@@ -275,6 +361,7 @@ void *httpServer(void *arg) {
             }
             statsUpnp.totalHttpRequests += 1;
             fcntl(clientFd, F_SETFL, O_NONBLOCK); // Set non-blocking mode
+            long long requestStartMs = now;
             struct telnetAndUpnpClient* newClient = malloc(sizeof(struct telnetAndUpnpClient));
             if (newClient == NULL) {
                 fprintf(stderr, "Out of memory");
@@ -284,9 +371,24 @@ void *httpServer(void *arg) {
 
             char buffer[1024];
             memset(buffer, 0, 1024);
-            read(clientFd, buffer, 1024-1);
-            char method[20], url[128];
-            sscanf(buffer, "%19s %255s", method, url);
+            ssize_t bytesReceived = readHttpRequestWithTimeout(clientFd, buffer, sizeof(buffer) - 1, 1000);
+            char method[20] = "";
+            char url[128] = "";
+            if (bytesReceived > 0) {
+                sscanf(buffer, "%19s %127s", method, url);
+            }
+
+            newClient->sessionStartMs = requestStartMs;
+            newClient->interactionDepth = 0;
+            makeUpnpEventId(newClient->sessionId, sizeof(newClient->sessionId), requestStartMs);
+
+            char fields[256];
+            snprintf(fields, sizeof(fields),
+                "\"transport\":\"tcp\",\"bytes_received\":%zd,\"http_method\":\"%s\",\"route\":\"%s\",\"handling_duration_ms\":0",
+                bytesReceived > 0 ? bytesReceived : 0,
+                httpMethodClass(method),
+                httpRouteClass(method, url));
+            emitUpnpAction(newClient->sessionId, "http_request_received", fields);
 
             if (strcmp(url, "/hue-device.xml") == 0 && strcmp(method, "GET") == 0) {
                 // statsUpnp.totalXmlRequests += 1;
@@ -300,21 +402,34 @@ void *httpServer(void *arg) {
                 if(out <= 0){
                     fprintf(stderr, "failed to write response header to %s\n", 
                         inet_ntoa(clientAddr.sin_addr));
+                    snprintf(fields, sizeof(fields),
+                        "\"transport\":\"tcp\",\"write_result\":\"write_error\",\"bytes_sent\":0,\"handling_duration_ms\":%lld,\"interaction_depth\":%u",
+                        currentTimeMs() - requestStartMs, newClient->interactionDepth);
+                    emitUpnpAction(newClient->sessionId, "response_sent", fields);
                     close(clientFd);
                     free(newClient);
                     continue;
                 }
 
                 char chunk_size[10];
-                snprintf(chunk_size, sizeof(FAKE_DEVICE_DESCRIPTION), "%X\r\n", (int)strlen(FAKE_DEVICE_DESCRIPTION));
-                write(clientFd, chunk_size, strlen(chunk_size));
-                write(clientFd, FAKE_DEVICE_DESCRIPTION, strlen(FAKE_DEVICE_DESCRIPTION));
-                write(clientFd, "\r\n", 2);
+                snprintf(chunk_size, sizeof(chunk_size), "%X\r\n", (int)strlen(FAKE_DEVICE_DESCRIPTION));
+                ssize_t chunkSizeOut = write(clientFd, chunk_size, strlen(chunk_size));
+                ssize_t bodyOut = write(clientFd, FAKE_DEVICE_DESCRIPTION, strlen(FAKE_DEVICE_DESCRIPTION));
+                ssize_t terminatorOut = write(clientFd, "\r\n", 2);
+                ssize_t totalBytesSent = out;
+                if (chunkSizeOut > 0) totalBytesSent += chunkSizeOut;
+                if (bodyOut > 0) totalBytesSent += bodyOut;
+                if (terminatorOut > 0) totalBytesSent += terminatorOut;
 
                 newClient->fd = clientFd;
                 newClient->base.sendNext = now + delay;
                 newClient->base.timeConnected = 0;
                 snprintf(newClient->base.ipaddr, sizeof(newClient->base.ipaddr), "%s", inet_ntoa(clientAddr.sin_addr));
+                newClient->interactionDepth += 1;
+                snprintf(fields, sizeof(fields),
+                    "\"transport\":\"tcp\",\"write_result\":\"success\",\"bytes_sent\":%zd,\"handling_duration_ms\":%lld,\"interaction_depth\":%u",
+                    totalBytesSent, currentTimeMs() - requestStartMs, newClient->interactionDepth);
+                emitUpnpAction(newClient->sessionId, "response_sent", fields);
                 queue_append(&clientQueueUpnp, (struct baseClient*)newClient);
 
                 if(statsUpnp.mostConcurrentConnections < clientQueueUpnp.length) {
@@ -339,6 +454,12 @@ void *httpServer(void *arg) {
                 printf("%s", msg);
                 sendMetric(msg);
 
+                snprintf(fields, sizeof(fields),
+                    "\"transport\":\"tcp\",\"http_method\":\"%s\",\"route\":\"%s\",\"handling_duration_ms\":%lld",
+                    httpMethodClass(method),
+                    httpRouteClass(method, url),
+                    currentTimeMs() - requestStartMs);
+                emitUpnpAction(newClient->sessionId, "unknown_request", fields);
                 close(clientFd);
                 free(newClient);
                 continue;
@@ -379,6 +500,7 @@ int main(int argc, char* argv[]) {
     maxNoClients = atoi(argv[4]);
     // openlog("upnp_tarpit", LOG_PID | LOG_CONS, LOG_USER);
     initializeStats();
+    session_events_init(NULL);
     setFdLimit(maxNoClients);
     pthread_t ssdpThread, httpThread;
     pthread_create(&ssdpThread, NULL, ssdpListener, NULL);

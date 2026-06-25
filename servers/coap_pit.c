@@ -34,6 +34,64 @@ int ACK_TIMEOUT = 2000;
 int MAX_RETRANSMIT = 4;
 int maxNoClients = 4096;
 int sockFd;
+static unsigned long coapEventCounter = 0;
+
+static void makeCoapEventId(char *buffer, size_t len, long long eventMs) {
+    coapEventCounter += 1;
+    session_events_make_request_id(buffer, len, "coap", coapEventCounter, eventMs);
+}
+
+static const char *coapTypeName(uint8_t type) {
+    switch (type) {
+        case TYPE_CONFIRMABLE:
+            return "confirmable";
+        case TYPE_NON_CONFIRMABLE:
+            return "non_confirmable";
+        case TYPE_ACK:
+            return "ack";
+        case TYPE_RST:
+            return "reset";
+        default:
+            return "unknown";
+    }
+}
+
+static const char *coapMethodName(uint8_t class, uint8_t detail) {
+    if (class != CLASS_REQUEST) {
+        return "non_request";
+    }
+
+    switch (detail) {
+        case DETAIL_GET:
+            return "GET";
+        case DETAIL_POST:
+            return "POST";
+        case DETAIL_PUT:
+            return "PUT";
+        case DETAIL_DELETE:
+            return "DELETE";
+        default:
+            return "unknown";
+    }
+}
+
+static void emitCoapAction(const char *eventId, const char *action, const char *fields) {
+    session_events_write_action("coap", eventId, action, fields);
+}
+
+static void emitCoapSendEvent(const char *eventId, const char *responseKind,
+                              int bytesSent, long long handlingDurationMs,
+                              unsigned int interactionDepth) {
+    char fields[256];
+    snprintf(fields, sizeof(fields),
+        "\"transport\":\"udp\",\"response_kind\":\"%s\",\"bytes_sent\":%d,\"write_result\":\"%s\",\"handling_duration_ms\":%lld,\"interaction_depth\":%u",
+        responseKind,
+        bytesSent > 0 ? bytesSent : 0,
+        bytesSent >= 0 ? "success" : "write_error",
+        handlingDurationMs < 0 ? 0 : handlingDurationMs,
+        interactionDepth);
+    emitCoapAction(eventId, "response_sent", fields);
+}
 
 void addClient(struct coapClient *client) {
     HASH_ADD(hh, clients, clientAddr, sizeof(struct sockaddr_in), client);
@@ -141,6 +199,7 @@ int main(int argc, char* argv[]) {
     maxNoClients = atoi(argv[5]);
     struct sockaddr_in serverAddr;
     heap_init(&clientQueueCoap, maxNoClients);
+    session_events_init(NULL);
 
     if ((sockFd = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         fprintf(stderr, "SSDP Socket creation failed");
@@ -188,9 +247,13 @@ int main(int argc, char* argv[]) {
                         c->retransmits += 1;
 
                         if(!c->receivedAck) {
-                            sendCoapBlockResponse(c->messageId, c->token, c->tkl, &c->blockNumber, &c->clientAddr, c->addrLen);
+                            int out = sendCoapBlockResponse(c->messageId, c->token, c->tkl, &c->blockNumber, &c->clientAddr, c->addrLen);
+                            c->interactionDepth += 1;
+                            emitCoapSendEvent(c->sessionId, "block2_retransmit", out, 0, c->interactionDepth);
                         } else {
-                            sendPing(c->messageId, &c->clientAddr, c->addrLen);
+                            int out = sendPing(c->messageId, &c->clientAddr, c->addrLen);
+                            c->interactionDepth += 1;
+                            emitCoapSendEvent(c->sessionId, "ping_retransmit", out, 0, c->interactionDepth);
                         }
 
                         // printf("Token contents: ");
@@ -215,11 +278,15 @@ int main(int argc, char* argv[]) {
                 } 
                 
                 if (c->receivedGet) {
-                    sendCoapBlockResponse(c->messageId, c->token, c->tkl, &c->blockNumber, &c->clientAddr, c->addrLen);
+                    int out = sendCoapBlockResponse(c->messageId, c->token, c->tkl, &c->blockNumber, &c->clientAddr, c->addrLen);
+                    c->interactionDepth += 1;
+                    emitCoapSendEvent(c->sessionId, "block2", out, 0, c->interactionDepth);
                     c->blockNumber += 1;
                     c->receivedAck = false;
                 } else if (c->receivedRst) {
-                    sendPing(c->messageId, &c->clientAddr, c->addrLen);
+                    int out = sendPing(c->messageId, &c->clientAddr, c->addrLen);
+                    c->interactionDepth += 1;
+                    emitCoapSendEvent(c->sessionId, "ping", out, 0, c->interactionDepth);
                     c->receivedRst = false;
                 } 
                 
@@ -246,8 +313,18 @@ int main(int argc, char* argv[]) {
             char buffer[1024];
 
             int len = recvfrom(sockFd, buffer, MAX_BUF_LEN, 0, (struct sockaddr *)&clientAddr, &addrLen);
+            long long requestStartMs = currentTimeMs();
             if(len < 4) {
                 // Too short or something went wrong
+                if (len > 0) {
+                    char eventId[SESSION_EVENT_ID_LEN];
+                    char fields[256];
+                    makeCoapEventId(eventId, sizeof(eventId), requestStartMs);
+                    snprintf(fields, sizeof(fields),
+                        "\"transport\":\"udp\",\"bytes_received\":%d,\"malformed_reason\":\"too_short\",\"handling_duration_ms\":0",
+                        len);
+                    emitCoapAction(eventId, "malformed_request", fields);
+                }
                 continue;
             }
 
@@ -282,6 +359,14 @@ int main(int argc, char* argv[]) {
 
             if (tkl > 8 || len < 4 + tkl) {
                 // Malformed request. Send 4.00 Bad Request
+                char eventId[SESSION_EVENT_ID_LEN];
+                char fields[256];
+                makeCoapEventId(eventId, sizeof(eventId), requestStartMs);
+                snprintf(fields, sizeof(fields),
+                    "\"transport\":\"udp\",\"bytes_received\":%d,\"coap_type\":\"%s\",\"coap_method\":\"%s\",\"message_id\":%u,\"token_length\":%u,\"malformed_reason\":\"invalid_token_length\",\"handling_duration_ms\":0",
+                    len, coapTypeName(type), coapMethodName(class, detail), msgId, tkl);
+                emitCoapAction(eventId, "malformed_request", fields);
+
                 uint8_t response[4];
                 uint8_t resp_type = (type == TYPE_CONFIRMABLE) ? TYPE_ACK : TYPE_NON_CONFIRMABLE;
             
@@ -291,11 +376,19 @@ int main(int argc, char* argv[]) {
                 response[3] = msgId & 0b11111111;
                 int resp_len = 4;
 
-                sendto(sockFd, response, resp_len, 0, (struct sockaddr *)&clientAddr, addrLen);
+                int out = sendto(sockFd, response, resp_len, 0, (struct sockaddr *)&clientAddr, addrLen);
+                emitCoapSendEvent(eventId, "bad_request", out, currentTimeMs() - requestStartMs, 0);
                 continue;
             } 
             else if (version != 1){
                 // Must be silently ignored
+                char eventId[SESSION_EVENT_ID_LEN];
+                char fields[256];
+                makeCoapEventId(eventId, sizeof(eventId), requestStartMs);
+                snprintf(fields, sizeof(fields),
+                    "\"transport\":\"udp\",\"bytes_received\":%d,\"coap_version\":%u,\"malformed_reason\":\"unsupported_version\",\"handling_duration_ms\":0",
+                    len, version);
+                emitCoapAction(eventId, "malformed_request", fields);
                 continue;
             } else if (tkl > 0) {
                 memcpy(token, &buffer[4], tkl);
@@ -317,12 +410,15 @@ int main(int argc, char* argv[]) {
                 client->base.timeConnected = 0;
                 client->blockNumber = 0;
                 client->tkl = tkl;
+                client->interactionDepth = 0;
                 client->retransmits = 0;
                 client->messageId = 1;
                 client->receivedAck = true;
                 client->receivedRst = true;
+                client->receivedGet = false;
                 memcpy(client->token, token, 8);
                 snprintf(client->base.ipaddr, INET_ADDRSTRLEN, "%s", inet_ntoa(clientAddr.sin_addr));
+                makeCoapEventId(client->sessionId, sizeof(client->sessionId), requestStartMs);
                 heap_insert(&clientQueueCoap, (struct baseClient*)client);
                 addClient(client);
 
@@ -332,6 +428,19 @@ int main(int argc, char* argv[]) {
                 printf("%s", msg);
                 sendMetric(msg);
             }
+
+            client->interactionDepth += 1;
+            char fields[256];
+            snprintf(fields, sizeof(fields),
+                "\"transport\":\"udp\",\"bytes_received\":%d,\"coap_type\":\"%s\",\"coap_method\":\"%s\",\"message_id\":%u,\"token_present\":%s,\"token_length\":%u,\"handling_duration_ms\":0,\"interaction_depth\":%u",
+                len,
+                coapTypeName(type),
+                coapMethodName(class, detail),
+                msgId,
+                tkl > 0 ? "true" : "false",
+                tkl,
+                client->interactionDepth);
+            emitCoapAction(client->sessionId, "request_received", fields);
             
             if (type == TYPE_RST) {
                 client->receivedRst = true;
@@ -356,6 +465,8 @@ int main(int argc, char* argv[]) {
 
                 int out = sendto(sockFd, ack, sizeof(ack), 0, (struct sockaddr *)&clientAddr, addrLen);
                 printf("ACK sendto: %d with messageId=%u\n", out, msgId);
+                client->interactionDepth += 1;
+                emitCoapSendEvent(client->sessionId, "ack", out, currentTimeMs() - requestStartMs, client->interactionDepth);
             }
         }
     }
