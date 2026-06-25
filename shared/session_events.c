@@ -3,6 +3,7 @@
 #include "session_events.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,7 @@
 
 static FILE *session_events_file = NULL;
 static int session_events_open_attempted = 0;
+static pthread_mutex_t session_events_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static const char *value_or_default(const char *value, const char *fallback) {
     return value && value[0] ? value : fallback;
@@ -83,7 +85,7 @@ static void current_iso8601_utc(char *buffer, size_t len) {
              ts.tv_nsec / 1000000L);
 }
 
-void session_events_init(const char *path) {
+static void session_events_init_unlocked(const char *path) {
     const char *configured_path = path;
 
     if (session_events_file || session_events_open_attempted) {
@@ -105,9 +107,21 @@ void session_events_init(const char *path) {
     }
 }
 
+void session_events_init(const char *path) {
+    pthread_mutex_lock(&session_events_lock);
+    session_events_init_unlocked(path);
+    pthread_mutex_unlock(&session_events_lock);
+}
+
 void session_events_make_id(char *buffer, size_t len, const char *protocol, long long start_ms, int fd) {
     snprintf(buffer, len, "%s-%ld-%d-%lld",
              value_or_default(protocol, "unknown"), (long)getpid(), fd, start_ms);
+}
+
+void session_events_make_request_id(char *buffer, size_t len, const char *protocol,
+                                    unsigned long counter, long long event_ms) {
+    snprintf(buffer, len, "%s-%ld-%lu-%lld",
+             value_or_default(protocol, "unknown"), (long)getpid(), counter, event_ms);
 }
 
 static void write_common_fields(const char *event_type, const char *protocol, const char *session_id) {
@@ -129,20 +143,25 @@ static void write_common_fields(const char *event_type, const char *protocol, co
 }
 
 void session_events_write_connect(const char *protocol, const char *session_id) {
-    session_events_init(NULL);
+    pthread_mutex_lock(&session_events_lock);
+    session_events_init_unlocked(NULL);
     if (!session_events_file) {
+        pthread_mutex_unlock(&session_events_lock);
         return;
     }
 
     write_common_fields("connect", protocol, session_id);
     fputs("}\n", session_events_file);
     fflush(session_events_file);
+    pthread_mutex_unlock(&session_events_lock);
 }
 
 void session_events_write_action(const char *protocol, const char *session_id,
                                  const char *action, const char *fields_json) {
-    session_events_init(NULL);
+    pthread_mutex_lock(&session_events_lock);
+    session_events_init_unlocked(NULL);
     if (!session_events_file) {
+        pthread_mutex_unlock(&session_events_lock);
         return;
     }
 
@@ -155,13 +174,16 @@ void session_events_write_action(const char *protocol, const char *session_id,
     }
     fputs("}\n", session_events_file);
     fflush(session_events_file);
+    pthread_mutex_unlock(&session_events_lock);
 }
 
 void session_events_write_disconnect(const char *protocol, const char *session_id,
                                      long long duration_ms, const char *disconnect_reason,
                                      unsigned int interaction_depth) {
-    session_events_init(NULL);
+    pthread_mutex_lock(&session_events_lock);
+    session_events_init_unlocked(NULL);
     if (!session_events_file) {
+        pthread_mutex_unlock(&session_events_lock);
         return;
     }
 
@@ -175,4 +197,5 @@ void session_events_write_disconnect(const char *protocol, const char *session_i
     write_json_string(session_events_file, value_or_default(disconnect_reason, "unknown"));
     fputs("}\n", session_events_file);
     fflush(session_events_file);
+    pthread_mutex_unlock(&session_events_lock);
 }
