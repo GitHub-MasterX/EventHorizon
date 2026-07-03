@@ -1,0 +1,34 @@
+services:
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: eventhorizon-loki
+    command: ["-config.file=/etc/loki/eventhorizon-config.yaml"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ./loki/eventhorizon-config.yaml:/etc/loki/eventhorizon-config.yaml:ro
+      - loki-storage:/loki
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.103.0
+    container_name: eventhorizon-otel-collector
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    restart: unless-stopped
+    volumes:
+      - ./logs:/var/log/eventhorizon:ro
+      - ./otelcol/eventhorizon-logs-to-loki.yaml:/etc/otelcol-contrib/config.yaml:ro
+    depends_on:
+      - loki
+      - telnet_pit
+      - mqtt_pit
+      - upnp_pit
+      - coap_pit
+
+  grafana:
+    depends_on:
+      - prometheus
+      - loki
+
+volumes:
+  loki-storage:

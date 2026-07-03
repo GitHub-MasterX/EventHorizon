@@ -1,0 +1,43 @@
+receivers:
+  filelog/eventhorizon:
+    include:
+      - /var/log/eventhorizon/eventhorizon.jsonl
+    start_at: beginning
+    operators:
+      - type: json_parser
+        parse_from: body
+        timestamp:
+          parse_from: attributes.ts
+          layout_type: strptime
+          layout: "%Y-%m-%dT%H:%M:%S.%LZ"
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 128
+    spike_limit_mib: 32
+  resource/eventhorizon:
+    attributes:
+      - key: service.name
+        value: eventhorizon
+        action: upsert
+      - key: deployment.environment
+        value: lab
+        action: upsert
+      - key: service.instance.id
+        value: eventhorizon-compose
+        action: upsert
+  batch: {}
+
+exporters:
+  debug:
+    verbosity: basic
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+
+service:
+  pipelines:
+    logs/eventhorizon:
+      receivers: [filelog/eventhorizon]
+      processors: [memory_limiter, resource/eventhorizon, batch]
+      exporters: [debug, otlphttp/loki]
