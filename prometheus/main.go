@@ -4,12 +4,12 @@ import (
 	// "bufio"
 	"fmt"
 	"log"
-	"net/netip"
 	"net"
 	"net/http"
-	"strings"
+	"net/netip"
 	"os"
 	"strconv"
+	"strings"
 
 	// "github.com/oschwald/geoip2-golang"
 	"github.com/oschwald/maxminddb-golang/v2"
@@ -18,30 +18,36 @@ import (
 )
 
 type metrics struct {
-	totalConnects  *prometheus.CounterVec
+	totalConnects    *prometheus.CounterVec
 	totalTrappedTime *prometheus.CounterVec
-	activeClients *prometheus.GaugeVec
-	clients *prometheus.CounterVec
+	activeClients    *prometheus.GaugeVec
+	clients          *prometheus.CounterVec
 
-	upnpOtherHttpRequests *prometheus.CounterVec
-	upnpMSearchRequests *prometheus.CounterVec
+	completedSessions *prometheus.CounterVec
+	sessionDuration   *prometheus.HistogramVec
+	earlyDisconnect   *prometheus.CounterVec
+	firstResponseExit *prometheus.CounterVec
+	protocolActions   *prometheus.CounterVec
+
+	upnpOtherHttpRequests  *prometheus.CounterVec
+	upnpMSearchRequests    *prometheus.CounterVec
 	upnpNonMSearchRequests *prometheus.CounterVec
 
 	mqttMalformedConnect prometheus.Counter
-	mqttConnectVersions *prometheus.CounterVec
-	mqttSubscribeTopics *prometheus.CounterVec
-	mqttCredentials *prometheus.CounterVec
-	telnetInput *prometheus.CounterVec
-	mqttPublishTopics *prometheus.CounterVec
-	mqttConacks prometheus.Counter
-	mqttUnsubscribe prometheus.Counter
-	mqttPubrec prometheus.Counter
+	mqttConnectVersions  *prometheus.CounterVec
+	mqttSubscribeTopics  *prometheus.CounterVec
+	mqttCredentials      *prometheus.CounterVec
+	telnetInput          *prometheus.CounterVec
+	mqttPublishTopics    *prometheus.CounterVec
+	mqttConacks          prometheus.Counter
+	mqttUnsubscribe      prometheus.Counter
+	mqttPubrec           prometheus.Counter
 }
 
 // Global variable
 var db *maxminddb.Reader
 
-func NewMetrics() *metrics {
+func newMetrics(registerer prometheus.Registerer) *metrics {
 	m := &metrics{
 		totalConnects: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "total_connects",
@@ -58,7 +64,28 @@ func NewMetrics() *metrics {
 		clients: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "tarpitted_clients",
 			Help: "Connected clients",
-		}, []string{/*"ip", */"server","country", "latitude", "longitude"}),
+		}, []string{ /*"ip", */ "server", "country", "latitude", "longitude"}),
+		completedSessions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "eventhorizon_completed_sessions_total",
+			Help: "Total completed EventHorizon sessions",
+		}, []string{"protocol", "disconnect_reason"}),
+		sessionDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "eventhorizon_session_duration_ms",
+			Help:    "Duration of completed EventHorizon sessions in milliseconds",
+			Buckets: []float64{10, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 60000},
+		}, []string{"protocol"}),
+		earlyDisconnect: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "eventhorizon_early_disconnect_total",
+			Help: "Completed sessions with zero meaningful client interactions",
+		}, []string{"protocol"}),
+		firstResponseExit: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "eventhorizon_first_response_exit_total",
+			Help: "Completed sessions that exited after the first response and before another meaningful client interaction",
+		}, []string{"protocol"}),
+		protocolActions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "eventhorizon_protocol_actions_total",
+			Help: "Total bounded protocol actions observed by EventHorizon",
+		}, []string{"protocol", "action"}),
 		// ---------------
 		upnpOtherHttpRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "upnp_other_http_requests",
@@ -110,11 +137,16 @@ func NewMetrics() *metrics {
 			Help: "Total PUBREC requests for MQTT",
 		}),
 	}
-	prometheus.MustRegister(m.totalConnects, m.totalTrappedTime, m.activeClients, m.clients,
+	registerer.MustRegister(m.totalConnects, m.totalTrappedTime, m.activeClients, m.clients,
+		m.completedSessions, m.sessionDuration, m.earlyDisconnect, m.firstResponseExit, m.protocolActions,
 		m.upnpOtherHttpRequests, m.upnpMSearchRequests, m.upnpNonMSearchRequests,
 		m.mqttConacks, m.mqttUnsubscribe, m.mqttPubrec,
-		m.mqttMalformedConnect, m.mqttConnectVersions, m.mqttSubscribeTopics, m.mqttCredentials, m.telnetInput, m.mqttPublishTopics,)
+		m.mqttMalformedConnect, m.mqttConnectVersions, m.mqttSubscribeTopics, m.mqttCredentials, m.telnetInput, m.mqttPublishTopics)
 	return m
+}
+
+func NewMetrics() *metrics {
+	return newMetrics(prometheus.DefaultRegisterer)
 }
 
 func main() {
@@ -122,11 +154,10 @@ func main() {
 	geoliteDbPath := os.Getenv("GEO_DB")
 	// fmt.Print(geoliteDbPath+"\n")
 	db, err = maxminddb.Open(geoliteDbPath)
-    if err != nil {
-        log.Fatal("Cannot open GeoLite2 database: ", err)
-    }
-    defer db.Close()
-
+	if err != nil {
+		log.Fatal("Cannot open GeoLite2 database: ", err)
+	}
+	defer db.Close()
 
 	// Register metrics
 	m := NewMetrics()
@@ -194,6 +225,7 @@ func handleMetric(line string, metrics *metrics) {
 		lon := CapitalCoordinates[country].Longitude
 		// Reduce cardinality by removing ip
 		handleConnect(server, country, lat, lon, metrics)
+		observeProtocolAction(server, "connect", metrics)
 	case "disconnect":
 		if len(fields) < 4 {
 			log.Printf("Malformed disconnect metric (need 4 fields): %q", line)
@@ -207,6 +239,37 @@ func handleMetric(line string, metrics *metrics) {
 		}
 		timeTrapped := float64(parsedTimeTrapped)
 		handleDisconnect(server, timeTrapped, metrics)
+		observeProtocolAction(server, "disconnect", metrics)
+
+		// Extended format:
+		// <server> disconnect <ip> <trapped_ms> <duration_ms>
+		// <interaction_depth> <reason> <first_response_exit>
+		if len(fields) < 8 {
+			return
+		}
+		durationMs, err := strconv.ParseUint(fields[4], 10, 64)
+		if err != nil {
+			log.Printf("Invalid session duration in metric line %q: %v", line, err)
+			return
+		}
+		interactionDepth, err := strconv.ParseUint(fields[5], 10, 32)
+		if err != nil {
+			log.Printf("Invalid interaction depth in metric line %q: %v", line, err)
+			return
+		}
+		firstResponseExit, err := strconv.ParseBool(fields[7])
+		if err != nil {
+			log.Printf("Invalid first-response-exit flag in metric line %q: %v", line, err)
+			return
+		}
+		observeCompletedSession(
+			server,
+			float64(durationMs),
+			uint32(interactionDepth),
+			fields[6],
+			firstResponseExit,
+			metrics,
+		)
 	// UPnP
 	case "otherHttpRequests":
 		method := " "
@@ -219,6 +282,7 @@ func handleMetric(line string, metrics *metrics) {
 		}
 
 		metrics.upnpOtherHttpRequests.WithLabelValues(method, url).Inc()
+		observeProtocolAction(server, "upnp_http_request", metrics)
 	case "M-SEARCH":
 		if len(fields) < 3 {
 			log.Printf("Malformed M-SEARCH metric (need 3 fields): %q", line)
@@ -226,6 +290,7 @@ func handleMetric(line string, metrics *metrics) {
 		}
 		ip := fields[2]
 		metrics.upnpMSearchRequests.WithLabelValues(ip).Inc()
+		observeProtocolAction(server, "upnp_discovery", metrics)
 	case "non-M-SEARCH":
 		if len(fields) < 3 {
 			log.Printf("Malformed non-M-SEARCH metric (need 3 fields): %q", line)
@@ -233,6 +298,7 @@ func handleMetric(line string, metrics *metrics) {
 		}
 		ip := fields[2]
 		metrics.upnpNonMSearchRequests.WithLabelValues(ip).Inc()
+		observeProtocolAction(server, "upnp_discovery", metrics)
 	// MQTT
 	case "CONNECT":
 		if len(fields) < 3 {
@@ -241,9 +307,11 @@ func handleMetric(line string, metrics *metrics) {
 		}
 		version := fields[2]
 		metrics.mqttConnectVersions.WithLabelValues(version).Inc()
+		observeProtocolAction(server, "mqtt_connect", metrics)
 
 	case "malformedConnect":
 		metrics.mqttMalformedConnect.Inc()
+		observeProtocolAction(server, "malformed_connect", metrics)
 
 	case "SUBSCRIBE":
 		if len(fields) < 4 {
@@ -253,6 +321,7 @@ func handleMetric(line string, metrics *metrics) {
 		topic := fields[2]
 		qos := fields[3]
 		metrics.mqttSubscribeTopics.WithLabelValues(topic, qos).Inc()
+		observeProtocolAction(server, "mqtt_subscribe", metrics)
 
 	case "credentials":
 		username := " "
@@ -274,19 +343,80 @@ func handleMetric(line string, metrics *metrics) {
 		topic := fields[2]
 		qos := fields[3]
 		metrics.mqttPublishTopics.WithLabelValues(topic, qos).Inc()
+		observeProtocolAction(server, "mqtt_publish", metrics)
 
 	case "CONNACK":
-		metrics.mqttConacks.Inc();
+		metrics.mqttConacks.Inc()
+		observeProtocolAction(server, "mqtt_connack", metrics)
 	case "UNSUBSCRIBE":
-		metrics.mqttUnsubscribe.Inc();
+		metrics.mqttUnsubscribe.Inc()
+		observeProtocolAction(server, "mqtt_unsubscribe", metrics)
 	case "PUBREC":
-		metrics.mqttPubrec.Inc();
+		metrics.mqttPubrec.Inc()
+		observeProtocolAction(server, "mqtt_pubrec", metrics)
 	case "action":
 		if len(fields) < 4 {
 			return
 		}
 		ip := fields[2]
-		metrics.telnetInput.WithLabelValues(ip).Inc();
+		metrics.telnetInput.WithLabelValues(ip).Inc()
+		observeProtocolAction(server, "read", metrics)
+	case "protocol_action":
+		if len(fields) != 3 {
+			log.Printf("Malformed protocol action metric: %q", line)
+			return
+		}
+		observeProtocolAction(server, fields[2], metrics)
+	}
+}
+
+func protocolLabel(server string) (string, bool) {
+	switch server {
+	case "Telnet":
+		return "telnet", true
+	case "UPnP":
+		return "upnp", true
+	case "MQTT":
+		return "mqtt", true
+	case "CoAP":
+		return "coap", true
+	case "SSH":
+		return "ssh", true
+	default:
+		return "", false
+	}
+}
+
+func observeProtocolAction(server string, action string, metrics *metrics) {
+	protocol, ok := protocolLabel(server)
+	if !ok {
+		return
+	}
+	if !allowedProtocolAction(action) {
+		log.Printf("Ignoring unbounded protocol action %q for %s", action, server)
+		return
+	}
+	metrics.protocolActions.WithLabelValues(protocol, action).Inc()
+}
+
+func allowedProtocolAction(action string) bool {
+	switch action {
+	case "connect", "disconnect", "read", "write", "banner",
+		"mqtt_connect", "mqtt_publish", "mqtt_subscribe", "mqtt_disconnect",
+		"mqtt_connack", "mqtt_pubrec", "mqtt_unsubscribe", "malformed_connect",
+		"coap_request", "upnp_discovery", "upnp_http_request", "upnp_http_response":
+		return true
+	default:
+		return false
+	}
+}
+
+func boundedDisconnectReason(reason string) string {
+	switch reason {
+	case "client_disconnect", "inactivity", "read_error", "write_error":
+		return reason
+	default:
+		return "unknown"
 	}
 }
 
@@ -333,6 +463,26 @@ func handleDisconnect(server string, timeTrapped float64, metrics *metrics) {
 		metrics.activeClients.WithLabelValues("SSH").Dec()
 		metrics.totalTrappedTime.WithLabelValues("SSH").Add(timeTrapped)
 	}
+
+}
+
+func observeCompletedSession(server string, durationMs float64, interactionDepth uint32,
+	disconnectReason string, exitedAfterFirstResponse bool, metrics *metrics) {
+	protocol, ok := protocolLabel(server)
+	if !ok {
+		return
+	}
+
+	metrics.completedSessions.WithLabelValues(protocol, boundedDisconnectReason(disconnectReason)).Inc()
+	metrics.sessionDuration.WithLabelValues(protocol).Observe(durationMs)
+	earlyDisconnect := metrics.earlyDisconnect.WithLabelValues(protocol)
+	firstResponseExit := metrics.firstResponseExit.WithLabelValues(protocol)
+	if interactionDepth == 0 {
+		earlyDisconnect.Inc()
+	}
+	if exitedAfterFirstResponse {
+		firstResponseExit.Inc()
+	}
 }
 
 func parseTimeMs(s string) int64 {
@@ -342,7 +492,7 @@ func parseTimeMs(s string) int64 {
 }
 
 func geoLookup(ipStr string) string {
-    ip := netip.MustParseAddr(ipStr)
+	ip := netip.MustParseAddr(ipStr)
 
 	var record struct {
 		Country struct {

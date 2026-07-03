@@ -388,6 +388,10 @@ bool sendConnack(struct mqttClient* client, uint8_t reasonCode) {
             SERVER_ID);
         printf("%s", msg);
         sendMetric(msg);
+        if (w > 0 && !client->firstResponseSent) {
+            client->firstResponseSent = true;
+            client->interactionDepthAtFirstResponse = client->interactionDepth;
+        }
         // syslog(LOG_INFO, "Sent CONNACK to client fd=%d\n", client->fd);
     }
 
@@ -711,10 +715,18 @@ bool sendPingresp(struct mqttClient* client) {
 
 void disconnectClient(struct mqttClient* client, int epollFd, long long now, const char *reason){
     long long wastedTime = now - client->timeOfConnection;
+    bool firstResponseExit = client->firstResponseSent &&
+        client->interactionDepth <= client->interactionDepthAtFirstResponse;
 
     char msg[256];
-    snprintf(msg, sizeof(msg), "%s disconnect %s %lld",
-        SERVER_ID, client->ipaddr, wastedTime);
+    snprintf(msg, sizeof(msg), "%s disconnect %s %lld %lld %u %s %d\n",
+        SERVER_ID,
+        client->ipaddr,
+        wastedTime,
+        wastedTime,
+        client->interactionDepth,
+        reason,
+        firstResponseExit ? 1 : 0);
 
     printf("%s", msg);
     sendMetric(msg);
@@ -901,6 +913,8 @@ int main(int argc, char* argv[]) {
                 newClient->lastPubrelMs = now;
                 newClient->keepAlive = 0; // Initial value. Will be updated after connect
                 newClient->interactionDepth = 0;
+                newClient->firstResponseSent = false;
+                newClient->interactionDepthAtFirstResponse = 0;
                 session_events_make_id(newClient->sessionId, sizeof(newClient->sessionId), "mqtt", newClient->timeOfConnection, newClient->fd);
                 memset(newClient->buffer, 0, sizeof(newClient->buffer)); // Maybe not necessary
                 // ev.events = EPOLLIN | EPOLLET;
@@ -1037,6 +1051,10 @@ int main(int argc, char* argv[]) {
                             break;
                         case DISCONNECT:
                             fprintf(stderr, "Disconnecting client due to receiving DISCONNECT");
+                            char disconnectMsg[64];
+                            snprintf(disconnectMsg, sizeof(disconnectMsg),
+                                "%s protocol_action mqtt_disconnect\n", SERVER_ID);
+                            sendMetric(disconnectMsg);
                             disconnectClient(client, epollfd, now, "client_disconnect");
                             clientDisconnected = true;
                             break;

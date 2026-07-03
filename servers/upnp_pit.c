@@ -389,6 +389,9 @@ void *httpServer(void *arg) {
                 httpMethodClass(method),
                 httpRouteClass(method, url));
             emitUpnpAction(newClient->sessionId, "http_request_received", fields);
+            char actionMsg[64];
+            snprintf(actionMsg, sizeof(actionMsg), "%s protocol_action upnp_http_request\n", SERVER_ID);
+            sendMetric(actionMsg);
 
             if (strcmp(url, "/hue-device.xml") == 0 && strcmp(method, "GET") == 0) {
                 // statsUpnp.totalXmlRequests += 1;
@@ -430,6 +433,8 @@ void *httpServer(void *arg) {
                     "\"transport\":\"tcp\",\"write_result\":\"success\",\"bytes_sent\":%zd,\"handling_duration_ms\":%lld,\"interaction_depth\":%u",
                     totalBytesSent, currentTimeMs() - requestStartMs, newClient->interactionDepth);
                 emitUpnpAction(newClient->sessionId, "response_sent", fields);
+                snprintf(actionMsg, sizeof(actionMsg), "%s protocol_action upnp_http_response\n", SERVER_ID);
+                sendMetric(actionMsg);
                 queue_append(&clientQueueUpnp, (struct baseClient*)newClient);
 
                 if(statsUpnp.mostConcurrentConnections < clientQueueUpnp.length) {

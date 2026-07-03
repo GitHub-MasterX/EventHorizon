@@ -23,6 +23,7 @@ struct telnetAndUpnpClient {
     int fd;
     long long sessionStartMs;
     unsigned int interactionDepth;
+    bool firstResponseSent;
     char sessionId[SESSION_EVENT_ID_LEN];
 };
 
@@ -54,6 +55,8 @@ struct mqttClient {
     uint64_t lastActivityMs;
     uint64_t lastPubrelMs;
     long long timeOfConnection;
+    bool firstResponseSent;
+    unsigned int interactionDepthAtFirstResponse;
     enum MqttVersion version;
     UT_hash_handle hh;
 };

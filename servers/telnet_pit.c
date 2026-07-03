@@ -62,9 +62,27 @@ void initializeStats(){
     statsTelnet.mostConcurrentConnections = 0;
 }
 
-static void emitSessionDisconnect(struct telnetAndUpnpClient *client, long long now, const char *reason) {
+static void completeTelnetSession(struct telnetAndUpnpClient *client, long long now, const char *reason) {
     long long durationMs = now - client->sessionStartMs;
+    bool firstResponseExit = client->firstResponseSent && client->interactionDepth == 0;
+    char msg[256];
+    snprintf(msg, sizeof(msg), "%s disconnect %s %lld %lld %u %s %d\n",
+        SERVER_ID,
+        client->base.ipaddr,
+        client->base.timeConnected,
+        durationMs,
+        client->interactionDepth,
+        reason,
+        firstResponseExit ? 1 : 0);
+    printf("%s", msg);
+    sendMetric(msg);
     session_events_write_disconnect("telnet", client->sessionId, durationMs, reason, client->interactionDepth);
+}
+
+static void emitProtocolActionMetric(const char *action) {
+    char msg[64];
+    snprintf(msg, sizeof(msg), "%s protocol_action %s\n", SERVER_ID, action);
+    sendMetric(msg);
 }
 
 static void emitTelnetWriteEvent(struct telnetAndUpnpClient *client, const char *result, int delayMs, ssize_t bytesSent) {
@@ -143,14 +161,8 @@ int main(int argc, char *argv[]) {
                         emitTelnetWriteEvent(c, "would_block", delay, 0);
                         queue_append(&clientQueueTelnet, (struct baseClient *)c);
                     } else {
-                        long long timeTrapped = c->base.timeConnected;
-                        char msg[256];
-                        snprintf(msg, sizeof(msg), "%s disconnect %s %lld\n",
-                            SERVER_ID, c->base.ipaddr, timeTrapped);
-                        printf("%s", msg);
-                        sendMetric(msg);
                         emitTelnetWriteEvent(c, "write_error", delay, 0);
-                        emitSessionDisconnect(c, now, "write_error");
+                        completeTelnetSession(c, now, "write_error");
                         close(c->fd);
                         free(c);
                     }
@@ -158,19 +170,17 @@ int main(int argc, char *argv[]) {
                     c->base.sendNext = now + delay;
                     c->base.timeConnected += delay;
                     statsTelnet.totalWastedTime += delay;
-                    c->interactionDepth += 1;
+                    if (out > 0) {
+                        emitProtocolActionMetric(c->firstResponseSent ? "write" : "banner");
+                        c->firstResponseSent = true;
+                    }
                     emitTelnetWriteEvent(c, "success", delay, out);
                     char buf[65];
                     ssize_t r=read(c->fd, buf, sizeof(buf)-1);
                     if(r<0){
                         //do nothing
                     }else if(r==0){
-                        char msg[256];
-                        snprintf(msg, sizeof(msg), "%s disconnect %s %lld\n",
-                            SERVER_ID, c->base.ipaddr, c->base.timeConnected);
-                        printf("%s", msg);
-                        sendMetric(msg);
-                        emitSessionDisconnect(c, now, "client_disconnect");
+                        completeTelnetSession(c, now, "client_disconnect");
                         close(c->fd);
                         free(c);
                         continue;
@@ -230,6 +240,7 @@ int main(int argc, char *argv[]) {
             newClient->base.timeConnected = 0;
             newClient->sessionStartMs = now;
             newClient->interactionDepth = 0;
+            newClient->firstResponseSent = false;
             snprintf(newClient->base.ipaddr, INET_ADDRSTRLEN, "%s", inet_ntoa(clientAddr.sin_addr));
             session_events_make_id(newClient->sessionId, sizeof(newClient->sessionId), "telnet", newClient->sessionStartMs, newClient->fd);
             queue_append(&clientQueueTelnet, (struct baseClient*)newClient);

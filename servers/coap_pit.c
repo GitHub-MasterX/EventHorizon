@@ -430,6 +430,9 @@ int main(int argc, char* argv[]) {
             }
 
             client->interactionDepth += 1;
+            char metricMsg[64];
+            snprintf(metricMsg, sizeof(metricMsg), "%s protocol_action coap_request\n", SERVER_ID);
+            sendMetric(metricMsg);
             char fields[256];
             snprintf(fields, sizeof(fields),
                 "\"transport\":\"udp\",\"bytes_received\":%d,\"coap_type\":\"%s\",\"coap_method\":\"%s\",\"message_id\":%u,\"token_present\":%s,\"token_length\":%u,\"handling_duration_ms\":0,\"interaction_depth\":%u",
