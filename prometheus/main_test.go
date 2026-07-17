@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"log"
+	"strings"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -192,6 +195,74 @@ func TestReliabilityMetricEvents(t *testing.T) {
 	assertCounter(t, m.exporterMessages.WithLabelValues("accepted"), 4)
 }
 
+func TestApplicationByteMetrics(t *testing.T) {
+	tests := []struct {
+		name      string
+		line      string
+		protocol  string
+		direction string
+		want      float64
+	}{
+		{name: "valid Telnet bytes received", line: "Telnet bytes_received 17", protocol: "telnet", direction: "received", want: 17},
+		{name: "valid Telnet bytes sent", line: "Telnet bytes_sent 11", protocol: "telnet", direction: "sent", want: 11},
+		{name: "valid MQTT bytes received", line: "MQTT bytes_received 29", protocol: "mqtt", direction: "received", want: 29},
+		{name: "valid MQTT bytes sent", line: "MQTT bytes_sent 23", protocol: "mqtt", direction: "sent", want: 23},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry := prometheus.NewRegistry()
+			m := newMetrics(registry)
+
+			handleMetric(tt.line, m)
+
+			if tt.direction == "received" {
+				assertCounter(t, m.bytesReceived.WithLabelValues(tt.protocol), tt.want)
+				assertCounter(t, m.bytesSent.WithLabelValues(tt.protocol), 0)
+			} else {
+				assertCounter(t, m.bytesSent.WithLabelValues(tt.protocol), tt.want)
+				assertCounter(t, m.bytesReceived.WithLabelValues(tt.protocol), 0)
+			}
+			assertCounter(t, m.exporterMessages.WithLabelValues("accepted"), 1)
+			assertCounter(t, m.exporterMessages.WithLabelValues("rejected"), 0)
+		})
+	}
+}
+
+func TestMalformedApplicationByteMetricsDoNotMutateCounters(t *testing.T) {
+	tests := []struct {
+		name            string
+		line            string
+		malformedReason string
+	}{
+		{name: "zero value is not an I/O success", line: "Telnet bytes_received 0", malformedReason: "invalid_number"},
+		{name: "invalid numeric value", line: "Telnet bytes_received nope", malformedReason: "invalid_number"},
+		{name: "negative value", line: "MQTT bytes_sent -1", malformedReason: "invalid_number"},
+		{name: "uint64 overflow", line: "MQTT bytes_received 18446744073709551616", malformedReason: "invalid_number"},
+		{name: "ssize_t overflow", line: "Telnet bytes_sent 9223372036854775808", malformedReason: "invalid_number"},
+		{name: "missing field", line: "Telnet bytes_sent", malformedReason: "missing_fields"},
+		{name: "extra field", line: "MQTT bytes_received 7 extra", malformedReason: "unknown_format"},
+		{name: "unsupported protocol", line: "CoAP bytes_sent 7", malformedReason: "unsupported_event"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry := prometheus.NewRegistry()
+			m := newMetrics(registry)
+
+			handleMetric(tt.line, m)
+
+			assertCounter(t, m.bytesReceived.WithLabelValues("telnet"), 0)
+			assertCounter(t, m.bytesSent.WithLabelValues("telnet"), 0)
+			assertCounter(t, m.bytesReceived.WithLabelValues("mqtt"), 0)
+			assertCounter(t, m.bytesSent.WithLabelValues("mqtt"), 0)
+			assertCounter(t, m.exporterMalformedMessages.WithLabelValues(tt.malformedReason), 1)
+			assertCounter(t, m.exporterMessages.WithLabelValues("accepted"), 0)
+			assertCounter(t, m.exporterMessages.WithLabelValues("rejected"), 1)
+		})
+	}
+}
+
 func TestMalformedMetricMessagesAreCounted(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	m := newMetrics(registry)
@@ -208,6 +279,61 @@ func TestMalformedMetricMessagesAreCounted(t *testing.T) {
 	assertCounter(t, m.exporterMalformedMessages.WithLabelValues("missing_fields"), 1)
 	assertCounter(t, m.exporterMalformedMessages.WithLabelValues("unsupported_event"), 1)
 	assertCounter(t, m.exporterMessages.WithLabelValues("rejected"), 5)
+}
+
+func TestFieldSafeModeRetainsBoundedMetricsWithoutRawSeriesOrLogs(t *testing.T) {
+	t.Setenv("EVENTHORIZON_FIELD_SAFE_MODE", "true")
+
+	registry := prometheus.NewRegistry()
+	m := newMetrics(registry)
+	var logs bytes.Buffer
+	oldOutput := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldOutput) })
+
+	handleMetric("Telnet action 203.0.113.8 raw-client-input", m)
+	handleMetric("MQTT CONNECT private-version", m)
+	handleMetric("MQTT SUBSCRIBE private/topic 1", m)
+	handleMetric("MQTT PUBLISH private/topic 1", m)
+	handleMetric("MQTT credentials secret-user secret-password", m)
+	handleMetric("MQTT bytes_sent not-a-number", m)
+
+	assertCounter(t, m.protocolActions.WithLabelValues("telnet", "read"), 1)
+	assertCounter(t, m.protocolActions.WithLabelValues("mqtt", "mqtt_connect"), 1)
+	assertCounter(t, m.protocolActions.WithLabelValues("mqtt", "mqtt_subscribe"), 1)
+	assertCounter(t, m.protocolActions.WithLabelValues("mqtt", "mqtt_publish"), 1)
+	assertCounter(t, m.exporterMessages.WithLabelValues("accepted"), 5)
+	assertCounter(t, m.exporterMessages.WithLabelValues("rejected"), 1)
+
+	metricFamilies, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, family := range []string{
+		"telnet_pit_input",
+		"mqtt_pit_connect_versions",
+		"mqtt_pit_subscribe_topics",
+		"mqtt_pit_publish_topics",
+		"mqtt_pit_credentials",
+	} {
+		if hasMetricFamily(metricFamilies, family) {
+			t.Fatalf("field-safe mode exposed raw metric family %q", family)
+		}
+	}
+
+	for _, sensitive := range []string{
+		"203.0.113.8",
+		"raw-client-input",
+		"private-version",
+		"private/topic",
+		"secret-user",
+		"secret-password",
+		"not-a-number",
+	} {
+		if strings.Contains(logs.String(), sensitive) {
+			t.Fatalf("field-safe mode logged sensitive value %q", sensitive)
+		}
+	}
 }
 
 func assertCounter(t *testing.T, metric prometheus.Metric, want float64) {

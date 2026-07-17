@@ -152,6 +152,7 @@ int main(int argc, char *argv[]) {
 
                 int optionIndex = rand() % num_options;
                 ssize_t out = write(c->fd, options[optionIndex].bytes, options[optionIndex].length);
+                sendByteMetric(SERVER_ID, "sent", out);
 
                 if (out == -1) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) { // Avoid blocking
@@ -172,13 +173,13 @@ int main(int argc, char *argv[]) {
                     c->base.timeConnected += delay;
                     statsTelnet.totalWastedTime += delay;
                     if (out > 0) {
-                        sendByteMetric(SERVER_ID, "sent", (unsigned long long)out);
                         emitProtocolActionMetric(c->firstResponseSent ? "write" : "banner");
                         c->firstResponseSent = true;
                     }
                     emitTelnetWriteEvent(c, "success", delay, out);
                     char buf[65];
                     ssize_t r=read(c->fd, buf, sizeof(buf)-1);
+                    sendByteMetric(SERVER_ID, "received", r);
                     if(r<0){
                         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                             sendReliabilityMetric(SERVER_ID, "read_error", metricReasonFromErrno(errno));
@@ -193,7 +194,6 @@ int main(int argc, char *argv[]) {
                         free(c);
                         continue;
                     }else{
-                        sendByteMetric(SERVER_ID, "received", (unsigned long long)r);
                         //terminate null
                         buf[r]='\0';
                         for(int i=0;i<r;i++){

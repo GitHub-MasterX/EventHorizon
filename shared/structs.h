@@ -3,6 +3,8 @@
 
 #include <netinet/in.h>
 #include <stdbool.h>
+#include <stddef.h>
+#include <sys/types.h>
 #include "uthash.h"
 #include "session_events.h"
 
@@ -161,8 +163,18 @@ const char *metricReasonFromErrno(int errorNumber);
 void sendReliabilityMetric(const char *server, const char *event, const char *reason);
 
 /**
- * @brief Sends aggregate byte accounting metrics.
+ * @brief Formats one bounded byte metric for a positive client I/O result.
+ *
+ * @return true when one complete event was formatted, otherwise false.
  */
-void sendByteMetric(const char *server, const char *direction, unsigned long long bytes);
+bool formatByteMetric(char *message, size_t messageSize, const char *server,
+    const char *direction, ssize_t ioResult);
+
+/**
+ * @brief Sends aggregate byte accounting for a positive client I/O result.
+ *
+ * Zero and failed I/O results are intentionally ignored.
+ */
+void sendByteMetric(const char *server, const char *direction, ssize_t ioResult);
 
 #endif

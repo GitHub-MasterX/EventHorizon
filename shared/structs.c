@@ -220,21 +220,31 @@ void sendReliabilityMetric(const char *server, const char *event, const char *re
     sendMetric(msg);
 }
 
-void sendByteMetric(const char *server, const char *direction, unsigned long long bytes) {
-    if (!server || !direction || bytes == 0) {
-        return;
+bool formatByteMetric(char *message, size_t messageSize, const char *server,
+                      const char *direction, ssize_t ioResult) {
+    if (!message || messageSize == 0 || !server || !direction || ioResult <= 0) {
+        return false;
     }
-
+    if (strcmp(server, "Telnet") != 0 && strcmp(server, "MQTT") != 0) {
+        return false;
+    }
     const char *command = NULL;
     if (strcmp(direction, "sent") == 0) {
         command = "bytes_sent";
     } else if (strcmp(direction, "received") == 0) {
         command = "bytes_received";
     } else {
-        return;
+        return false;
     }
 
+    int written = snprintf(message, messageSize, "%s %s %zd\n", server, command, ioResult);
+    return written > 0 && (size_t)written < messageSize;
+}
+
+void sendByteMetric(const char *server, const char *direction, ssize_t ioResult) {
     char msg[128];
-    snprintf(msg, sizeof(msg), "%s %s %llu\n", server, command, bytes);
+    if (!formatByteMetric(msg, sizeof(msg), server, direction, ioResult)) {
+        return;
+    }
     sendMetric(msg);
 }

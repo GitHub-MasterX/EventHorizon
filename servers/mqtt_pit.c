@@ -376,6 +376,7 @@ bool sendConnack(struct mqttClient* client, uint8_t reasonCode) {
     }
 
     ssize_t w = write(client->fd, arr, size);
+    sendByteMetric(SERVER_ID, "sent", w);
     free(arr);
     if (w == -1) {
         fprintf(stderr, "sendConnack: write failed. May retry.");
@@ -384,9 +385,6 @@ bool sendConnack(struct mqttClient* client, uint8_t reasonCode) {
             return false;
         }
     } else {
-        if (w > 0) {
-            sendByteMetric(SERVER_ID, "sent", (unsigned long long)w);
-        }
         char msg[256];
         snprintf(msg, sizeof(msg), "%s CONNACK\n",
             SERVER_ID);
@@ -552,6 +550,7 @@ bool sendPublish(struct mqttClient* client, const char* topic, const char* messa
     offset += payloadLength;
 
     ssize_t w = write(client->fd, packet, packetLength);
+    sendByteMetric(SERVER_ID, "sent", w);
     free(packet);
     if (w < 0) {
         fprintf(stderr, "sendPublish: write failed. May retry.");
@@ -560,9 +559,6 @@ bool sendPublish(struct mqttClient* client, const char* topic, const char* messa
             return false;
         }
     } else {
-        if (w > 0) {
-            sendByteMetric(SERVER_ID, "sent", (unsigned long long)w);
-        }
         // syslog(LOG_INFO, "Sent PUBLISH to client (fd=%d), topic=%s\n", client->fd, topic);
     }
     
@@ -683,6 +679,7 @@ bool sendPubrel(struct mqttClient* client, uint16_t packetId) {
     }
 
     ssize_t w = write(client->fd, arr, size);
+    sendByteMetric(SERVER_ID, "sent", w);
     if (w == -1) {
         fprintf(stderr, "sendPubrel: write failed");
         sendReliabilityMetric(SERVER_ID, "write_error", metricReasonFromErrno(errno));
@@ -691,9 +688,6 @@ bool sendPubrel(struct mqttClient* client, uint16_t packetId) {
     }
 
     // syslog(LOG_INFO, "Sent PUBREL to client fd=%d", client->fd);
-    if (w > 0) {
-        sendByteMetric(SERVER_ID, "sent", (unsigned long long)w);
-    }
     free(arr);
     return true;
 }
@@ -713,6 +707,7 @@ void readPubcomp(uint32_t packetEnd, uint32_t offset) {
 bool sendPingresp(struct mqttClient* client) {
     uint8_t packet[2] = { 0xD0, 0x00 };
     ssize_t w = write(client->fd, packet, sizeof(packet));
+    sendByteMetric(SERVER_ID, "sent", w);
 
     if (w == -1) {
         fprintf(stderr, "sendPingresp: write failed. May retry.");
@@ -721,9 +716,6 @@ bool sendPingresp(struct mqttClient* client) {
             return false;
         }
     } else {
-        if (w > 0) {
-            sendByteMetric(SERVER_ID, "sent", (unsigned long long)w);
-        }
         fprintf(stderr, "Sent PINGRESP to client (fd=%d)\n", client->fd);
     }
     return true;
@@ -966,6 +958,7 @@ int main(int argc, char* argv[]) {
                 ssize_t bytesRead = read(currentFd,
                           client->buffer + client->bytesWrittenToBuffer, // Avoid overwriting existing data
                           sizeof(client->buffer) - client->bytesWrittenToBuffer);
+                sendByteMetric(SERVER_ID, "received", bytesRead);
 
                 if(bytesRead == -1) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -983,7 +976,6 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                sendByteMetric(SERVER_ID, "received", (unsigned long long)bytesRead);
                 client->bytesWrittenToBuffer += bytesRead;
 
                 if (client->bytesWrittenToBuffer >= sizeof(client->buffer)) {

@@ -18,6 +18,8 @@ import (
 )
 
 type metrics struct {
+	fieldSafeMode bool
+
 	totalConnects    *prometheus.CounterVec
 	totalTrappedTime *prometheus.CounterVec
 	activeClients    *prometheus.GaugeVec
@@ -115,11 +117,11 @@ func newMetrics(registerer prometheus.Registerer) *metrics {
 		}, []string{"protocol", "reason"}),
 		bytesSent: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "eventhorizon_bytes_sent_total",
-			Help: "Bytes sent by EventHorizon tarpits",
+			Help: "Bytes returned by successful Telnet and MQTT client-facing writes; includes protocol framing and excludes failed or zero-byte I/O and internal telemetry",
 		}, []string{"protocol"}),
 		bytesReceived: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "eventhorizon_bytes_received_total",
-			Help: "Bytes received by EventHorizon tarpits",
+			Help: "Bytes returned by successful Telnet and MQTT client-facing reads; includes protocol framing and excludes failed or zero-byte I/O and internal telemetry",
 		}, []string{"protocol"}),
 		// ---------------
 		upnpOtherHttpRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -171,6 +173,10 @@ func newMetrics(registerer prometheus.Registerer) *metrics {
 			Name: "mqtt_pit_pubrec_counter",
 			Help: "Total PUBREC requests for MQTT",
 		}),
+	}
+	for _, protocol := range []string{"telnet", "mqtt"} {
+		m.bytesSent.WithLabelValues(protocol).Add(0)
+		m.bytesReceived.WithLabelValues(protocol).Add(0)
 	}
 	registerer.MustRegister(m.totalConnects, m.totalTrappedTime, m.activeClients, m.clients,
 		m.sessionStarts, m.completedSessions, m.sessionDuration, m.earlyDisconnect, m.firstResponseExit, m.protocolActions,
@@ -480,33 +486,50 @@ func handleMetric(line string, metrics *metrics) {
 		}
 		observeWriteError(server, fields[2], metrics)
 		acceptMetric(metrics)
-	case "bytes_sent":
-		if len(fields) < 3 {
-			rejectMetric(metrics, "missing_fields", "Malformed bytes_sent metric (need 3 fields): %q", line)
-			return
-		}
-		bytes, err := strconv.ParseUint(fields[2], 10, 64)
+	case "bytes_sent", "bytes_received":
+		byteCount, reason, err := parseApplicationByteMetric(server, fields)
 		if err != nil {
-			rejectMetric(metrics, "invalid_number", "Invalid bytes_sent value in metric line %q: %v", line, err)
+			rejectMetric(metrics, reason, "Invalid %s metric line %q: %v", command, line, err)
 			return
 		}
-		observeBytesSent(server, float64(bytes), metrics)
-		acceptMetric(metrics)
-	case "bytes_received":
-		if len(fields) < 3 {
-			rejectMetric(metrics, "missing_fields", "Malformed bytes_received metric (need 3 fields): %q", line)
-			return
+		if command == "bytes_sent" {
+			observeBytesSent(server, byteCount, metrics)
+		} else {
+			observeBytesReceived(server, byteCount, metrics)
 		}
-		bytes, err := strconv.ParseUint(fields[2], 10, 64)
-		if err != nil {
-			rejectMetric(metrics, "invalid_number", "Invalid bytes_received value in metric line %q: %v", line, err)
-			return
-		}
-		observeBytesReceived(server, float64(bytes), metrics)
 		acceptMetric(metrics)
 	default:
 		rejectMetric(metrics, "unsupported_event", "Unsupported metric command in line: %q", line)
 	}
+}
+
+const maxSuccessfulIOBytes uint64 = 1<<63 - 1
+
+func parseApplicationByteMetric(server string, fields []string) (float64, string, error) {
+	if len(fields) != 3 {
+		if len(fields) < 3 {
+			return 0, "missing_fields", fmt.Errorf("need exactly 3 fields")
+		}
+		return 0, "unknown_format", fmt.Errorf("need exactly 3 fields")
+	}
+
+	protocol, ok := protocolLabel(server)
+	if !ok || (protocol != "telnet" && protocol != "mqtt") {
+		return 0, "unsupported_event", fmt.Errorf("byte metrics support only Telnet and MQTT")
+	}
+
+	byteCount, err := strconv.ParseUint(fields[2], 10, 64)
+	if err != nil {
+		return 0, "invalid_number", err
+	}
+	if byteCount == 0 {
+		return 0, "invalid_number", fmt.Errorf("byte count must be positive")
+	}
+	if byteCount > maxSuccessfulIOBytes {
+		return 0, "invalid_number", fmt.Errorf("byte count exceeds a positive 64-bit ssize_t result")
+	}
+
+	return float64(byteCount), "", nil
 }
 
 func acceptMetric(metrics *metrics) {
@@ -519,7 +542,12 @@ func rejectMetric(metrics *metrics, reason string, format string, args ...any) {
 }
 
 func recordMalformedMetric(metrics *metrics, reason string, format string, args ...any) {
-	metrics.exporterMalformedMessages.WithLabelValues(boundedMalformedReason(reason)).Inc()
+	boundedReason := boundedMalformedReason(reason)
+	metrics.exporterMalformedMessages.WithLabelValues(boundedReason).Inc()
+	if metrics.fieldSafeMode {
+		log.Printf("Rejected malformed metric: reason=%s", boundedReason)
+		return
+	}
 	log.Printf(format, args...)
 }
 
