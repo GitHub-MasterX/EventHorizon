@@ -58,6 +58,7 @@ var db *maxminddb.Reader
 
 func newMetrics(registerer prometheus.Registerer) *metrics {
 	m := &metrics{
+		fieldSafeMode: fieldSafeModeEnabled(),
 		totalConnects: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "total_connects",
 			Help: "Total client connections",
@@ -191,6 +192,20 @@ func NewMetrics() *metrics {
 	return newMetrics(prometheus.DefaultRegisterer)
 }
 
+func fieldSafeModeEnabled() bool {
+	value := os.Getenv("EVENTHORIZON_FIELD_SAFE_MODE")
+	if value == "" {
+		return false
+	}
+
+	enabled, err := strconv.ParseBool(value)
+	if err != nil {
+		log.Printf("Ignoring invalid EVENTHORIZON_FIELD_SAFE_MODE value; field-safe mode remains disabled")
+		return false
+	}
+	return enabled
+}
+
 func main() {
 	var err error
 	geoliteDbPath := os.Getenv("GEO_DB")
@@ -251,7 +266,9 @@ func handleMetric(line string, metrics *metrics) {
 	}
 
 	fields := strings.Fields(line)
-	log.Println(fields)
+	if !metrics.fieldSafeMode {
+		log.Println(fields)
+	}
 
 	if len(fields) < 2 {
 		rejectMetric(metrics, "missing_fields", "Malformed metric line (need at least 2 fields): %q", line)
@@ -357,7 +374,9 @@ func handleMetric(line string, metrics *metrics) {
 			url = fields[3]
 		}
 
-		metrics.upnpOtherHttpRequests.WithLabelValues(method, url).Inc()
+		if !metrics.fieldSafeMode {
+			metrics.upnpOtherHttpRequests.WithLabelValues(method, url).Inc()
+		}
 		observeProtocolAction(server, "upnp_http_request", metrics)
 		acceptMetric(metrics)
 	case "M-SEARCH":
@@ -366,7 +385,9 @@ func handleMetric(line string, metrics *metrics) {
 			return
 		}
 		ip := fields[2]
-		metrics.upnpMSearchRequests.WithLabelValues(ip).Inc()
+		if !metrics.fieldSafeMode {
+			metrics.upnpMSearchRequests.WithLabelValues(ip).Inc()
+		}
 		observeProtocolAction(server, "upnp_discovery", metrics)
 		acceptMetric(metrics)
 	case "non-M-SEARCH":
@@ -375,7 +396,9 @@ func handleMetric(line string, metrics *metrics) {
 			return
 		}
 		ip := fields[2]
-		metrics.upnpNonMSearchRequests.WithLabelValues(ip).Inc()
+		if !metrics.fieldSafeMode {
+			metrics.upnpNonMSearchRequests.WithLabelValues(ip).Inc()
+		}
 		observeProtocolAction(server, "upnp_discovery", metrics)
 		acceptMetric(metrics)
 	// MQTT
@@ -385,7 +408,9 @@ func handleMetric(line string, metrics *metrics) {
 			return
 		}
 		version := fields[2]
-		metrics.mqttConnectVersions.WithLabelValues(version).Inc()
+		if !metrics.fieldSafeMode {
+			metrics.mqttConnectVersions.WithLabelValues(version).Inc()
+		}
 		observeProtocolAction(server, "mqtt_connect", metrics)
 		acceptMetric(metrics)
 
@@ -401,7 +426,9 @@ func handleMetric(line string, metrics *metrics) {
 		}
 		topic := fields[2]
 		qos := fields[3]
-		metrics.mqttSubscribeTopics.WithLabelValues(topic, qos).Inc()
+		if !metrics.fieldSafeMode {
+			metrics.mqttSubscribeTopics.WithLabelValues(topic, qos).Inc()
+		}
 		observeProtocolAction(server, "mqtt_subscribe", metrics)
 		acceptMetric(metrics)
 
@@ -415,7 +442,9 @@ func handleMetric(line string, metrics *metrics) {
 			password = fields[3]
 		}
 
-		metrics.mqttCredentials.WithLabelValues(username, password).Inc()
+		if !metrics.fieldSafeMode {
+			metrics.mqttCredentials.WithLabelValues(username, password).Inc()
+		}
 		acceptMetric(metrics)
 
 	case "PUBLISH":
@@ -425,7 +454,9 @@ func handleMetric(line string, metrics *metrics) {
 		}
 		topic := fields[2]
 		qos := fields[3]
-		metrics.mqttPublishTopics.WithLabelValues(topic, qos).Inc()
+		if !metrics.fieldSafeMode {
+			metrics.mqttPublishTopics.WithLabelValues(topic, qos).Inc()
+		}
 		observeProtocolAction(server, "mqtt_publish", metrics)
 		acceptMetric(metrics)
 
@@ -447,7 +478,9 @@ func handleMetric(line string, metrics *metrics) {
 			return
 		}
 		ip := fields[2]
-		metrics.telnetInput.WithLabelValues(ip).Inc()
+		if !metrics.fieldSafeMode {
+			metrics.telnetInput.WithLabelValues(ip).Inc()
+		}
 		observeProtocolAction(server, "read", metrics)
 		acceptMetric(metrics)
 	case "protocol_action":

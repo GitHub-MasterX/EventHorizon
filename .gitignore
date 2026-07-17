@@ -1,5 +1,6 @@
 bin/
 logs/
+validation-output/
 otel-output/
 *.sqlite
 *.sqlite3
