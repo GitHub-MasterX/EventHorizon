@@ -8,7 +8,7 @@
     {
       "gridPos": {"h": 5, "w": 24, "x": 0, "y": 0},
       "id": 1,
-      "options": {"content": "EventHorizon's essential Prometheus views in one place: current traffic, retained attacker time, completed-session duration, protocol activity, and measurement reliability.\n\nCompleted-session and lifecycle-reconciliation panels currently cover Telnet and MQTT. Reliability outcomes can describe normal peer behavior as well as faults, so they should be interpreted with their bounded reason labels.", "mode": "markdown"},
+      "options": {"content": "EventHorizon's essential Prometheus views in one place: current traffic, retained attacker time, completed-session duration, protocol activity, and measurement reliability.\n\nCompleted-session and lifecycle-reconciliation panels currently cover Telnet and MQTT. Reliability outcomes can describe normal peer behavior as well as faults, so they should be interpreted with their bounded reason labels.\n\nAll dashboard timestamps are displayed in UTC (UTC+00:00).", "mode": "markdown"},
       "title": "Dashboard Purpose & Interpretation",
       "type": "text"
     },
@@ -184,7 +184,7 @@
   "templating": {"list": []},
   "time": {"from": "now-1h", "to": "now"},
   "timepicker": {},
-  "timezone": "browser",
+  "timezone": "utc",
   "title": "EventHorizon - Core Metrics",
   "uid": "eh-overview-effectiveness",
   "version": 2,

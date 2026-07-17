@@ -8,7 +8,7 @@
     {
       "gridPos": {"h": 5, "w": 24, "x": 0, "y": 0},
       "id": 1,
-      "options": {"content": "A specialist view of bounded protocol activity, showing whether traffic progresses beyond opening a connection. It compares Telnet, MQTT, CoAP, and UPnP actions without exposing raw payloads, topics, client IDs, or source IPs.\n\nActions per completed session and early disconnect are provisional Telnet/MQTT views. Cross-protocol shallow/deep classification remains deferred until interaction-depth semantics are approved.", "mode": "markdown"},
+      "options": {"content": "A specialist view of bounded protocol activity, showing whether traffic progresses beyond opening a connection. It compares Telnet, MQTT, CoAP, and UPnP actions without exposing raw payloads, topics, client IDs, or source IPs.\n\nActions per completed session and early disconnect are provisional Telnet/MQTT views. Cross-protocol shallow/deep classification remains deferred until interaction-depth semantics are approved.\n\nAll dashboard timestamps are displayed in UTC (UTC+00:00).", "mode": "markdown"},
       "title": "Dashboard Purpose & Interpretation",
       "type": "text"
     },
@@ -105,7 +105,7 @@
   "templating": {"list": []},
   "time": {"from": "now-1h", "to": "now"},
   "timepicker": {},
-  "timezone": "browser",
+  "timezone": "utc",
   "title": "EventHorizon - Interaction Quality & Depth",
   "uid": "eh-interaction-depth",
   "version": 2,

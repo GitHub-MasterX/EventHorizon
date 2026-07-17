@@ -1106,7 +1106,7 @@
     "to": "now"
   },
   "timepicker": {},
-  "timezone": "browser",
+  "timezone": "utc",
   "title": "Combined dashboard",
   "uid": "8b208313-2d3e-4365-bac2-a829beb62169",
   "version": 1,

@@ -8,7 +8,7 @@
     {
       "gridPos": {"h": 5, "w": 24, "x": 0, "y": 0},
       "id": 1,
-      "options": {"content": "A detailed view of completed Telnet and MQTT sessions: session volume, average and percentile duration, bucket distribution, accumulated trapped time, and bounded ending outcomes.\n\nEarly disconnect remains provisional. CoAP, UPnP, and SSH are not included in completed-session duration because their lifecycle models differ.", "mode": "markdown"},
+      "options": {"content": "A detailed view of completed Telnet and MQTT sessions: session volume, average and percentile duration, bucket distribution, accumulated trapped time, and bounded ending outcomes.\n\nEarly disconnect remains provisional. CoAP, UPnP, and SSH are not included in completed-session duration because their lifecycle models differ.\n\nAll dashboard timestamps are displayed in UTC (UTC+00:00).", "mode": "markdown"},
       "title": "Dashboard Purpose & Interpretation",
       "type": "text"
     },
@@ -114,7 +114,7 @@
   "templating": {"list": []},
   "time": {"from": "now-1h", "to": "now"},
   "timepicker": {},
-  "timezone": "browser",
+  "timezone": "utc",
   "title": "EventHorizon - Trapping Duration & Engagement",
   "uid": "eh-trapping-duration",
   "version": 2,
