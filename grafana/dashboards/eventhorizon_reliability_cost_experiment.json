@@ -1,0 +1,105 @@
+{
+  "annotations": {"list": [{"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"}]},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "links": [],
+  "panels": [
+    {
+      "gridPos": {"h": 5, "w": 24, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"content": "An experimental view that keeps working measurement-reliability checks separate from future Defender Cost and baseline-vs-modified evaluation. Lifecycle accounting is limited to Telnet and MQTT, while malformed and I/O panels expose bounded telemetry/runtime outcomes.\n\nDefender Cost and experiment sections remain implementation-status placeholders until their metric definitions and validation plans are approved.", "mode": "markdown"},
+      "title": "Dashboard Purpose & Interpretation",
+      "type": "text"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5}, "id": 2, "panels": [], "title": "Measurement Reliability", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "description": "Scoped to Telnet/MQTT. total_connects is the canonical connection-start counter.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 6},
+      "id": 3,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {"expr": "sum(increase(total_connects{server=~\"Telnet|MQTT\"}[$__rate_interval]))", "legendFormat": "connections", "refId": "A"},
+        {"expr": "sum(increase(eventhorizon_completed_sessions_total{protocol=~\"telnet|mqtt\"}[$__rate_interval]))", "legendFormat": "completions", "refId": "B"}
+      ],
+      "title": "Connections vs Completions",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "description": "Interpret near zero only after Telnet/MQTT sessions settle.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 6},
+      "id": 4,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [{"expr": "sum(increase(total_connects{server=~\"Telnet|MQTT\"}[$__rate_interval])) - sum(increase(eventhorizon_completed_sessions_total{protocol=~\"telnet|mqtt\"}[$__rate_interval]))", "legendFormat": "gap", "refId": "A"}],
+      "title": "Settled Lifecycle Gap",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 14},
+      "id": 5,
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}},
+      "targets": [{"expr": "sum(current_connected_clients{server=~\"Telnet|MQTT\"})", "instant": true, "legendFormat": "active", "refId": "A"}],
+      "title": "Active Clients",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 14},
+      "id": 6,
+      "options": {"barWidth": 0.8, "groupWidth": 0.7, "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "single", "sort": "none"}, "xTickLabelRotation": 0, "xTickLabelSpacing": 80},
+      "pluginVersion": "12.4.1",
+      "targets": [{"expr": "sum by (reason) (increase(eventhorizon_exporter_malformed_messages_total[$__rate_interval]))", "legendFormat": "{{reason}}", "refId": "A"}],
+      "title": "Exporter Malformed Messages",
+      "type": "barchart"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "description": "Peer reset, close, timeout, or invalid packet can be normal scanner/client behavior. These are outcomes, not automatically system faults.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 14},
+      "id": 7,
+      "options": {"barWidth": 0.8, "groupWidth": 0.7, "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "single", "sort": "none"}, "xTickLabelRotation": 0, "xTickLabelSpacing": 80},
+      "pluginVersion": "12.4.1",
+      "targets": [
+        {"expr": "sum by (protocol, reason) (increase(eventhorizon_read_errors_total[$__rate_interval]))", "legendFormat": "read {{protocol}} / {{reason}}", "refId": "A"},
+        {"expr": "sum by (protocol, reason) (increase(eventhorizon_write_errors_total[$__rate_interval]))", "legendFormat": "write {{protocol}} / {{reason}}", "refId": "B"}
+      ],
+      "title": "Runtime I/O Outcomes",
+      "type": "barchart"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 22}, "id": 8, "panels": [], "title": "Defender Cost", "type": "row"},
+    {
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 23},
+      "id": 9,
+      "options": {"content": "# Implementation Status\n\nThis section is reserved for the Defender Cost metric branch.\n\nAvailable but deferred from the selected core:\n- aggregate Telnet/MQTT bytes sent\n- aggregate Telnet/MQTT bytes received\n\nStill required:\n- mentor-approved cost question and experiment\n- complete protocol coverage or an explicit Telnet/MQTT-only scope\n- CPU and memory from existing container/process monitoring\n- an agreed cost-per-trapped-time interpretation\n\nByte panels are withheld because partial instrumentation would imply complete defender-cost coverage. This section becomes active after the Defender Cost branch and validation plan are approved.\n\n```text\nDefender Cost\n|-- Network bytes\n|-- CPU / memory\n`-- Cost per trapped second\n```", "mode": "markdown"},
+      "title": "Implementation Status",
+      "type": "text"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 33}, "id": 13, "panels": [], "title": "Baseline-vs-Modified Experiment", "type": "row"},
+    {
+      "gridPos": {"h": 10, "w": 24, "x": 0, "y": 34},
+      "id": 14,
+      "options": {"content": "# Implementation Status\n\nThis section is reserved for the first controlled baseline-vs-modified Telnet experiment.\n\nAvailable now:\n- completed-session duration histogram\n- early-disconnect ratio, provisional\n- bounded protocol actions\n- measurement-reliability checks\n\nStill required:\n- approved modified behavior\n- bounded experiment identity or separate run configuration\n- repeatable baseline and modified traffic runs\n- agreed comparison and defender-cost criteria\n\nNo comparison panel is shown until those inputs exist, preventing empty or misleading PromQL.\n\n```text\nBaseline vs Modified\n|-- p50 / p95 duration\n|-- Early disconnect\n|-- Interaction depth\n`-- Defender cost\n```", "mode": "markdown"},
+      "title": "Implementation Status",
+      "type": "text"
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 41,
+  "tags": ["eventhorizon", "experimental", "gsoc-2026", "reliability-cost"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "EventHorizon - Reliability, Cost & Experiment",
+  "uid": "eh-reliability-cost",
+  "version": 2,
+  "weekStart": ""
+}

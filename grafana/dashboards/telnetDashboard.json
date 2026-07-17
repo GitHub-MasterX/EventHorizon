@@ -1094,7 +1094,10 @@
   ],
   "preload": false,
   "schemaVersion": 42,
-  "tags": [],
+  "tags": [
+    "eventhorizon",
+    "legacy"
+  ],
   "templating": {
     "list": []
   },
