@@ -1,3 +1,5 @@
+# Optional structured-log overlay. The default stack does not require this file.
+# This collector has a logs-only pipeline and does not export Prometheus metrics.
 services:
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.103.0

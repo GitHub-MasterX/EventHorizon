@@ -1,3 +1,5 @@
+# Optional structured JSONL pipeline. No EventHorizon metric receiver or exporter
+# is configured here; Prometheus metrics remain owned by the Go exporter.
 receivers:
   filelog/eventhorizon:
     include:
