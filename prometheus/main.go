@@ -23,11 +23,18 @@ type metrics struct {
 	activeClients    *prometheus.GaugeVec
 	clients          *prometheus.CounterVec
 
-	completedSessions *prometheus.CounterVec
-	sessionDuration   *prometheus.HistogramVec
-	earlyDisconnect   *prometheus.CounterVec
-	firstResponseExit *prometheus.CounterVec
-	protocolActions   *prometheus.CounterVec
+	sessionStarts             *prometheus.CounterVec
+	completedSessions         *prometheus.CounterVec
+	sessionDuration           *prometheus.HistogramVec
+	earlyDisconnect           *prometheus.CounterVec
+	firstResponseExit         *prometheus.CounterVec
+	protocolActions           *prometheus.CounterVec
+	exporterMalformedMessages *prometheus.CounterVec
+	exporterMessages          *prometheus.CounterVec
+	readErrors                *prometheus.CounterVec
+	writeErrors               *prometheus.CounterVec
+	bytesSent                 *prometheus.CounterVec
+	bytesReceived             *prometheus.CounterVec
 
 	upnpOtherHttpRequests  *prometheus.CounterVec
 	upnpMSearchRequests    *prometheus.CounterVec
@@ -65,6 +72,10 @@ func newMetrics(registerer prometheus.Registerer) *metrics {
 			Name: "tarpitted_clients",
 			Help: "Connected clients",
 		}, []string{ /*"ip", */ "server", "country", "latitude", "longitude"}),
+		sessionStarts: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "eventhorizon_session_starts_total",
+			Help: "DEPRECATED: duplicates total_connects; retained temporarily for compatibility",
+		}, []string{"protocol"}),
 		completedSessions: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "eventhorizon_completed_sessions_total",
 			Help: "Total completed EventHorizon sessions",
@@ -86,6 +97,30 @@ func newMetrics(registerer prometheus.Registerer) *metrics {
 			Name: "eventhorizon_protocol_actions_total",
 			Help: "Total bounded protocol actions observed by EventHorizon",
 		}, []string{"protocol", "action"}),
+		exporterMalformedMessages: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "eventhorizon_exporter_malformed_messages_total",
+			Help: "Malformed or unsupported metric messages received by the EventHorizon exporter",
+		}, []string{"reason"}),
+		exporterMessages: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "eventhorizon_exporter_messages_total",
+			Help: "DEPRECATED: exporter message totals by parse status; use eventhorizon_exporter_malformed_messages_total for parser reliability",
+		}, []string{"status"}),
+		readErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "eventhorizon_read_errors_total",
+			Help: "Bounded read-side runtime I/O outcomes; peer closure or reset may be normal client behavior",
+		}, []string{"protocol", "reason"}),
+		writeErrors: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "eventhorizon_write_errors_total",
+			Help: "Bounded write-side runtime I/O outcomes; peer closure or reset may be normal client behavior",
+		}, []string{"protocol", "reason"}),
+		bytesSent: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "eventhorizon_bytes_sent_total",
+			Help: "Bytes sent by EventHorizon tarpits",
+		}, []string{"protocol"}),
+		bytesReceived: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "eventhorizon_bytes_received_total",
+			Help: "Bytes received by EventHorizon tarpits",
+		}, []string{"protocol"}),
 		// ---------------
 		upnpOtherHttpRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "upnp_other_http_requests",
@@ -138,7 +173,8 @@ func newMetrics(registerer prometheus.Registerer) *metrics {
 		}),
 	}
 	registerer.MustRegister(m.totalConnects, m.totalTrappedTime, m.activeClients, m.clients,
-		m.completedSessions, m.sessionDuration, m.earlyDisconnect, m.firstResponseExit, m.protocolActions,
+		m.sessionStarts, m.completedSessions, m.sessionDuration, m.earlyDisconnect, m.firstResponseExit, m.protocolActions,
+		m.exporterMalformedMessages, m.exporterMessages, m.readErrors, m.writeErrors, m.bytesSent, m.bytesReceived,
 		m.upnpOtherHttpRequests, m.upnpMSearchRequests, m.upnpNonMSearchRequests,
 		m.mqttConacks, m.mqttUnsubscribe, m.mqttPubrec,
 		m.mqttMalformedConnect, m.mqttConnectVersions, m.mqttSubscribeTopics, m.mqttCredentials, m.telnetInput, m.mqttPublishTopics)
@@ -202,74 +238,108 @@ func listenForMetrics(socketPath string, metrics *metrics) {
 }
 
 func handleMetric(line string, metrics *metrics) {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		rejectMetric(metrics, "empty_message", "Empty metric line")
+		return
+	}
+
 	fields := strings.Fields(line)
 	log.Println(fields)
 
 	if len(fields) < 2 {
-		log.Printf("Malformed metric line (need at least 2 fields): %q", line)
+		rejectMetric(metrics, "missing_fields", "Malformed metric line (need at least 2 fields): %q", line)
 		return
 	}
 
 	server := fields[0]
 	command := fields[1]
+	if _, ok := protocolLabel(server); !ok {
+		rejectMetric(metrics, "unknown_server", "Unknown server in metric line: %q", line)
+		return
+	}
 
 	switch command {
 	case "connect":
 		if len(fields) < 3 {
-			log.Printf("Malformed connect metric (need 3 fields): %q", line)
+			rejectMetric(metrics, "missing_fields", "Malformed connect metric (need 3 fields): %q", line)
 			return
 		}
 		ip := fields[2]
+		if _, err := netip.ParseAddr(ip); err != nil {
+			rejectMetric(metrics, "invalid_number", "Invalid client IP in connect metric line %q: %v", line, err)
+			return
+		}
 		country := geoLookup(ip)
 		lat := CapitalCoordinates[country].Latitude
 		lon := CapitalCoordinates[country].Longitude
 		// Reduce cardinality by removing ip
 		handleConnect(server, country, lat, lon, metrics)
+		observeSessionStart(server, metrics)
 		observeProtocolAction(server, "connect", metrics)
+		acceptMetric(metrics)
 	case "disconnect":
-		if len(fields) < 4 {
-			log.Printf("Malformed disconnect metric (need 4 fields): %q", line)
+		if len(fields) != 4 && len(fields) != 8 {
+			reason := "unknown_format"
+			if len(fields) < 8 {
+				reason = "missing_fields"
+			}
+			rejectMetric(metrics, reason, "Malformed disconnect metric (need exactly 4 or 8 fields): %q", line)
 			return
 		}
-		// ip := fields[2]
+		if _, err := netip.ParseAddr(fields[2]); err != nil {
+			rejectMetric(metrics, "invalid_number", "Invalid client IP in disconnect metric line %q: %v", line, err)
+			return
+		}
 		parsedTimeTrapped, err := strconv.ParseUint(fields[3], 10, 64)
 		if err != nil {
-			fmt.Println("Error parsing timeTrapped:", err)
+			rejectMetric(metrics, "invalid_number", "Invalid trapped time in metric line %q: %v", line, err)
 			return
 		}
 		timeTrapped := float64(parsedTimeTrapped)
-		handleDisconnect(server, timeTrapped, metrics)
-		observeProtocolAction(server, "disconnect", metrics)
+		if len(fields) == 4 {
+			handleDisconnect(server, timeTrapped, metrics)
+			observeProtocolAction(server, "disconnect", metrics)
+			acceptMetric(metrics)
+			return
+		}
 
 		// Extended format:
 		// <server> disconnect <ip> <trapped_ms> <duration_ms>
 		// <interaction_depth> <reason> <first_response_exit>
-		if len(fields) < 8 {
-			return
-		}
 		durationMs, err := strconv.ParseUint(fields[4], 10, 64)
 		if err != nil {
-			log.Printf("Invalid session duration in metric line %q: %v", line, err)
+			rejectMetric(metrics, "invalid_number", "Invalid session duration in metric line %q: %v", line, err)
 			return
 		}
 		interactionDepth, err := strconv.ParseUint(fields[5], 10, 32)
 		if err != nil {
-			log.Printf("Invalid interaction depth in metric line %q: %v", line, err)
+			rejectMetric(metrics, "invalid_number", "Invalid interaction depth in metric line %q: %v", line, err)
+			return
+		}
+		disconnectReason, ok := canonicalDisconnectReason(fields[6])
+		if !ok {
+			rejectMetric(metrics, "unsupported_event", "Unsupported disconnect reason in metric line: %q", line)
 			return
 		}
 		firstResponseExit, err := strconv.ParseBool(fields[7])
 		if err != nil {
-			log.Printf("Invalid first-response-exit flag in metric line %q: %v", line, err)
+			rejectMetric(metrics, "invalid_number", "Invalid first-response-exit flag in metric line %q: %v", line, err)
 			return
 		}
+
+		// Apply all lifecycle mutations only after the complete message is valid.
+		handleDisconnect(server, timeTrapped, metrics)
+		observeProtocolAction(server, "disconnect", metrics)
 		observeCompletedSession(
 			server,
 			float64(durationMs),
 			uint32(interactionDepth),
-			fields[6],
+			disconnectReason,
 			firstResponseExit,
 			metrics,
 		)
+		acceptMetric(metrics)
 	// UPnP
 	case "otherHttpRequests":
 		method := " "
@@ -283,45 +353,51 @@ func handleMetric(line string, metrics *metrics) {
 
 		metrics.upnpOtherHttpRequests.WithLabelValues(method, url).Inc()
 		observeProtocolAction(server, "upnp_http_request", metrics)
+		acceptMetric(metrics)
 	case "M-SEARCH":
 		if len(fields) < 3 {
-			log.Printf("Malformed M-SEARCH metric (need 3 fields): %q", line)
+			rejectMetric(metrics, "missing_fields", "Malformed M-SEARCH metric (need 3 fields): %q", line)
 			return
 		}
 		ip := fields[2]
 		metrics.upnpMSearchRequests.WithLabelValues(ip).Inc()
 		observeProtocolAction(server, "upnp_discovery", metrics)
+		acceptMetric(metrics)
 	case "non-M-SEARCH":
 		if len(fields) < 3 {
-			log.Printf("Malformed non-M-SEARCH metric (need 3 fields): %q", line)
+			rejectMetric(metrics, "missing_fields", "Malformed non-M-SEARCH metric (need 3 fields): %q", line)
 			return
 		}
 		ip := fields[2]
 		metrics.upnpNonMSearchRequests.WithLabelValues(ip).Inc()
 		observeProtocolAction(server, "upnp_discovery", metrics)
+		acceptMetric(metrics)
 	// MQTT
 	case "CONNECT":
 		if len(fields) < 3 {
-			log.Printf("Malformed MQTT CONNECT metric (need 3 fields): %q", line)
+			rejectMetric(metrics, "missing_fields", "Malformed MQTT CONNECT metric (need 3 fields): %q", line)
 			return
 		}
 		version := fields[2]
 		metrics.mqttConnectVersions.WithLabelValues(version).Inc()
 		observeProtocolAction(server, "mqtt_connect", metrics)
+		acceptMetric(metrics)
 
 	case "malformedConnect":
 		metrics.mqttMalformedConnect.Inc()
 		observeProtocolAction(server, "malformed_connect", metrics)
+		acceptMetric(metrics)
 
 	case "SUBSCRIBE":
 		if len(fields) < 4 {
-			log.Printf("Malformed SUBSCRIBE metric (need 4 fields): %q", line)
+			rejectMetric(metrics, "missing_fields", "Malformed SUBSCRIBE metric (need 4 fields): %q", line)
 			return
 		}
 		topic := fields[2]
 		qos := fields[3]
 		metrics.mqttSubscribeTopics.WithLabelValues(topic, qos).Inc()
 		observeProtocolAction(server, "mqtt_subscribe", metrics)
+		acceptMetric(metrics)
 
 	case "credentials":
 		username := " "
@@ -334,40 +410,117 @@ func handleMetric(line string, metrics *metrics) {
 		}
 
 		metrics.mqttCredentials.WithLabelValues(username, password).Inc()
+		acceptMetric(metrics)
 
 	case "PUBLISH":
 		if len(fields) < 4 {
-			log.Printf("Malformed PUBLISH metric (need 4 fields): %q", line)
+			rejectMetric(metrics, "missing_fields", "Malformed PUBLISH metric (need 4 fields): %q", line)
 			return
 		}
 		topic := fields[2]
 		qos := fields[3]
 		metrics.mqttPublishTopics.WithLabelValues(topic, qos).Inc()
 		observeProtocolAction(server, "mqtt_publish", metrics)
+		acceptMetric(metrics)
 
 	case "CONNACK":
 		metrics.mqttConacks.Inc()
 		observeProtocolAction(server, "mqtt_connack", metrics)
+		acceptMetric(metrics)
 	case "UNSUBSCRIBE":
 		metrics.mqttUnsubscribe.Inc()
 		observeProtocolAction(server, "mqtt_unsubscribe", metrics)
+		acceptMetric(metrics)
 	case "PUBREC":
 		metrics.mqttPubrec.Inc()
 		observeProtocolAction(server, "mqtt_pubrec", metrics)
+		acceptMetric(metrics)
 	case "action":
 		if len(fields) < 4 {
+			rejectMetric(metrics, "missing_fields", "Malformed Telnet action metric (need 4 fields): %q", line)
 			return
 		}
 		ip := fields[2]
 		metrics.telnetInput.WithLabelValues(ip).Inc()
 		observeProtocolAction(server, "read", metrics)
+		acceptMetric(metrics)
 	case "protocol_action":
 		if len(fields) != 3 {
-			log.Printf("Malformed protocol action metric: %q", line)
+			reason := "unknown_format"
+			if len(fields) < 3 {
+				reason = "missing_fields"
+			}
+			rejectMetric(metrics, reason, "Malformed protocol action metric: %q", line)
+			return
+		}
+		if !allowedProtocolAction(fields[2]) {
+			rejectMetric(metrics, "unsupported_event", "Unsupported protocol action in metric line: %q", line)
 			return
 		}
 		observeProtocolAction(server, fields[2], metrics)
+		acceptMetric(metrics)
+	case "session_start":
+		if len(fields) != 2 {
+			rejectMetric(metrics, "unknown_format", "Malformed session_start metric: %q", line)
+			return
+		}
+		observeSessionStart(server, metrics)
+		acceptMetric(metrics)
+	case "read_error":
+		if len(fields) < 3 {
+			rejectMetric(metrics, "missing_fields", "Malformed read_error metric (need 3 fields): %q", line)
+			return
+		}
+		observeReadError(server, fields[2], metrics)
+		acceptMetric(metrics)
+	case "write_error":
+		if len(fields) < 3 {
+			rejectMetric(metrics, "missing_fields", "Malformed write_error metric (need 3 fields): %q", line)
+			return
+		}
+		observeWriteError(server, fields[2], metrics)
+		acceptMetric(metrics)
+	case "bytes_sent":
+		if len(fields) < 3 {
+			rejectMetric(metrics, "missing_fields", "Malformed bytes_sent metric (need 3 fields): %q", line)
+			return
+		}
+		bytes, err := strconv.ParseUint(fields[2], 10, 64)
+		if err != nil {
+			rejectMetric(metrics, "invalid_number", "Invalid bytes_sent value in metric line %q: %v", line, err)
+			return
+		}
+		observeBytesSent(server, float64(bytes), metrics)
+		acceptMetric(metrics)
+	case "bytes_received":
+		if len(fields) < 3 {
+			rejectMetric(metrics, "missing_fields", "Malformed bytes_received metric (need 3 fields): %q", line)
+			return
+		}
+		bytes, err := strconv.ParseUint(fields[2], 10, 64)
+		if err != nil {
+			rejectMetric(metrics, "invalid_number", "Invalid bytes_received value in metric line %q: %v", line, err)
+			return
+		}
+		observeBytesReceived(server, float64(bytes), metrics)
+		acceptMetric(metrics)
+	default:
+		rejectMetric(metrics, "unsupported_event", "Unsupported metric command in line: %q", line)
 	}
+}
+
+func acceptMetric(metrics *metrics) {
+	metrics.exporterMessages.WithLabelValues("accepted").Inc()
+}
+
+func rejectMetric(metrics *metrics, reason string, format string, args ...any) {
+	recordMalformedMetric(metrics, reason, format, args...)
+	metrics.exporterMessages.WithLabelValues("rejected").Inc()
+}
+
+func recordMalformedMetric(metrics *metrics, reason string, format string, args ...any) {
+	metrics.exporterMalformedMessages.WithLabelValues(boundedMalformedReason(reason)).Inc()
+	log.Printf(format, args...)
 }
 
 func protocolLabel(server string) (string, bool) {
@@ -387,6 +540,14 @@ func protocolLabel(server string) (string, bool) {
 	}
 }
 
+func observeSessionStart(server string, metrics *metrics) {
+	protocol, ok := protocolLabel(server)
+	if !ok {
+		return
+	}
+	metrics.sessionStarts.WithLabelValues(protocol).Inc()
+}
+
 func observeProtocolAction(server string, action string, metrics *metrics) {
 	protocol, ok := protocolLabel(server)
 	if !ok {
@@ -397,6 +558,38 @@ func observeProtocolAction(server string, action string, metrics *metrics) {
 		return
 	}
 	metrics.protocolActions.WithLabelValues(protocol, action).Inc()
+}
+
+func observeReadError(server string, reason string, metrics *metrics) {
+	protocol, ok := protocolLabel(server)
+	if !ok {
+		return
+	}
+	metrics.readErrors.WithLabelValues(protocol, boundedIOErrorReason(reason)).Inc()
+}
+
+func observeWriteError(server string, reason string, metrics *metrics) {
+	protocol, ok := protocolLabel(server)
+	if !ok {
+		return
+	}
+	metrics.writeErrors.WithLabelValues(protocol, boundedIOErrorReason(reason)).Inc()
+}
+
+func observeBytesSent(server string, bytes float64, metrics *metrics) {
+	protocol, ok := protocolLabel(server)
+	if !ok {
+		return
+	}
+	metrics.bytesSent.WithLabelValues(protocol).Add(bytes)
+}
+
+func observeBytesReceived(server string, bytes float64, metrics *metrics) {
+	protocol, ok := protocolLabel(server)
+	if !ok {
+		return
+	}
+	metrics.bytesReceived.WithLabelValues(protocol).Add(bytes)
 }
 
 func allowedProtocolAction(action string) bool {
@@ -411,12 +604,38 @@ func allowedProtocolAction(action string) bool {
 	}
 }
 
-func boundedDisconnectReason(reason string) string {
+func boundedMalformedReason(reason string) string {
 	switch reason {
-	case "client_disconnect", "inactivity", "read_error", "write_error":
+	case "empty_message", "unknown_format", "unknown_server", "missing_fields", "invalid_number", "unsupported_event":
 		return reason
 	default:
+		return "unknown_format"
+	}
+}
+
+func boundedIOErrorReason(reason string) string {
+	switch reason {
+	case "eof", "timeout", "reset", "closed", "invalid_packet", "unknown":
+		return reason
+	case "connection_reset":
+		return "reset"
+	case "broken_pipe", "not_connected", "connection_aborted", "bad_fd":
+		return "closed"
+	case "timed_out", "would_block":
+		return "timeout"
+	default:
 		return "unknown"
+	}
+}
+
+func canonicalDisconnectReason(reason string) (string, bool) {
+	switch reason {
+	case "client_disconnect", "read_error", "write_error", "timeout", "parse_error", "server_close", "unknown":
+		return reason, true
+	case "inactivity":
+		return "timeout", true
+	default:
+		return "", false
 	}
 }
 
@@ -473,7 +692,7 @@ func observeCompletedSession(server string, durationMs float64, interactionDepth
 		return
 	}
 
-	metrics.completedSessions.WithLabelValues(protocol, boundedDisconnectReason(disconnectReason)).Inc()
+	metrics.completedSessions.WithLabelValues(protocol, disconnectReason).Inc()
 	metrics.sessionDuration.WithLabelValues(protocol).Observe(durationMs)
 	earlyDisconnect := metrics.earlyDisconnect.WithLabelValues(protocol)
 	firstResponseExit := metrics.firstResponseExit.WithLabelValues(protocol)
@@ -492,16 +711,24 @@ func parseTimeMs(s string) int64 {
 }
 
 func geoLookup(ipStr string) string {
-	ip := netip.MustParseAddr(ipStr)
+	ip, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		log.Printf("Invalid IP address for GeoIP lookup %q: %v", ipStr, err)
+		return ""
+	}
+	if db == nil {
+		return ""
+	}
 
 	var record struct {
 		Country struct {
 			ISOCode string `maxminddb:"iso_code"`
 		} `maxminddb:"country"`
 	}
-	err := db.Lookup(ip).Decode(&record)
+	err = db.Lookup(ip).Decode(&record)
 	if err != nil {
-		log.Panic(err)
+		log.Printf("GeoIP lookup failed for %q: %v", ipStr, err)
+		return ""
 	}
 	fmt.Print(record.Country.ISOCode)
 

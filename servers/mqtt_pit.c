@@ -380,9 +380,13 @@ bool sendConnack(struct mqttClient* client, uint8_t reasonCode) {
     if (w == -1) {
         fprintf(stderr, "sendConnack: write failed. May retry.");
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            sendReliabilityMetric(SERVER_ID, "write_error", metricReasonFromErrno(errno));
             return false;
         }
     } else {
+        if (w > 0) {
+            sendByteMetric(SERVER_ID, "sent", (unsigned long long)w);
+        }
         char msg[256];
         snprintf(msg, sizeof(msg), "%s CONNACK\n",
             SERVER_ID);
@@ -552,9 +556,13 @@ bool sendPublish(struct mqttClient* client, const char* topic, const char* messa
     if (w < 0) {
         fprintf(stderr, "sendPublish: write failed. May retry.");
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            sendReliabilityMetric(SERVER_ID, "write_error", metricReasonFromErrno(errno));
             return false;
         }
     } else {
+        if (w > 0) {
+            sendByteMetric(SERVER_ID, "sent", (unsigned long long)w);
+        }
         // syslog(LOG_INFO, "Sent PUBLISH to client (fd=%d), topic=%s\n", client->fd, topic);
     }
     
@@ -677,11 +685,15 @@ bool sendPubrel(struct mqttClient* client, uint16_t packetId) {
     ssize_t w = write(client->fd, arr, size);
     if (w == -1) {
         fprintf(stderr, "sendPubrel: write failed");
+        sendReliabilityMetric(SERVER_ID, "write_error", metricReasonFromErrno(errno));
         free(arr);
         return false;
     }
 
     // syslog(LOG_INFO, "Sent PUBREL to client fd=%d", client->fd);
+    if (w > 0) {
+        sendByteMetric(SERVER_ID, "sent", (unsigned long long)w);
+    }
     free(arr);
     return true;
 }
@@ -705,9 +717,13 @@ bool sendPingresp(struct mqttClient* client) {
     if (w == -1) {
         fprintf(stderr, "sendPingresp: write failed. May retry.");
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            sendReliabilityMetric(SERVER_ID, "write_error", metricReasonFromErrno(errno));
             return false;
         }
     } else {
+        if (w > 0) {
+            sendByteMetric(SERVER_ID, "sent", (unsigned long long)w);
+        }
         fprintf(stderr, "Sent PINGRESP to client (fd=%d)\n", client->fd);
     }
     return true;
@@ -956,6 +972,7 @@ int main(int argc, char* argv[]) {
                         continue;
                     }
                     fprintf(stderr, "Failed reading. Disconnecting client. error: %s", strerror(errno));
+                    sendReliabilityMetric(SERVER_ID, "read_error", metricReasonFromErrno(errno));
                     disconnectClient(client, epollfd, now, "read_error");
                     continue;
                 }
@@ -966,10 +983,12 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
+                sendByteMetric(SERVER_ID, "received", (unsigned long long)bytesRead);
                 client->bytesWrittenToBuffer += bytesRead;
 
                 if (client->bytesWrittenToBuffer >= sizeof(client->buffer)) {
                     fprintf(stderr, "Buffer full. Disconnecting client.");
+                    sendReliabilityMetric(SERVER_ID, "read_error", "invalid_packet");
                     disconnectClient(client, epollfd, now, "read_error");
                     continue;
                 }

@@ -9,6 +9,7 @@
 #include <sys/resource.h>
 #include <sys/un.h>
 #include <stdio.h>
+#include <string.h>
 #include "structs.h"
 
 struct queue clientQueueTelnet;
@@ -188,4 +189,52 @@ void sendMetric(const char* message) {
         perror("sendto failed");
     }
     close(sock);
+}
+
+const char *metricReasonFromErrno(int errorNumber) {
+    switch (errorNumber) {
+        case ETIMEDOUT:
+            return "timeout";
+        case ECONNRESET:
+            return "reset";
+        case EPIPE:
+        case ENOTCONN:
+        case ECONNABORTED:
+        case EBADF:
+            return "closed";
+        default:
+            return "unknown";
+    }
+}
+
+void sendReliabilityMetric(const char *server, const char *event, const char *reason) {
+    if (!server || !event) {
+        return;
+    }
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "%s %s %s\n",
+        server,
+        event,
+        reason && reason[0] ? reason : "unknown");
+    sendMetric(msg);
+}
+
+void sendByteMetric(const char *server, const char *direction, unsigned long long bytes) {
+    if (!server || !direction || bytes == 0) {
+        return;
+    }
+
+    const char *command = NULL;
+    if (strcmp(direction, "sent") == 0) {
+        command = "bytes_sent";
+    } else if (strcmp(direction, "received") == 0) {
+        command = "bytes_received";
+    } else {
+        return;
+    }
+
+    char msg[128];
+    snprintf(msg, sizeof(msg), "%s %s %llu\n", server, command, bytes);
+    sendMetric(msg);
 }

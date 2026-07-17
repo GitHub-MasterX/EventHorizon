@@ -161,6 +161,7 @@ int main(int argc, char *argv[]) {
                         emitTelnetWriteEvent(c, "would_block", delay, 0);
                         queue_append(&clientQueueTelnet, (struct baseClient *)c);
                     } else {
+                        sendReliabilityMetric(SERVER_ID, "write_error", metricReasonFromErrno(errno));
                         emitTelnetWriteEvent(c, "write_error", delay, 0);
                         completeTelnetSession(c, now, "write_error");
                         close(c->fd);
@@ -171,6 +172,7 @@ int main(int argc, char *argv[]) {
                     c->base.timeConnected += delay;
                     statsTelnet.totalWastedTime += delay;
                     if (out > 0) {
+                        sendByteMetric(SERVER_ID, "sent", (unsigned long long)out);
                         emitProtocolActionMetric(c->firstResponseSent ? "write" : "banner");
                         c->firstResponseSent = true;
                     }
@@ -178,13 +180,20 @@ int main(int argc, char *argv[]) {
                     char buf[65];
                     ssize_t r=read(c->fd, buf, sizeof(buf)-1);
                     if(r<0){
-                        //do nothing
+                        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                            sendReliabilityMetric(SERVER_ID, "read_error", metricReasonFromErrno(errno));
+                            completeTelnetSession(c, now, "read_error");
+                            close(c->fd);
+                            free(c);
+                            continue;
+                        }
                     }else if(r==0){
                         completeTelnetSession(c, now, "client_disconnect");
                         close(c->fd);
                         free(c);
                         continue;
                     }else{
+                        sendByteMetric(SERVER_ID, "received", (unsigned long long)r);
                         //terminate null
                         buf[r]='\0';
                         for(int i=0;i<r;i++){

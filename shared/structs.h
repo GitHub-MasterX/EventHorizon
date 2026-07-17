@@ -150,4 +150,19 @@ void setFdLimit(int limit);
  */
 void sendMetric(const char* message);
 
+/**
+ * @brief Maps errno values to bounded Prometheus label values.
+ */
+const char *metricReasonFromErrno(int errorNumber);
+
+/**
+ * @brief Sends a bounded reliability error metric.
+ */
+void sendReliabilityMetric(const char *server, const char *event, const char *reason);
+
+/**
+ * @brief Sends aggregate byte accounting metrics.
+ */
+void sendByteMetric(const char *server, const char *direction, unsigned long long bytes);
+
 #endif
