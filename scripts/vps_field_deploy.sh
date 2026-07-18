@@ -32,6 +32,7 @@ fi
 read -r -p "Type DEPLOY $DEPLOY_COMMIT to clone/build/start the authorized VPS stack: " confirmation
 [[ "$confirmation" == "DEPLOY $DEPLOY_COMMIT" ]] || vps_field_die "deployment cancelled"
 
+memory_limit_arg="${FIELD_TARPIT_MEMORY_LIMIT:-__EVENTHORIZON_EMPTY__}"
 vps_field_ssh bash -s -- \
     "$VPS_DEPLOY_DIR" \
     "$VPS_PROJECT_NAME" \
@@ -41,7 +42,7 @@ vps_field_ssh bash -s -- \
     "$FIELD_DURATION_HOURS" \
     "$SNAPSHOT_INTERVAL_HOURS" \
     "$FIELD_TARPIT_CPU_LIMIT" \
-    "${FIELD_TARPIT_MEMORY_LIMIT:-}" <<'REMOTE'
+    "$memory_limit_arg" <<'REMOTE'
 set -Eeuo pipefail
 
 deploy_dir_input="$1"
@@ -52,7 +53,8 @@ deploy_commit="$5"
 field_duration="$6"
 snapshot_interval="$7"
 cpu_limit="$8"
-memory_limit="$9"
+memory_limit="${9:-}"
+[[ "$memory_limit" == "__EVENTHORIZON_EMPTY__" ]] && memory_limit=""
 
 case "$deploy_dir_input" in
     "~/"*) deploy_dir="$HOME/${deploy_dir_input#\~/}" ;;

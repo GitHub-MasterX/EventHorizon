@@ -9,19 +9,21 @@ vps_field_load_env
 printf 'Running read-only VPS preflight. No package, firewall, file, or container changes will be made.\n'
 
 local_epoch="$(date -u +%s)"
+memory_limit_arg="${FIELD_TARPIT_MEMORY_LIMIT:-__EVENTHORIZON_EMPTY__}"
 vps_field_ssh bash -s -- \
     "$VPS_DEPLOY_DIR" \
     "$VPS_PROJECT_NAME" \
     "$REPOSITORY_URL" \
     "$local_epoch" \
-    "${FIELD_TARPIT_MEMORY_LIMIT:-}" <<'REMOTE'
+    "$memory_limit_arg" <<'REMOTE'
 set -u
 
 deploy_dir_input="$1"
 project_name="$2"
 repository_url="$3"
 reference_epoch="$4"
-requested_memory_limit="$5"
+requested_memory_limit="${5:-}"
+[[ "$requested_memory_limit" == "__EVENTHORIZON_EMPTY__" ]] && requested_memory_limit=""
 failures=0
 
 case "$deploy_dir_input" in
