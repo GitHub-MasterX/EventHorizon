@@ -159,10 +159,27 @@ while :; do
     sleep 3
 done
 
-curl -fsS http://127.0.0.1:9101/metrics >/dev/null
-curl -fsS http://127.0.0.1:9090/-/healthy >/dev/null
-curl -fsS http://127.0.0.1:3000/api/health >/dev/null
-curl -fsS http://127.0.0.1:8081/healthz >/dev/null
+wait_http() {
+    local name="$1"
+    local url="$2"
+    local deadline=$((SECONDS + 120))
+    while :; do
+        if curl -fsS "$url" >/dev/null; then
+            printf '%s endpoint is ready: %s\n' "$name" "$url"
+            return 0
+        fi
+        ((SECONDS < deadline)) || {
+            printf '%s endpoint did not become ready: %s\n' "$name" "$url" >&2
+            return 1
+        }
+        sleep 3
+    done
+}
+
+wait_http 'EventHorizon exporter' 'http://127.0.0.1:9101/metrics'
+wait_http 'Prometheus' 'http://127.0.0.1:9090/-/healthy'
+wait_http 'Grafana' 'http://127.0.0.1:3000/api/health'
+wait_http 'cAdvisor' 'http://127.0.0.1:8081/healthz'
 
 for port in 3000 8081 9090 9101; do
     mapfile -t addresses < <(ss -H -ltn | awk -v suffix=":$port" '$4 ~ suffix "$" {print $4}')
