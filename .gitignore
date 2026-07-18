@@ -1,5 +1,7 @@
 bin/
 logs/
+analysis/
+docs/
 validation-output/
 deploy/vps-field.env
 otel-output/
