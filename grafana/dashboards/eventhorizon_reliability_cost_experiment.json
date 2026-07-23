@@ -136,7 +136,7 @@
   "tags": ["eventhorizon", "experimental", "gsoc-2026", "reliability-cost"],
   "templating": {"list": []},
   "time": {"from": "now-1h", "to": "now"},
-  "timepicker": {},
+  "timepicker": {"hidden": false, "quick_ranges": [{"display": "Last 15 minutes", "from": "now-15m", "to": "now"}, {"display": "Last 1 hour", "from": "now-1h", "to": "now"}, {"display": "Last 6 hours", "from": "now-6h", "to": "now"}, {"display": "Last 24 hours", "from": "now-24h", "to": "now"}, {"display": "Last 3 days", "from": "now-3d", "to": "now"}, {"display": "Last 7 days", "from": "now-7d", "to": "now"}]},
   "timezone": "utc",
   "title": "EventHorizon - Reliability, Cost & Experiment",
   "uid": "eh-reliability-cost",

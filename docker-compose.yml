@@ -103,9 +103,12 @@ services:
     ports:
       - "127.0.0.1:9090:9090"
     volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
     depends_on:
       - prometheus-exporter
 
@@ -125,5 +128,6 @@ services:
     - GF_LOG_LEVEL=warn
 
 volumes:
+  prometheus-data:
   grafana-storage:
   tarpit-sock:

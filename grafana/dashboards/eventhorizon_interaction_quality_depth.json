@@ -1,5 +1,5 @@
 {
-  "annotations": {"list": [{"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": true, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"}]},
+  "annotations": {"list": [{"builtIn": 1, "datasource": {"type": "grafana", "uid": "-- Grafana --"}, "enable": true, "hide": false, "iconColor": "rgba(0, 211, 255, 1)", "name": "Annotations & Alerts", "type": "dashboard"}]},
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 0,
@@ -8,16 +8,62 @@
     {
       "gridPos": {"h": 5, "w": 24, "x": 0, "y": 0},
       "id": 1,
-      "options": {"content": "A specialist view of bounded protocol activity, showing whether traffic progresses beyond opening a connection. It compares Telnet, MQTT, CoAP, and UPnP actions without exposing raw payloads, topics, client IDs, or source IPs.\n\nActions per completed session and early disconnect are provisional Telnet/MQTT views. Cross-protocol shallow/deep classification remains deferred until interaction-depth semantics are approved.\n\nAll dashboard timestamps are displayed in UTC (UTC+00:00).", "mode": "markdown"},
+      "options": {"content": "Bounded final Telnet and MQTT session classification. Level 0 is no meaningful progression; level 1 is incomplete Telnet input or MQTT CONNECT only; level 2 is one complete Telnet line or one MQTT application operation; level 3 is continued interaction. The levels are ordinal categories, not a weighted score. No session ID, source IP, command, topic, payload, credential, or client ID is a metric label.\n\nAll dashboard timestamps and generated validation links use UTC (UTC+00:00).", "mode": "markdown"},
       "title": "Dashboard Purpose & Interpretation",
       "type": "text"
     },
-    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5}, "id": 2, "panels": [], "title": "Available Protocol Actions", "type": "row"},
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5}, "id": 2, "panels": [], "title": "Completed Session Interaction Depth", "type": "row"},
     {
       "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "description": "Purpose: show completed-session depth changes over time. Interpret higher levels as more protocol progression, not greater attacker sophistication. Limitation: values are scrape-window increases and levels are ordinal.",
       "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
       "gridPos": {"h": 8, "w": 24, "x": 0, "y": 6},
       "id": 3,
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [{"expr": "sum by (protocol, depth_level) (increase(eventhorizon_session_interaction_depth_total[$__rate_interval]))", "legendFormat": "{{protocol}} / level {{depth_level}}", "refId": "A"}],
+      "title": "Completed Sessions by Interaction Depth",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "description": "Purpose: compare the selected UTC window's final depth distribution. Interpret each bar as a completed-session count. Limitation: sessions active at either window boundary are not a closed cohort.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 14},
+      "id": 4,
+      "options": {"displayMode": "gradient", "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "showUnfilled": true},
+      "targets": [{"expr": "sum by (protocol, depth_level) (increase(eventhorizon_session_interaction_depth_total[$__range]))", "instant": true, "legendFormat": "{{protocol}} / level {{depth_level}}", "refId": "A"}],
+      "title": "Interaction Depth Distribution by Protocol",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "description": "Purpose: show the fraction of completed sessions with no meaningful progression. During compatibility validation this must equal the early-disconnect ratio. Limitation: sparse completion counts make ratios unstable.",
+      "fieldConfig": {"defaults": {"min": 0, "max": 1, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 14},
+      "id": 5,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [{"expr": "sum by (protocol) (rate(eventhorizon_session_interaction_depth_total{depth_level=\"0\"}[$__rate_interval])) / sum by (protocol) (rate(eventhorizon_session_interaction_depth_total[$__rate_interval]))", "legendFormat": "{{protocol}}", "refId": "A"}],
+      "title": "Zero-Depth Session Ratio",
+      "type": "timeseries"
+    },
+    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 22}, "id": 6, "panels": [], "title": "Actions and Reconciliation", "type": "row"},
+    {
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "description": "Purpose: compare bounded client-originated actions with completions. Interpretation: operational activity per completion, not per-session depth. Limitation: aggregate action totals can be skewed by a few long sessions.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 23},
+      "id": 7,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [{"expr": "sum by (protocol) (increase(eventhorizon_protocol_actions_total{protocol=~\"telnet|mqtt\",action=~\"read|mqtt_connect|mqtt_publish|mqtt_subscribe|mqtt_unsubscribe\"}[$__rate_interval])) / sum by (protocol) (increase(eventhorizon_completed_sessions_total{protocol=~\"telnet|mqtt\"}[$__rate_interval]))", "legendFormat": "{{protocol}}", "refId": "A"}],
+      "title": "Meaningful Actions per Completion",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
+      "description": "Purpose: expose the bounded protocol action vocabulary. Interpretation depends on action type; server writes are work signals, not client depth. Limitation: this is aggregate action telemetry.",
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 23},
+      "id": 8,
       "options": {"barWidth": 0.8, "groupWidth": 0.7, "legend": {"displayMode": "table", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}, "xTickLabelRotation": 0, "xTickLabelSpacing": 100},
       "pluginVersion": "12.4.1",
       "targets": [{"expr": "sum by (protocol, action) (increase(eventhorizon_protocol_actions_total[$__rate_interval]))", "legendFormat": "{{protocol}} / {{action}}", "refId": "A"}],
@@ -26,77 +72,14 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
-      "description": "Provisional: numerator includes only agreed client-originated Telnet/MQTT actions and excludes connect/disconnect and server responses.",
+      "description": "Purpose: verify one final depth classification per completed Telnet/MQTT session. Expected value is exactly zero. Limitation: use a selected window that includes complete scrapes around both boundaries.",
       "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 14},
-      "id": 4,
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 31},
+      "id": 9,
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
-      "targets": [{"expr": "sum by (protocol) (increase(eventhorizon_protocol_actions_total{protocol=~\"telnet|mqtt\",action=~\"read|mqtt_connect|mqtt_publish|mqtt_subscribe|mqtt_disconnect\"}[$__rate_interval])) / sum by (protocol) (increase(eventhorizon_completed_sessions_total{protocol=~\"telnet|mqtt\"}[$__rate_interval]))", "legendFormat": "{{protocol}}", "refId": "A"}],
-      "title": "Client Actions per Completed Session (Provisional)",
+      "targets": [{"expr": "sum by (protocol) (increase(eventhorizon_completed_sessions_total{protocol=~\"telnet|mqtt\"}[$__rate_interval])) - sum by (protocol) (increase(eventhorizon_session_interaction_depth_total[$__rate_interval]))", "legendFormat": "{{protocol}}", "refId": "A"}],
+      "title": "Depth Reconciliation Gap",
       "type": "timeseries"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
-      "id": 5,
-      "options": {"barWidth": 0.8, "groupWidth": 0.7, "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}, "xTickLabelRotation": 0, "xTickLabelSpacing": 80},
-      "pluginVersion": "12.4.1",
-      "targets": [{"expr": "sum by (action) (increase(eventhorizon_protocol_actions_total{protocol=\"telnet\"}[$__rate_interval]))", "legendFormat": "{{action}}", "refId": "A"}],
-      "title": "Telnet Actions",
-      "type": "barchart"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
-      "id": 6,
-      "options": {"barWidth": 0.8, "groupWidth": 0.7, "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}, "xTickLabelRotation": 0, "xTickLabelSpacing": 80},
-      "pluginVersion": "12.4.1",
-      "targets": [{"expr": "sum by (action) (increase(eventhorizon_protocol_actions_total{protocol=\"mqtt\"}[$__rate_interval]))", "legendFormat": "{{action}}", "refId": "A"}],
-      "title": "MQTT Actions",
-      "type": "barchart"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 30},
-      "id": 7,
-      "options": {"barWidth": 0.8, "groupWidth": 0.7, "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}, "xTickLabelRotation": 0, "xTickLabelSpacing": 80},
-      "pluginVersion": "12.4.1",
-      "targets": [{"expr": "sum by (action) (increase(eventhorizon_protocol_actions_total{protocol=\"coap\"}[$__rate_interval]))", "legendFormat": "{{action}}", "refId": "A"}],
-      "title": "CoAP Actions",
-      "type": "barchart"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 30},
-      "id": 8,
-      "options": {"barWidth": 0.8, "groupWidth": 0.7, "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}, "xTickLabelRotation": 0, "xTickLabelSpacing": 80},
-      "pluginVersion": "12.4.1",
-      "targets": [{"expr": "sum by (action) (increase(eventhorizon_protocol_actions_total{protocol=\"upnp\"}[$__rate_interval]))", "legendFormat": "{{action}}", "refId": "A"}],
-      "title": "UPnP Actions",
-      "type": "barchart"
-    },
-    {"collapsed": false, "gridPos": {"h": 1, "w": 24, "x": 0, "y": 38}, "id": 9, "panels": [], "title": "Interaction Depth Status", "type": "row"},
-    {
-      "datasource": {"type": "prometheus", "uid": "PBFA97CFB590B2093"},
-      "description": "Provisional Telnet/MQTT definition: a completed session with zero meaningful client actions.",
-      "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 39},
-      "id": 11,
-      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
-      "targets": [{"expr": "sum by (protocol) (rate(eventhorizon_early_disconnect_total{protocol=~\"telnet|mqtt\"}[$__rate_interval])) / sum by (protocol) (rate(eventhorizon_completed_sessions_total{protocol=~\"telnet|mqtt\"}[$__rate_interval]))", "legendFormat": "{{protocol}}", "refId": "A"}],
-      "title": "Early Disconnect Ratio (Provisional)",
-      "type": "timeseries"
-    },
-    {
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 39},
-      "id": 12,
-      "options": {"content": "# Implementation Status\n\nThis dashboard represents the Protocol Interaction Depth metric branch.\n\nAvailable now:\n- `eventhorizon_protocol_actions_total`\n- bounded Telnet, MQTT, CoAP, and UPnP action labels\n- completed-session denominator for Telnet and MQTT\n\nStill required:\n- mentor-approved cross-protocol interaction-depth semantics\n- shallow/deep session classification\n- validation for actions-per-session interpretation\n\nThese items are deferred because they require a protocol-aware definition, not another generic counter. The dashboard becomes fully active after that definition and metric branch are approved.\n\n```text\nProtocol Interaction Depth\n|-- Telnet actions\n|-- MQTT actions\n|-- Client actions per completed session\n`-- Shallow vs deep sessions\n```", "mode": "markdown"},
-      "title": "Implementation Status",
-      "type": "text"
     }
   ],
   "refresh": "15s",
@@ -104,10 +87,10 @@
   "tags": ["eventhorizon", "gsoc-2026", "interaction-depth", "specialist"],
   "templating": {"list": []},
   "time": {"from": "now-1h", "to": "now"},
-  "timepicker": {},
+  "timepicker": {"hidden": false, "quick_ranges": [{"display": "Last 15 minutes", "from": "now-15m", "to": "now"}, {"display": "Last 1 hour", "from": "now-1h", "to": "now"}, {"display": "Last 6 hours", "from": "now-6h", "to": "now"}, {"display": "Last 24 hours", "from": "now-24h", "to": "now"}, {"display": "Last 3 days", "from": "now-3d", "to": "now"}, {"display": "Last 7 days", "from": "now-7d", "to": "now"}]},
   "timezone": "utc",
   "title": "EventHorizon - Interaction Quality & Depth",
   "uid": "eh-interaction-depth",
-  "version": 2,
+  "version": 3,
   "weekStart": ""
 }
