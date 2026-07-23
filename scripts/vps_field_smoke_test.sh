@@ -66,6 +66,14 @@ queries = {
     "mqtt_rx_bytes": 'sum(eventhorizon_bytes_received_total{protocol="mqtt"}) or vector(0)',
     "telnet_tx_bytes": 'sum(eventhorizon_bytes_sent_total{protocol="telnet"}) or vector(0)',
     "mqtt_tx_bytes": 'sum(eventhorizon_bytes_sent_total{protocol="mqtt"}) or vector(0)',
+    "telnet_depth_total": 'sum(eventhorizon_session_interaction_depth_total{protocol="telnet"}) or vector(0)',
+    "mqtt_depth_total": 'sum(eventhorizon_session_interaction_depth_total{protocol="mqtt"}) or vector(0)',
+    "telnet_depth_0": 'sum(eventhorizon_session_interaction_depth_total{protocol="telnet",depth_level="0"}) or vector(0)',
+    "mqtt_depth_0": 'sum(eventhorizon_session_interaction_depth_total{protocol="mqtt",depth_level="0"}) or vector(0)',
+    "telnet_depth_2": 'sum(eventhorizon_session_interaction_depth_total{protocol="telnet",depth_level="2"}) or vector(0)',
+    "mqtt_depth_2": 'sum(eventhorizon_session_interaction_depth_total{protocol="mqtt",depth_level="2"}) or vector(0)',
+    "telnet_early_disconnect": 'sum(eventhorizon_early_disconnect_total{protocol="telnet"}) or vector(0)',
+    "mqtt_early_disconnect": 'sum(eventhorizon_early_disconnect_total{protocol="mqtt"}) or vector(0)',
     "malformed": 'sum(eventhorizon_exporter_malformed_messages_total) or vector(0)',
     "read_outcomes": 'sum(eventhorizon_read_errors_total{protocol=~"telnet|mqtt"}) or vector(0)',
     "write_outcomes": 'sum(eventhorizon_write_errors_total{protocol=~"telnet|mqtt"}) or vector(0)',
@@ -150,6 +158,11 @@ for protocol in ("telnet", "mqtt"):
     checks[f"{protocol}_histogram_consistent"] = after[f"{protocol}_duration_inf"] == after[f"{protocol}_duration_count"]
     checks[f"{protocol}_rx_increased"] = deltas[f"{protocol}_rx_bytes"] > 0
     checks[f"{protocol}_tx_increased"] = deltas[f"{protocol}_tx_bytes"] > 0
+    checks[f"{protocol}_depth_plus_one"] = deltas[f"{protocol}_depth_total"] == 1
+    checks[f"{protocol}_expected_depth_two"] = deltas[f"{protocol}_depth_2"] == 1
+    checks[f"{protocol}_depth_zero_matches_early"] = (
+        deltas[f"{protocol}_depth_0"] == deltas[f"{protocol}_early_disconnect"]
+    )
 
 checks["malformed_unchanged"] = deltas["malformed"] == 0
 checks["read_outcomes_unchanged"] = deltas["read_outcomes"] == 0

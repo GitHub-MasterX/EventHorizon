@@ -112,16 +112,42 @@ exporter_environment = services["prometheus-exporter"].get("environment", {})
 if exporter_environment.get("EVENTHORIZON_FIELD_SAFE_MODE") != "true":
     raise SystemExit("exporter field-safe mode is not enabled")
 
+def require_named_mount(service_name, source, target):
+    matches = [
+        mount for mount in services[service_name].get("volumes", [])
+        if mount.get("type") == "volume"
+        and mount.get("source") == source
+        and mount.get("target") == target
+    ]
+    if len(matches) != 1:
+        raise SystemExit(
+            f"{service_name} must mount named volume {source!r} exactly once at {target!r}"
+        )
+
+require_named_mount("prometheus", "prometheus-data", "/prometheus")
+require_named_mount("grafana", "grafana-storage", "/var/lib/grafana")
+declared_volumes = config.get("volumes", {})
+if not {"prometheus-data", "grafana-storage"}.issubset(declared_volumes):
+    raise SystemExit("Prometheus and Grafana named volumes are not declared")
+
+prometheus_command = services["prometheus"].get("command", [])
+required_flags = {
+    "--storage.tsdb.path=/prometheus",
+    "--storage.tsdb.retention.time=15d",
+}
+if not required_flags.issubset(prometheus_command):
+    raise SystemExit("Prometheus persistent path or explicit 15-day retention is missing")
+
 for service in ("telnet_pit", "mqtt_pit"):
     if services[service].get("logging", {}).get("driver") != "none":
         raise SystemExit(f"{service} may persist raw client content in container logs")
     if services[service].get("environment", {}).get("EVENTHORIZON_SESSION_LOG") != "/dev/null":
         raise SystemExit(f"{service} session log is not disabled for aggregate-only field validation")
 
-print("bindings, service scope, field-safe metrics, and raw-log suppression are valid")
+print("bindings, persistence, retention, field-safe metrics, and raw-log suppression are valid")
 PY
 then
-    pass "only Telnet/MQTT are public; management is loopback-only; raw field storage is disabled"
+    pass "public/private bindings, persistent monitoring, retention, and raw-log suppression are valid"
 else
     fail "field Compose safety policy validation failed"
 fi

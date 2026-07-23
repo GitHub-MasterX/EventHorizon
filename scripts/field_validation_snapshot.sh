@@ -45,6 +45,7 @@ for item in results:
     printf 'project=%s\n' "$FIELD_PROJECT_NAME"
     printf 'architecture=%s\n' "$(uname -m)"
     printf 'kernel=%s\n' "$(uname -r)"
+    printf 'host_uptime_seconds=%s\n' "$(awk '{print int($1)}' /proc/uptime)"
     printf 'prometheus_scrape_interval=15s\n'
     if [[ -r /sys/fs/cgroup/cgroup.controllers ]] && grep -qw memory /sys/fs/cgroup/cgroup.controllers && [[ -r /sys/fs/cgroup/memory.current ]]; then
         printf 'cgroup_v2_memory_accounting=supported\n'
@@ -82,6 +83,8 @@ for item in results:
     prom_query "disconnect reasons" 'sum by (protocol, disconnect_reason) (eventhorizon_completed_sessions_total{protocol=~"telnet|mqtt"})'
     prom_query "bounded protocol actions" 'sum by (protocol, action) (eventhorizon_protocol_actions_total{protocol=~"telnet|mqtt"})'
     prom_query "early disconnect" 'sum by (protocol) (eventhorizon_early_disconnect_total{protocol=~"telnet|mqtt"})'
+    prom_query "interaction depth" 'sum by (protocol, depth_level) (eventhorizon_session_interaction_depth_total{protocol=~"telnet|mqtt"})'
+    prom_query "depth reconciliation gap" 'sum by (protocol) (eventhorizon_completed_sessions_total{protocol=~"telnet|mqtt"}) - sum by (protocol) (eventhorizon_session_interaction_depth_total{protocol=~"telnet|mqtt"})'
     prom_query "application bytes received" 'sum by (protocol) (eventhorizon_bytes_received_total{protocol=~"telnet|mqtt"})'
     prom_query "application bytes sent" 'sum by (protocol) (eventhorizon_bytes_sent_total{protocol=~"telnet|mqtt"})'
     prom_query "malformed exporter messages" 'sum by (reason) (eventhorizon_exporter_malformed_messages_total)'
@@ -91,6 +94,8 @@ for item in results:
     prom_query "tarpit memory working set" 'sum by (container_label_com_docker_compose_service) (container_memory_working_set_bytes{container_label_com_docker_compose_service=~"telnet_pit|mqtt_pit"})'
     prom_query "five-minute container network receive" 'sum by (container_label_com_docker_compose_service) (rate(container_network_receive_bytes_total{container_label_com_docker_compose_service=~"telnet_pit|mqtt_pit"}[5m]))'
     prom_query "five-minute container network transmit" 'sum by (container_label_com_docker_compose_service) (rate(container_network_transmit_bytes_total{container_label_com_docker_compose_service=~"telnet_pit|mqtt_pit"}[5m]))'
+    printf '\n[disk usage]\n'
+    df -h "$REPO_ROOT"
 } >"$OUTPUT_FILE"
 
 printf '%s\n' "$OUTPUT_FILE"
