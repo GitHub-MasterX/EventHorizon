@@ -77,7 +77,6 @@ static const char *boolString(bool value) {
 }
 
 static void emitMqttAction(struct mqttClient *client, const char *action, const char *fields) {
-    client->interactionDepth += 1;
     session_events_write_action("mqtt", client->sessionId, action, fields);
 }
 
@@ -116,8 +115,12 @@ uint8_t readConnreq(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct
     uint16_t protocolName = (buffer[offset] << 8) | buffer[offset + 1];
     offset += 2;
 
-    bool isV31 = memcmp(&buffer[offset], "MQIsdp", 6) == 0 ? true : false;
-    if (memcmp(&buffer[offset], "MQTT", 4) != 0 && !isV31){
+    if ((protocolName != 4 && protocolName != 6) || offset + protocolName > packetEnd) {
+        fprintf(stderr, "Malformed CONNECT protocol name length");
+        return 0x01;
+    }
+    bool isV31 = protocolName == 6 && memcmp(&buffer[offset], "MQIsdp", 6) == 0;
+    if ((protocolName != 4 || memcmp(&buffer[offset], "MQTT", 4) != 0) && !isV31){
         char wrong[7] = {0};
         memcpy(wrong, &buffer[offset], protocolName < 7 ? protocolName : 4);
         fprintf(stderr, "Malformed CONNECT request. Expected \"MQTT\" or \"MQIsdp\" but got \"%s\"", wrong);
@@ -161,6 +164,10 @@ uint8_t readConnreq(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct
         return 0x80;
     }
     uint8_t connect_flags = buffer[offset++];
+    if ((connect_flags & 0x01) != 0) {
+        fprintf(stderr, "CONNECT reserved flag bit is set");
+        return 0x80;
+    }
     // printf("Connect Flags: 0x%02X\n", connect_flags);
 
     // Keep Alive
@@ -186,6 +193,9 @@ uint8_t readConnreq(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct
         }
 
         uint32_t props_end = offset + varint;
+        if (props_end > packetEnd) {
+            return 0x80;
+        }
         while (offset < props_end && offset < packetEnd) {
             offset++; // Don't parse props, just skip
         }
@@ -255,6 +265,7 @@ uint8_t readConnreq(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct
     printf("%s", msg);
     sendMetric(msg);
 
+    interactionDepthObserveMqttConnect(&client->interactionDepth);
     char fields[256];
     snprintf(fields, sizeof(fields),
         "\"mqtt_version\":\"%s\",\"client_id_present\":%s,\"username_present\":%s,\"password_present\":%s,\"keep_alive_seconds\":%d,\"interaction_depth\":%u",
@@ -263,16 +274,16 @@ uint8_t readConnreq(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct
         boolString(usernamePresent),
         boolString(passwordPresent),
         keepAlive,
-        client->interactionDepth + 1);
+        interactionDepthLevel(&client->interactionDepth));
     emitMqttAction(client, "CONNECT", fields);
     return 0x00; // Success
 }
 
-void readSubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct mqttClient* client) {
+bool readSubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct mqttClient* client) {
     // syslog(LOG_INFO, "Reading SUBSCRIBE request");
     if (offset + 2 > packetEnd) {
         fprintf(stderr, "SUBSCRIBE request too short for fixed header");
-        return;
+        return false;
     }
 
     // *packetId = (buffer[offset] << 8) | buffer[offset + 1];
@@ -282,16 +293,19 @@ void readSubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct 
         bool decodeSuccess = decodeVarint(buffer, packetEnd, &offset, &varint);
         if(!decodeSuccess) {
             fprintf(stderr, "SUBSCRIBE Failed decoding varint");
-            return;
+            return false;
         }
 
         // parse actual properties here if needed
+        if (offset + varint > packetEnd) {
+            return false;
+        }
         offset += varint;
     }
 
     if (offset + 3 > packetEnd) { // 2 bytes topic + 1 byte options
         fprintf(stderr, "SUBSCRIBE topic section too short");
-        return;
+        return false;
     }
 
     uint16_t topicLength = (buffer[offset] << 8) | buffer[offset + 1];
@@ -299,7 +313,7 @@ void readSubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct 
 
     if (offset + topicLength + 1 > packetEnd) {
         fprintf(stderr, "SUBSCRIBE topic filter length exceeds packet size");
-        return;
+        return false;
     }
 
     char topic[256];
@@ -310,6 +324,9 @@ void readSubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct 
 
     uint8_t options = buffer[offset++];
     uint8_t qos = options & 0b11;
+    if (topicLength == 0 || qos > 2) {
+        return false;
+    }
 
     char msg[256];
     snprintf(msg, sizeof(msg), "%s SUBSCRIBE %.100s %d\n",
@@ -318,13 +335,14 @@ void readSubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct 
     sendMetric(msg);
 
     char fields[160];
+    interactionDepthObserveMqttOperation(&client->interactionDepth);
     snprintf(fields, sizeof(fields),
         "\"qos\":%d,\"topic_present\":%s,\"interaction_depth\":%u",
-        qos, boolString(topicLength > 0), client->interactionDepth + 1);
+        qos, boolString(topicLength > 0), interactionDepthLevel(&client->interactionDepth));
     emitMqttAction(client, "SUBSCRIBE", fields);
 
     // syslog(LOG_INFO, "Successfully read SUBSCRIBE request with topic: %s and QoS %d", topic, qos);
-    return;
+    return true;
 }
 
 void generateFakeMatchingTopic(char* sub, size_t length) {
@@ -392,7 +410,7 @@ bool sendConnack(struct mqttClient* client, uint8_t reasonCode) {
         sendMetric(msg);
         if (w > 0 && !client->firstResponseSent) {
             client->firstResponseSent = true;
-            client->interactionDepthAtFirstResponse = client->interactionDepth;
+            client->interactionDepthAtFirstResponse = interactionDepthLevel(&client->interactionDepth);
         }
         // syslog(LOG_INFO, "Sent CONNACK to client fd=%d\n", client->fd);
     }
@@ -400,10 +418,11 @@ bool sendConnack(struct mqttClient* client, uint8_t reasonCode) {
     return true;
 }
 
-void readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct mqttClient* client) {
+bool readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset,
+                 uint8_t firstByte, struct mqttClient* client) {
     if (offset + 2 > packetEnd) {
         fprintf(stderr, "PUBLISH packet too short for topic length");
-        return;
+        return false;
     }
 
     uint16_t topicLen = (buffer[offset] << 8) | buffer[offset + 1];
@@ -411,16 +430,23 @@ void readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct mq
 
     if (offset + topicLen > packetEnd) {
         fprintf(stderr, "PUBLISH topic exceeds packet bounds");
-        return;
+        return false;
     }
 
     char topic[256] = {0};
     memcpy(topic, &buffer[offset], topicLen < 255 ? topicLen : 255);
     offset += topicLen;
 
-    uint8_t qos = (buffer[0] & 0b00000110) >> 1;
+    if (topicLen == 0) {
+        return false;
+    }
+
+    uint8_t qos = (firstByte & 0b00000110) >> 1;
+    if (qos == 3) {
+        return false;
+    }
     if (qos > 0) {
-        if (offset + 2 > packetEnd) return;
+        if (offset + 2 > packetEnd) return false;
         offset += 2; // packet id (don't care)
     }
 
@@ -428,15 +454,18 @@ void readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct mq
         uint32_t varint;
         bool decodeSuccess = decodeVarint(buffer, packetEnd, &offset, &varint);
         if(!decodeSuccess) {
-            return;
+            return false;
         }
     
         // Skip properties
+        if (offset + varint > packetEnd) {
+            return false;
+        }
         offset += varint;
     }
 
     // Remaining is payload
-    if (offset >= packetEnd) return;
+    if (offset > packetEnd) return false;
 
     char payload[512] = {0};
     uint32_t payloadLen = packetEnd - offset;
@@ -449,38 +478,46 @@ void readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct mq
         SERVER_ID, topic, qos);
     sendMetric(msg);
     char fields[192];
+    interactionDepthObserveMqttOperation(&client->interactionDepth);
     snprintf(fields, sizeof(fields),
         "\"qos\":%d,\"topic_present\":%s,\"payload_present\":%s,\"interaction_depth\":%u",
-        qos, boolString(topicLen > 0), boolString(payloadLen > 0), client->interactionDepth + 1);
+        qos, boolString(topicLen > 0), boolString(payloadLen > 0),
+        interactionDepthLevel(&client->interactionDepth));
     emitMqttAction(client, "PUBLISH", fields);
     printf("PUBLISH received. Topic: %s, Payload: %s, QoS: %d\n", topic, payload, qos);
+    return true;
 }
 
-void readUnsubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, enum MqttVersion version) {
+bool readUnsubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset,
+                     struct mqttClient *client) {
     if (offset + 2 > packetEnd) {
         fprintf(stderr, "UNSUBSCRIBE packet too short");
-        return;
+        return false;
     }
 
     uint16_t packetId = (buffer[offset] << 8) | buffer[offset + 1];
     offset += 2;
 
-    if (version == V5) {
+    if (client->version == V5) {
         uint32_t varint;
         bool decodeSuccess = decodeVarint(buffer, packetEnd, &offset, &varint);
         if(!decodeSuccess) {
-            return;
+            return false;
         }
 
         // Skip properties
+        if (offset + varint > packetEnd) {
+            return false;
+        }
         offset += varint;
     }
 
+    bool observedTopic = false;
     while (offset + 2 <= packetEnd) {
         uint16_t topicLen = (buffer[offset] << 8) | buffer[offset + 1];
         offset += 2;
 
-        if (offset + topicLen > packetEnd) return;
+        if (topicLen == 0 || offset + topicLen > packetEnd) return false;
 
         char topic[256] = {0};
         memcpy(topic, &buffer[offset], topicLen < 255 ? topicLen : 255);
@@ -490,9 +527,15 @@ void readUnsubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, enum 
         snprintf(msg, sizeof(msg), "%s UNSUBSCRIBE %.200s\n",
             SERVER_ID, topic);
         sendMetric(msg);
+        observedTopic = true;
 
         printf("UNSUBSCRIBE received for topic: %s (Packet ID: %u)\n", topic, packetId);
     }
+    if (!observedTopic || offset != packetEnd) {
+        return false;
+    }
+    interactionDepthObserveMqttOperation(&client->interactionDepth);
+    return true;
 }
 
 bool sendPublish(struct mqttClient* client, const char* topic, const char* message) {
@@ -654,7 +697,8 @@ void readPubrec(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct mqt
         SERVER_ID);
     sendMetric(msg);
     char fields[64];
-    snprintf(fields, sizeof(fields), "\"interaction_depth\":%u", client->interactionDepth + 1);
+    snprintf(fields, sizeof(fields), "\"interaction_depth\":%u",
+        interactionDepthLevel(&client->interactionDepth));
     emitMqttAction(client, "PUBREC", fields);
     // syslog(LOG_INFO, "Received PUBREC for fd=%d and packet ID: %d\n", client->fd, packetId);
 }
@@ -722,9 +766,13 @@ bool sendPingresp(struct mqttClient* client) {
 }
 
 void disconnectClient(struct mqttClient* client, int epollFd, long long now, const char *reason){
+    unsigned int depthLevel;
+    if (!interactionDepthFinalize(&client->interactionDepth, &depthLevel)) {
+        return;
+    }
     long long wastedTime = now - client->timeOfConnection;
     bool firstResponseExit = client->firstResponseSent &&
-        client->interactionDepth <= client->interactionDepthAtFirstResponse;
+        depthLevel <= client->interactionDepthAtFirstResponse;
 
     char msg[256];
     snprintf(msg, sizeof(msg), "%s disconnect %s %lld %lld %u %s %d\n",
@@ -732,13 +780,13 @@ void disconnectClient(struct mqttClient* client, int epollFd, long long now, con
         client->ipaddr,
         wastedTime,
         wastedTime,
-        client->interactionDepth,
+        depthLevel,
         reason,
         firstResponseExit ? 1 : 0);
 
     printf("%s", msg);
     sendMetric(msg);
-    session_events_write_disconnect("mqtt", client->sessionId, wastedTime, reason, client->interactionDepth);
+    session_events_write_disconnect("mqtt", client->sessionId, wastedTime, reason, depthLevel);
 
     epoll_ctl(epollFd, EPOLL_CTL_DEL, client->fd, NULL);
     deleteClient(client);
@@ -920,7 +968,10 @@ int main(int argc, char* argv[]) {
                 newClient->timeOfConnection = now;
                 newClient->lastPubrelMs = now;
                 newClient->keepAlive = 0; // Initial value. Will be updated after connect
-                newClient->interactionDepth = 0;
+                // Keep pre-CONNECT parsing deterministic. Meaningful depth still
+                // cannot advance until a CONNECT has been fully accepted.
+                newClient->version = V311;
+                interactionDepthInit(&newClient->interactionDepth);
                 newClient->firstResponseSent = false;
                 newClient->interactionDepthAtFirstResponse = 0;
                 session_events_make_id(newClient->sessionId, sizeof(newClient->sessionId), "mqtt", newClient->timeOfConnection, newClient->fd);
@@ -997,7 +1048,7 @@ int main(int argc, char* argv[]) {
                 for (uint32_t i = 0; i < packetCount; i++) {
                     uint32_t packetLength = packetLengths[i];
                     uint32_t packetStart = packetStarts[i];
-                    uint32_t packetEnd = packetStart + packetLength;
+                    uint32_t packetEnd = processedPackets + packetLength;
 
                     if (packetLength == 0 || processedPackets + packetLength > client->bytesWrittenToBuffer) {
                         // syslog(LOG_INFO, "Incomplete packet");
@@ -1037,7 +1088,8 @@ int main(int argc, char* argv[]) {
                             readPubrec(client->buffer, packetEnd, packetStart, client);
                             break;
                         case PUBLISH:
-                            readPublish(client->buffer, packetEnd, packetStart, client);
+                            readPublish(client->buffer, packetEnd, packetStart,
+                                client->buffer[processedPackets], client);
                             break;
                         case PUBCOMP:
                             readPubcomp(packetEnd, packetStart);
@@ -1049,7 +1101,7 @@ int main(int argc, char* argv[]) {
                             }
                             break;
                         case UNSUBSCRIBE:
-                            readUnsubscribe(client->buffer, packetEnd, packetStart, client->version);
+                            readUnsubscribe(client->buffer, packetEnd, packetStart, client);
                             break;
                         case PING:
                             bool pingSuccess = sendPingresp(client);

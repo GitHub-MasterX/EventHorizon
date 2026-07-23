@@ -31,6 +31,7 @@ type metrics struct {
 	earlyDisconnect           *prometheus.CounterVec
 	firstResponseExit         *prometheus.CounterVec
 	protocolActions           *prometheus.CounterVec
+	sessionInteractionDepth   *prometheus.CounterVec
 	exporterMalformedMessages *prometheus.CounterVec
 	exporterMessages          *prometheus.CounterVec
 	readErrors                *prometheus.CounterVec
@@ -100,6 +101,10 @@ func newMetrics(registerer prometheus.Registerer) *metrics {
 			Name: "eventhorizon_protocol_actions_total",
 			Help: "Total bounded protocol actions observed by EventHorizon",
 		}, []string{"protocol", "action"}),
+		sessionInteractionDepth: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "eventhorizon_session_interaction_depth_total",
+			Help: "Completed Telnet and MQTT sessions by bounded final interaction depth level",
+		}, []string{"protocol", "depth_level"}),
 		exporterMalformedMessages: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "eventhorizon_exporter_malformed_messages_total",
 			Help: "Malformed or unsupported metric messages received by the EventHorizon exporter",
@@ -176,11 +181,28 @@ func newMetrics(registerer prometheus.Registerer) *metrics {
 		}),
 	}
 	for _, protocol := range []string{"telnet", "mqtt"} {
+		server := "Telnet"
+		if protocol == "mqtt" {
+			server = "MQTT"
+		}
+		m.totalConnects.WithLabelValues(server).Add(0)
+		m.activeClients.WithLabelValues(server).Set(0)
+		m.sessionStarts.WithLabelValues(protocol).Add(0)
+		m.earlyDisconnect.WithLabelValues(protocol).Add(0)
+		m.firstResponseExit.WithLabelValues(protocol).Add(0)
+		m.sessionDuration.WithLabelValues(protocol)
+		for _, reason := range []string{"client_disconnect", "read_error", "write_error", "timeout", "parse_error", "server_close", "unknown"} {
+			m.completedSessions.WithLabelValues(protocol, reason).Add(0)
+		}
 		m.bytesSent.WithLabelValues(protocol).Add(0)
 		m.bytesReceived.WithLabelValues(protocol).Add(0)
+		for depthLevel := 0; depthLevel <= 3; depthLevel++ {
+			m.sessionInteractionDepth.WithLabelValues(protocol, strconv.Itoa(depthLevel)).Add(0)
+		}
 	}
 	registerer.MustRegister(m.totalConnects, m.totalTrappedTime, m.activeClients, m.clients,
 		m.sessionStarts, m.completedSessions, m.sessionDuration, m.earlyDisconnect, m.firstResponseExit, m.protocolActions,
+		m.sessionInteractionDepth,
 		m.exporterMalformedMessages, m.exporterMessages, m.readErrors, m.writeErrors, m.bytesSent, m.bytesReceived,
 		m.upnpOtherHttpRequests, m.upnpMSearchRequests, m.upnpNonMSearchRequests,
 		m.mqttConacks, m.mqttUnsubscribe, m.mqttPubrec,
@@ -338,6 +360,15 @@ func handleMetric(line string, metrics *metrics) {
 		interactionDepth, err := strconv.ParseUint(fields[5], 10, 32)
 		if err != nil {
 			rejectMetric(metrics, "invalid_number", "Invalid interaction depth in metric line %q: %v", line, err)
+			return
+		}
+		protocol, supportedDepthProtocol := protocolLabel(server)
+		if !supportedDepthProtocol || (protocol != "telnet" && protocol != "mqtt") {
+			rejectMetric(metrics, "unsupported_event", "Interaction depth is unsupported for server in metric line: %q", line)
+			return
+		}
+		if interactionDepth > 3 {
+			rejectMetric(metrics, "unsupported_event", "Unsupported interaction depth in metric line: %q", line)
 			return
 		}
 		disconnectReason, ok := canonicalDisconnectReason(fields[6])
@@ -755,6 +786,7 @@ func observeCompletedSession(server string, durationMs float64, interactionDepth
 
 	metrics.completedSessions.WithLabelValues(protocol, disconnectReason).Inc()
 	metrics.sessionDuration.WithLabelValues(protocol).Observe(durationMs)
+	metrics.sessionInteractionDepth.WithLabelValues(protocol, strconv.FormatUint(uint64(interactionDepth), 10)).Inc()
 	earlyDisconnect := metrics.earlyDisconnect.WithLabelValues(protocol)
 	firstResponseExit := metrics.firstResponseExit.WithLabelValues(protocol)
 	if interactionDepth == 0 {

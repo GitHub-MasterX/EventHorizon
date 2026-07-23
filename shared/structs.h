@@ -7,6 +7,7 @@
 #include <sys/types.h>
 #include "uthash.h"
 #include "session_events.h"
+#include "interaction_depth.h"
 
 enum Request { CONNECT, PING, SUBSCRIBE, PUBREC, DISCONNECT, PUBLISH, UNSUBSCRIBE, PUBCOMP, UNSUPPORTED_REQUEST };
 enum MqttVersion { V5, V311, V31 };
@@ -25,6 +26,7 @@ struct telnetAndUpnpClient {
     int fd;
     long long sessionStartMs;
     unsigned int interactionDepth;
+    struct interactionDepthState boundedInteractionDepth;
     bool firstResponseSent;
     char sessionId[SESSION_EVENT_ID_LEN];
 };
@@ -50,7 +52,7 @@ struct mqttClient {
     int fd;
     char ipaddr[INET_ADDRSTRLEN];
     char sessionId[SESSION_EVENT_ID_LEN];
-    unsigned int interactionDepth;
+    struct interactionDepthState interactionDepth;
     uint8_t buffer[1024];
     uint16_t bytesWrittenToBuffer;
     uint16_t keepAlive;

@@ -63,20 +63,24 @@ void initializeStats(){
 }
 
 static void completeTelnetSession(struct telnetAndUpnpClient *client, long long now, const char *reason) {
+    unsigned int depthLevel;
+    if (!interactionDepthFinalize(&client->boundedInteractionDepth, &depthLevel)) {
+        return;
+    }
     long long durationMs = now - client->sessionStartMs;
-    bool firstResponseExit = client->firstResponseSent && client->interactionDepth == 0;
+    bool firstResponseExit = client->firstResponseSent && depthLevel == 0;
     char msg[256];
     snprintf(msg, sizeof(msg), "%s disconnect %s %lld %lld %u %s %d\n",
         SERVER_ID,
         client->base.ipaddr,
         client->base.timeConnected,
         durationMs,
-        client->interactionDepth,
+        depthLevel,
         reason,
         firstResponseExit ? 1 : 0);
     printf("%s", msg);
     sendMetric(msg);
-    session_events_write_disconnect("telnet", client->sessionId, durationMs, reason, client->interactionDepth);
+    session_events_write_disconnect("telnet", client->sessionId, durationMs, reason, depthLevel);
 }
 
 static void emitProtocolActionMetric(const char *action) {
@@ -89,7 +93,8 @@ static void emitTelnetWriteEvent(struct telnetAndUpnpClient *client, const char 
     char fields[256];
     snprintf(fields, sizeof(fields),
         "\"delay_ms\":%d,\"write_result\":\"%s\",\"bytes_sent\":%zd,\"interaction_depth\":%u",
-        delayMs, result, bytesSent > 0 ? bytesSent : 0, client->interactionDepth);
+        delayMs, result, bytesSent > 0 ? bytesSent : 0,
+        interactionDepthLevel(&client->boundedInteractionDepth));
     session_events_write_action("telnet", client->sessionId, "write", fields);
 }
 
@@ -97,7 +102,8 @@ static void emitTelnetInputEvent(struct telnetAndUpnpClient *client, ssize_t byt
     char fields[128];
     snprintf(fields, sizeof(fields),
         "\"bytes_received\":%zd,\"interaction_depth\":%u",
-        bytesReceived > 0 ? bytesReceived : 0, client->interactionDepth);
+        bytesReceived > 0 ? bytesReceived : 0,
+        interactionDepthLevel(&client->boundedInteractionDepth));
     session_events_write_action("telnet", client->sessionId, "input", fields);
 }
 
@@ -194,6 +200,8 @@ int main(int argc, char *argv[]) {
                         free(c);
                         continue;
                     }else{
+                        interactionDepthObserveTelnet(&c->boundedInteractionDepth,
+                            (const uint8_t *)buf, (size_t)r);
                         //terminate null
                         buf[r]='\0';
                         for(int i=0;i<r;i++){
@@ -208,7 +216,6 @@ int main(int argc, char *argv[]) {
                         printf("%s", msg);
 
                         sendMetric(msg);
-                        c->interactionDepth += 1;
                         emitTelnetInputEvent(c, r);
                     }
                     queue_append(&clientQueueTelnet, (struct baseClient *)c);
@@ -249,6 +256,7 @@ int main(int argc, char *argv[]) {
             newClient->base.timeConnected = 0;
             newClient->sessionStartMs = now;
             newClient->interactionDepth = 0;
+            interactionDepthInit(&newClient->boundedInteractionDepth);
             newClient->firstResponseSent = false;
             snprintf(newClient->base.ipaddr, INET_ADDRSTRLEN, "%s", inet_ntoa(clientAddr.sin_addr));
             session_events_make_id(newClient->sessionId, sizeof(newClient->sessionId), "telnet", newClient->sessionStartMs, newClient->fd);

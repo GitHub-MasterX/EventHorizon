@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -24,31 +26,12 @@ func TestExtendedDisconnectUpdatesDurationMetrics(t *testing.T) {
 	assertGauge(t, m.activeClients.WithLabelValues("Telnet"), 0)
 	assertCounter(t, m.completedSessions.WithLabelValues("telnet", "client_disconnect"), 1)
 	assertCounter(t, m.earlyDisconnect.WithLabelValues("telnet"), 1)
+	assertCounter(t, m.sessionInteractionDepth.WithLabelValues("telnet", "0"), 1)
 	assertCounter(t, m.firstResponseExit.WithLabelValues("telnet"), 1)
 	assertCounter(t, m.protocolActions.WithLabelValues("telnet", "disconnect"), 1)
 	assertCounter(t, m.exporterMessages.WithLabelValues("accepted"), 1)
 
-	metricFamilies, err := registry.Gather()
-	if err != nil {
-		t.Fatalf("gather metrics: %v", err)
-	}
-	for _, family := range metricFamilies {
-		if family.GetName() != "eventhorizon_session_duration_ms" {
-			continue
-		}
-		if len(family.Metric) != 1 {
-			t.Fatalf("duration histogram metric count = %d, want 1", len(family.Metric))
-		}
-		histogram := family.Metric[0].GetHistogram()
-		if histogram.GetSampleCount() != 1 {
-			t.Fatalf("duration sample count = %d, want 1", histogram.GetSampleCount())
-		}
-		if histogram.GetSampleSum() != 1250 {
-			t.Fatalf("duration sample sum = %f, want 1250", histogram.GetSampleSum())
-		}
-		return
-	}
-	t.Fatal("duration histogram was not gathered")
+	assertHistogram(t, m.sessionDuration.WithLabelValues("telnet"), 1, 1250)
 }
 
 func TestLegacyDisconnectDoesNotInventSessionDuration(t *testing.T) {
@@ -62,16 +45,8 @@ func TestLegacyDisconnectDoesNotInventSessionDuration(t *testing.T) {
 	assertGauge(t, m.activeClients.WithLabelValues("CoAP"), 0)
 	assertCounter(t, m.protocolActions.WithLabelValues("coap", "disconnect"), 1)
 	assertCounter(t, m.exporterMessages.WithLabelValues("accepted"), 1)
-	metricFamilies, err := registry.Gather()
-	if err != nil {
-		t.Fatalf("gather metrics: %v", err)
-	}
-	if hasMetricFamily(metricFamilies, "eventhorizon_session_duration_ms") {
-		t.Fatal("legacy disconnect created a duration histogram")
-	}
-	if hasMetricFamily(metricFamilies, "eventhorizon_completed_sessions_total") {
-		t.Fatal("legacy disconnect created a completed-session counter")
-	}
+	assertHistogramCount(t, m.sessionDuration.WithLabelValues("telnet"), 0)
+	assertCounter(t, m.completedSessions.WithLabelValues("telnet", "client_disconnect"), 0)
 }
 
 func TestInvalidExtendedDisconnectDoesNotMutateLifecycle(t *testing.T) {
@@ -105,6 +80,31 @@ func TestInvalidExtendedDisconnectDoesNotMutateLifecycle(t *testing.T) {
 			line:            "Telnet disconnect 127.0.0.1 500 500 0 client_disconnect false extra",
 			malformedReason: "unknown_format",
 		},
+		{
+			name:            "unsupported depth",
+			line:            "Telnet disconnect 127.0.0.1 500 500 4 client_disconnect false",
+			malformedReason: "unsupported_event",
+		},
+		{
+			name:            "negative depth",
+			line:            "Telnet disconnect 127.0.0.1 500 500 -1 client_disconnect false",
+			malformedReason: "invalid_number",
+		},
+		{
+			name:            "invalid depth number",
+			line:            "MQTT disconnect 127.0.0.1 500 500 nope client_disconnect false",
+			malformedReason: "invalid_number",
+		},
+		{
+			name:            "depth overflow",
+			line:            "MQTT disconnect 127.0.0.1 500 500 4294967296 client_disconnect false",
+			malformedReason: "invalid_number",
+		},
+		{
+			name:            "known but unsupported depth protocol",
+			line:            "CoAP disconnect 127.0.0.1 500 500 0 client_disconnect false",
+			malformedReason: "unsupported_event",
+		},
 	}
 
 	for _, tt := range tests {
@@ -120,19 +120,84 @@ func TestInvalidExtendedDisconnectDoesNotMutateLifecycle(t *testing.T) {
 			assertCounter(t, m.protocolActions.WithLabelValues("telnet", "disconnect"), 0)
 			assertCounter(t, m.completedSessions.WithLabelValues("telnet", "client_disconnect"), 0)
 			assertCounter(t, m.completedSessions.WithLabelValues("telnet", "unknown"), 0)
+			for _, protocol := range []string{"telnet", "mqtt"} {
+				for _, depth := range []string{"0", "1", "2", "3"} {
+					assertCounter(t, m.sessionInteractionDepth.WithLabelValues(protocol, depth), 0)
+				}
+			}
 			assertCounter(t, m.exporterMalformedMessages.WithLabelValues(tt.malformedReason), 1)
 			assertCounter(t, m.exporterMessages.WithLabelValues("accepted"), 0)
 			assertCounter(t, m.exporterMessages.WithLabelValues("rejected"), 1)
 
-			metricFamilies, err := registry.Gather()
-			if err != nil {
-				t.Fatalf("gather metrics: %v", err)
-			}
-			if hasMetricFamily(metricFamilies, "eventhorizon_session_duration_ms") {
-				t.Fatal("malformed disconnect created a duration histogram")
-			}
+			assertHistogramCount(t, m.sessionDuration.WithLabelValues("telnet"), 0)
 		})
 	}
+}
+
+func TestInteractionDepthLevelsAndEarlyDisconnectCompatibility(t *testing.T) {
+	for _, protocol := range []struct {
+		server string
+		label  string
+	}{
+		{server: "Telnet", label: "telnet"},
+		{server: "MQTT", label: "mqtt"},
+	} {
+		for depth := 0; depth <= 3; depth++ {
+			t.Run(protocol.label+"_depth_"+strconv.Itoa(depth), func(t *testing.T) {
+				registry := prometheus.NewRegistry()
+				m := newMetrics(registry)
+				m.activeClients.WithLabelValues(protocol.server).Set(1)
+
+				handleMetric(fmt.Sprintf(
+					"%s disconnect 127.0.0.1 25 50 %d client_disconnect false",
+					protocol.server, depth), m)
+
+				assertCounter(t, m.completedSessions.WithLabelValues(protocol.label, "client_disconnect"), 1)
+				assertCounter(t, m.sessionInteractionDepth.WithLabelValues(protocol.label, strconv.Itoa(depth)), 1)
+				wantEarly := float64(0)
+				if depth == 0 {
+					wantEarly = 1
+				}
+				assertCounter(t, m.earlyDisconnect.WithLabelValues(protocol.label), wantEarly)
+				assertGauge(t, m.activeClients.WithLabelValues(protocol.server), 0)
+			})
+		}
+	}
+}
+
+func TestRepeatedInteractionDepthEventsAndBoundedLabels(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	m := newMetrics(registry)
+
+	handleMetric("Telnet disconnect 127.0.0.1 10 10 3 client_disconnect false", m)
+	handleMetric("Telnet disconnect 127.0.0.1 20 20 3 client_disconnect false", m)
+	assertCounter(t, m.sessionInteractionDepth.WithLabelValues("telnet", "3"), 2)
+
+	metricFamilies, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("gather metrics: %v", err)
+	}
+	for _, family := range metricFamilies {
+		if family.GetName() != "eventhorizon_session_interaction_depth_total" {
+			continue
+		}
+		if len(family.Metric) != 8 {
+			t.Fatalf("interaction depth series count = %d, want 8", len(family.Metric))
+		}
+		allowedProtocols := map[string]bool{"telnet": true, "mqtt": true}
+		allowedDepths := map[string]bool{"0": true, "1": true, "2": true, "3": true}
+		for _, metric := range family.Metric {
+			labels := map[string]string{}
+			for _, pair := range metric.Label {
+				labels[pair.GetName()] = pair.GetValue()
+			}
+			if len(labels) != 2 || !allowedProtocols[labels["protocol"]] || !allowedDepths[labels["depth_level"]] {
+				t.Fatalf("unexpected interaction depth labels: %#v", labels)
+			}
+		}
+		return
+	}
+	t.Fatal("interaction depth metric family was not gathered")
 }
 
 func TestLegacyInactivityReasonMapsToTimeout(t *testing.T) {
@@ -355,6 +420,29 @@ func assertGauge(t *testing.T, metric prometheus.Metric, want float64) {
 	}
 	if got := dtoMetric.GetGauge().GetValue(); got != want {
 		t.Fatalf("gauge = %f, want %f", got, want)
+	}
+}
+
+func assertHistogramCount(t *testing.T, observer prometheus.Observer, want uint64) {
+	assertHistogram(t, observer, want, 0)
+}
+
+func assertHistogram(t *testing.T, observer prometheus.Observer, wantCount uint64, wantSum float64) {
+	t.Helper()
+	metric, ok := observer.(prometheus.Metric)
+	if !ok {
+		t.Fatal("histogram observer does not implement prometheus.Metric")
+	}
+	dtoMetric := &dto.Metric{}
+	if err := metric.Write(dtoMetric); err != nil {
+		t.Fatalf("write histogram: %v", err)
+	}
+	histogram := dtoMetric.GetHistogram()
+	if got := histogram.GetSampleCount(); got != wantCount {
+		t.Fatalf("histogram count = %d, want %d", got, wantCount)
+	}
+	if got := histogram.GetSampleSum(); got != wantSum {
+		t.Fatalf("histogram sum = %f, want %f", got, wantSum)
 	}
 }
 
