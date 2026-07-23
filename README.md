@@ -24,4 +24,7 @@ To start all components, simply run:
 docker compose up
 ```
 
+## Validation
+
+Use [`VALIDATION.md`](VALIDATION.md) as the canonical guide for exact tests, controlled volume validation, persistent monitoring, authorized VPS stages, and historical Grafana experiment windows.
 
