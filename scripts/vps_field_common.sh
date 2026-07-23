@@ -47,8 +47,8 @@ vps_field_load_env() {
     [[ "$VPS_PROJECT_NAME" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || vps_field_die "VPS_PROJECT_NAME is not a safe Compose project name"
     [[ "$DEPLOY_BRANCH" == "GSoC_2026" ]] || vps_field_die "DEPLOY_BRANCH must be GSoC_2026"
     [[ "$DEPLOY_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]] || vps_field_die "DEPLOY_COMMIT must be a full 40-character Git commit"
-    [[ "$FIELD_DURATION_HOURS" =~ ^[0-9]+$ ]] && ((FIELD_DURATION_HOURS >= 72 && FIELD_DURATION_HOURS <= 96)) || \
-        vps_field_die "FIELD_DURATION_HOURS must be between 72 and 96"
+    [[ "$FIELD_DURATION_HOURS" =~ ^[0-9]+$ ]] && ((FIELD_DURATION_HOURS >= 48 && FIELD_DURATION_HOURS <= 96)) || \
+        vps_field_die "FIELD_DURATION_HOURS must be between 48 and 96"
     [[ "$SNAPSHOT_INTERVAL_HOURS" =~ ^[0-9]+$ ]] && ((SNAPSHOT_INTERVAL_HOURS >= 6 && SNAPSHOT_INTERVAL_HOURS <= 12)) || \
         vps_field_die "SNAPSHOT_INTERVAL_HOURS must be between 6 and 12"
     [[ "$FIELD_TARPIT_CPU_LIMIT" =~ ^[0-9]+([.][0-9]+)?$ ]] || vps_field_die "FIELD_TARPIT_CPU_LIMIT must be numeric"

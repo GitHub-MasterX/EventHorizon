@@ -62,7 +62,7 @@ stable—1,000 total sessions per protocol.
 
 Purpose: observe uncontrolled traffic, long-running stability, real disconnect
 behavior, and practical metric usefulness. For an extended observation, use a
-reviewed duration such as 72–96 hours and keep all deliberate traffic outside
+reviewed duration such as 48–96 hours and keep all deliberate traffic outside
 the observation window.
 
 ## 4. Prerequisites
