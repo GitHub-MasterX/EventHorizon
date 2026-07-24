@@ -227,4 +227,4 @@ PY
 REMOTE
 
 printf 'Controlled VPS smoke test passed for %s to %s UTC.\n' "$smoke_start_utc" "$smoke_end_utc"
-printf 'Next: review the result, open TCP 23/1883 according to the approved firewall policy, then run scripts/vps_field_start_observation.sh.\n'
+printf 'Next: review controlled-load results, preserve a clean baseline, then run scripts/vps_field_start_observation.sh --external-verified.\n'

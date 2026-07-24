@@ -274,6 +274,18 @@ non-loopback client target, explicitly set
 runner, annotate and snapshot each window, and never overlap controlled traffic
 with Window D.
 
+After the controlled stages pass, start the unsolicited observation without
+repeating the TCP-connect probe inside its baseline window:
+
+```bash
+./scripts/vps_field_start_observation.sh --external-verified
+```
+
+The start helper requires the earlier external verification explicitly. It
+refuses to start while a validation annotation is open, a controlled client is
+running, a container has restarted or been OOM-killed, active clients are
+nonzero, or lifecycle/depth reconciliation has not settled.
+
 Only TCP 23 and 1883 are intended to be public for the field scope. Grafana 3000,
 Prometheus 9090, exporter 9101, and cAdvisor 8081 must remain on `127.0.0.1`.
 Verify from an independent external host.

@@ -6,13 +6,51 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/vps_field_common.sh"
 vps_field_load_env
 
+usage() {
+    printf 'Usage: %s --external-verified\n' "$0"
+}
+
+case "${1:-}" in
+    --external-verified)
+        [[ $# -eq 1 ]] || vps_field_die "usage: $0 --external-verified"
+        ;;
+    --help|-h)
+        usage
+        exit 0
+        ;;
+    *)
+        usage >&2
+        vps_field_die "run scripts/vps_field_verify_external.sh as a separate window, then pass --external-verified"
+        ;;
+esac
+
+vps_field_require_clean_commit
+
 for process_name in mosquitto_pub nc nmap masscan zmap; do
     if pgrep -x "$process_name" >/dev/null 2>&1; then
         vps_field_die "controlled traffic process '$process_name' is still running locally"
     fi
 done
 
-"$SCRIPT_DIR/vps_field_verify_external.sh"
+python3 - "$VPS_FIELD_REPO_ROOT/validation-output/annotations" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+state_dir = Path(sys.argv[1])
+if state_dir.is_dir():
+    running = []
+    for state_path in state_dir.glob("*.json"):
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if state.get("status") == "running":
+            running.append(state.get("name", state_path.name))
+    if running:
+        raise SystemExit(
+            "validation annotations are still running: " + ", ".join(sorted(running))
+        )
+PY
+
+printf 'External port verification already completed in a separate window.\n'
 baseline_snapshot="$("$SCRIPT_DIR/vps_field_snapshot_remote.sh" --once)"
 
 vps_field_ssh bash -s -- \
@@ -54,6 +92,8 @@ for service in prometheus-exporter telnet_pit mqtt_pit prometheus grafana cadvis
     [[ "$(docker inspect --format '{{.State.Status}}' "$container_id")" == running ]]
     health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}not-configured{{end}}' "$container_id")"
     [[ "$health" != unhealthy && "$health" != starting ]]
+    [[ "$(docker inspect --format '{{.RestartCount}}' "$container_id")" == 0 ]]
+    [[ "$(docker inspect --format '{{.State.OOMKilled}}' "$container_id")" == false ]]
 done
 
 if pgrep -x mosquitto_pub >/dev/null 2>&1 || pgrep -x nc >/dev/null 2>&1 || pgrep -x nmap >/dev/null 2>&1 || \
@@ -61,6 +101,54 @@ if pgrep -x mosquitto_pub >/dev/null 2>&1 || pgrep -x nc >/dev/null 2>&1 || pgre
     printf 'A traffic-generation or scanning process is running on the VPS.\n' >&2
     exit 1
 fi
+
+python3 - <<'PY'
+import json
+import urllib.parse
+import urllib.request
+
+queries = {
+    "telnet active clients": 'sum(current_connected_clients{server="Telnet"}) or vector(0)',
+    "mqtt active clients": 'sum(current_connected_clients{server="MQTT"}) or vector(0)',
+    "telnet lifecycle gap": (
+        'sum(total_connects{server="Telnet"}) '
+        '- sum(eventhorizon_completed_sessions_total{protocol="telnet"}) '
+        '- sum(current_connected_clients{server="Telnet"})'
+    ),
+    "mqtt lifecycle gap": (
+        'sum(total_connects{server="MQTT"}) '
+        '- sum(eventhorizon_completed_sessions_total{protocol="mqtt"}) '
+        '- sum(current_connected_clients{server="MQTT"})'
+    ),
+    "telnet depth gap": (
+        'sum(eventhorizon_completed_sessions_total{protocol="telnet"}) '
+        '- sum(eventhorizon_session_interaction_depth_total{protocol="telnet"})'
+    ),
+    "mqtt depth gap": (
+        'sum(eventhorizon_completed_sessions_total{protocol="mqtt"}) '
+        '- sum(eventhorizon_session_interaction_depth_total{protocol="mqtt"})'
+    ),
+}
+
+failures = []
+for name, expression in queries.items():
+    encoded = urllib.parse.urlencode({"query": expression})
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:9090/api/v1/query?{encoded}", timeout=10
+    ) as response:
+        payload = json.load(response)
+    if payload.get("status") != "success" or len(payload["data"]["result"]) != 1:
+        raise SystemExit(f"unexpected Prometheus response for {name}: {payload!r}")
+    value = float(payload["data"]["result"][0]["value"][1])
+    if value != 0:
+        failures.append(f"{name}={value:g}, expected 0")
+
+if failures:
+    raise SystemExit(
+        "pre-observation baseline is not clean; observation was not started: "
+        + "; ".join(failures)
+    )
+PY
 
 export OBSERVATION_DURATION_HOURS="$duration_hours"
 export OBSERVATION_COMMIT="$expected_commit"
@@ -96,6 +184,7 @@ PY
 REMOTE
 
 printf '\nUnsolicited observation window recorded. Do not generate controlled traffic during this window.\n'
+printf 'Open TCP 23 and 1883 according to the approved public provider policy now; keep management ports private.\n'
 printf 'Manual status snapshot:\n  %s/scripts/vps_field_snapshot_remote.sh\n' "$VPS_FIELD_REPO_ROOT"
 printf 'Background local snapshot loop:\n  %s/scripts/vps_field_snapshot_remote.sh --loop\n' "$VPS_FIELD_REPO_ROOT"
 printf 'Stop and retrieve evidence:\n  %s/scripts/vps_field_stop_remote.sh\n' "$VPS_FIELD_REPO_ROOT"
