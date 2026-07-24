@@ -253,6 +253,20 @@ The repository provides `scripts/vps_field_*.sh` helpers for an authorized VPS
 deployment. Deployment requires a clean reviewed working tree, an explicit
 commit, and an exact checkout of that commit on the remote host.
 
+Run external port verification as a separate window before the smoke test:
+
+```bash
+./scripts/vps_field_verify_external.sh
+./scripts/vps_field_smoke_test.sh --external-verified
+```
+
+External verification uses bounded TCP-connect probes and can create protocol
+sessions. Let those sessions settle to zero before the smoke test. If the
+tarpit intentionally retains a probe connection, perform and record a
+controlled stack stop/start without removing volumes. The smoke script refuses
+to generate traffic unless both protocol active-client gauges and lifecycle
+gaps are zero at its baseline.
+
 Run controlled stages on the remote host itself or through private SSH tunnels
 so the runner can reach its loopback-bound Prometheus endpoint. Before using a
 non-loopback client target, explicitly set

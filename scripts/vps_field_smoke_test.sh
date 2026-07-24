@@ -6,13 +6,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/vps_field_common.sh"
 vps_field_load_env
 
+usage() {
+    printf 'Usage: %s --external-verified\n' "$0"
+}
+
+case "${1:-}" in
+    --external-verified)
+        [[ $# -eq 1 ]] || vps_field_die "usage: $0 --external-verified"
+        ;;
+    --help|-h)
+        usage
+        exit 0
+        ;;
+    *)
+        usage >&2
+        vps_field_die "run scripts/vps_field_verify_external.sh as a separate window, then pass --external-verified"
+        ;;
+esac
+
 command -v nc >/dev/null 2>&1 || vps_field_die "nc is required for the controlled Telnet interaction"
 command -v mosquitto_pub >/dev/null 2>&1 || vps_field_die "mosquitto_pub is required for the controlled MQTT interaction"
 command -v timeout >/dev/null 2>&1 || vps_field_die "timeout is required for bounded client execution"
 
-"$SCRIPT_DIR/vps_field_verify_external.sh"
-
 printf '\nControlled VPS smoke test\n'
+printf 'External port verification must already have passed in a separate window.\n'
 printf 'Before continuing, TCP 23 and 1883 should be temporarily restricted by the reviewed firewall policy to ADMIN_SOURCE_CIDR=%s.\n' "$ADMIN_SOURCE_CIDR"
 if [[ ! -t 0 ]]; then
     vps_field_die "smoke-test confirmation requires an interactive terminal"
@@ -87,16 +104,36 @@ def query(expression):
         raise RuntimeError(f"unexpected Prometheus response for {expression!r}: {payload!r}")
     return float(payload["data"]["result"][0]["value"][1])
 
+metrics = {name: query(expression) for name, expression in queries.items()}
 document = {
     "label": "Controlled VPS smoke test",
     "phase": os.environ["SMOKE_PHASE"],
     "captured_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-    "metrics": {name: query(expression) for name, expression in queries.items()},
+    "metrics": metrics,
 }
 output = Path(f"validation-output/smoke/{os.environ['SMOKE_PHASE']}.json")
 output.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 output.chmod(0o600)
 print(output)
+
+if os.environ["SMOKE_PHASE"] == "before":
+    failures = []
+    for protocol in ("telnet", "mqtt"):
+        active = metrics[f"{protocol}_active"]
+        lifecycle_gap = (
+            metrics[f"{protocol}_connections"]
+            - metrics[f"{protocol}_completions"]
+            - active
+        )
+        if active != 0:
+            failures.append(f"{protocol} active clients={active:g}, expected 0")
+        if lifecycle_gap != 0:
+            failures.append(f"{protocol} lifecycle gap={lifecycle_gap:g}, expected 0")
+    if failures:
+        raise SystemExit(
+            "controlled smoke baseline is not clean; preserve this evidence and "
+            "do not generate smoke traffic: " + "; ".join(failures)
+        )
 PY
 REMOTE
 }
@@ -175,7 +212,10 @@ result = {
     "end_utc": os.environ["SMOKE_END_UTC"],
     "checks": checks,
     "deltas": deltas,
-    "note": "This controlled window is not unsolicited public field validation.",
+    "note": (
+        "External port verification completed separately before this controlled "
+        "window; this is not unsolicited public field validation."
+    ),
 }
 output = directory / "smoke_result.json"
 output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
