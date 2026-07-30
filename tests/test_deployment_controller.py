@@ -511,23 +511,31 @@ class DeploymentOperatorCliTests(unittest.TestCase):
                 Path(temporary_directory) / "must-not-be-read.env"
             )
 
-            completed = subprocess.run(
-                [
-                    str(REPO_ROOT / "scripts/vps_field_deploy.sh"),
-                    "--check-only",
-                    "--commit",
-                    commit,
-                    "--output-dir",
-                    str(output_base),
-                    "--format",
-                    "json",
-                ],
-                cwd=REPO_ROOT,
-                env=environment,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
+            with tempfile.TemporaryDirectory(
+                prefix=".deployment-controller-untracked-",
+                dir=REPO_ROOT,
+            ) as untracked_directory:
+                (Path(untracked_directory) / "fixture.txt").write_text(
+                    "untracked test fixture\n",
+                    encoding="utf-8",
+                )
+                completed = subprocess.run(
+                    [
+                        str(REPO_ROOT / "scripts/vps_field_deploy.sh"),
+                        "--check-only",
+                        "--commit",
+                        commit,
+                        "--output-dir",
+                        str(output_base),
+                        "--format",
+                        "json",
+                    ],
+                    cwd=REPO_ROOT,
+                    env=environment,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
 
             self.assertEqual(completed.returncode, 2)
             result = json.loads(completed.stdout)
