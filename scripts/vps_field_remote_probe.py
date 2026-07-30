@@ -157,12 +157,64 @@ def _trusted_origin_matches(origin: str, repository: str) -> bool:
 
 def _read_bounded_json(path: Path) -> dict[str, Any] | None:
     try:
-        if path.stat().st_size > 256 * 1024:
+        if path.is_symlink() or path.stat().st_size > 256 * 1024:
             return None
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     return document if isinstance(document, dict) else None
+
+
+def _latest_deployment_manifest(deploy_dir: Path) -> dict[str, Any] | None:
+    deployments = deploy_dir / "validation-output" / "deployments"
+    candidates: list[Path] = []
+    try:
+        if deployments.is_dir() and not deployments.is_symlink():
+            candidates = sorted(
+                (
+                    path / "deployment-manifest.json"
+                    for path in deployments.iterdir()
+                    if path.is_dir()
+                    and not path.is_symlink()
+                    and re.fullmatch(
+                        r"deploy-[0-9]{8}T[0-9]{6}Z-[a-z0-9]{6,32}",
+                        path.name,
+                    )
+                    is not None
+                ),
+                reverse=True,
+            )
+    except OSError:
+        return None
+
+    if candidates:
+        return _read_bounded_json(candidates[0])
+
+    for manifest_name in (
+        "deployment-manifest.json",
+        "deployment_manifest.json",
+    ):
+        candidate = deploy_dir / "validation-output" / manifest_name
+        if candidate.is_file():
+            return _read_bounded_json(candidate)
+    return None
+
+
+def _manifest_describes_safe_managed_state(
+    manifest: dict[str, Any],
+) -> bool:
+    result = manifest.get("result")
+    if result is None:
+        return True
+    if result == "PASS":
+        return True
+    cleanup = manifest.get("cleanup")
+    return (
+        result in {"FAIL", "ERROR", "INCONCLUSIVE"}
+        and isinstance(cleanup, dict)
+        and cleanup.get("attempted") is True
+        and cleanup.get("succeeded") is True
+    )
 
 
 def _collect(request: dict[str, Any]) -> dict[str, object]:
@@ -479,20 +531,13 @@ def _collect(request: dict[str, Any]) -> dict[str, object]:
             else None
         )
 
-        manifest = None
-        for manifest_name in (
-            "deployment-manifest.json",
-            "deployment_manifest.json",
-        ):
-            candidate = deploy_dir / "validation-output" / manifest_name
-            if candidate.is_file():
-                manifest = _read_bounded_json(candidate)
-                break
+        manifest = _latest_deployment_manifest(deploy_dir)
         prior_evidence_matches = (
             manifest is not None
             and current_head is not None
             and manifest.get("repository_commit") == current_head
             and manifest.get("compose_project_name") == project_name
+            and _manifest_describes_safe_managed_state(manifest)
         )
         record(
             "prior_deployment_evidence",

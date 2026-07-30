@@ -27,6 +27,8 @@ RESULT_SCHEMA_VERSION = 1
 EVIDENCE_INDEX_SCHEMA_VERSION = 1
 CI_PROOF_SCHEMA_VERSION = 1
 REMOTE_PREFLIGHT_SCHEMA_VERSION = 1
+COMPOSE_CONFIG_SCHEMA_VERSION = 1
+DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 1
 CONTROLLER_CONTRACT_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FULL_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -88,7 +90,25 @@ class RemotePreflightVerification:
 
 
 @dataclass(frozen=True)
+class RemoteDeploymentVerification:
+    passed: bool
+    outcome: str
+    blocker: str | None
+    remote_mutation_occurred: bool
+    field_services_running: bool
+    compose_config: dict[str, object]
+    deployment_manifest: dict[str, object]
+
+
+@dataclass(frozen=True)
 class RemoteProbeExecution:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+@dataclass(frozen=True)
+class RemoteDeploymentExecution:
     returncode: int
     stdout: bytes
     stderr: bytes
@@ -150,6 +170,18 @@ class RemoteCapabilities(Protocol):
         """Prove the non-mutating authorized-VPS preflight contract."""
 
 
+class DeploymentCapabilities(Protocol):
+    def deploy(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+        preflight: dict[str, object],
+        run_id: str,
+    ) -> RemoteDeploymentVerification:
+        """Deploy one exact source commit and return bounded evidence."""
+
+
 class RemoteProbeCapabilities(Protocol):
     def collect(
         self,
@@ -158,6 +190,18 @@ class RemoteProbeCapabilities(Protocol):
         policy: dict[str, object],
     ) -> RemoteProbeExecution:
         """Collect one bounded remote preflight document over SSH."""
+
+
+class RemoteDeploymentTransportCapabilities(Protocol):
+    def execute(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+        preflight: dict[str, object],
+        run_id: str,
+    ) -> RemoteDeploymentExecution:
+        """Execute one authorized remote deployment and return bounded output."""
 
 
 class AuthorizationCapabilities(Protocol):
@@ -825,6 +869,96 @@ class SystemSshProbeTransport:
         )
 
 
+@dataclass(frozen=True)
+class SystemSshDeploymentTransport:
+    deployment_program_path: Path
+    ssh_executable: str | Path = "ssh"
+    timeout_seconds: int = 1800
+
+    def execute(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+        preflight: dict[str, object],
+        run_id: str,
+    ) -> RemoteDeploymentExecution:
+        trusted_repository = policy.get("trusted_repository")
+        approved_ref = policy.get("approved_ref")
+        compose_files = policy.get("supported_compose_files")
+        starting_state = preflight.get("starting_state")
+        if (
+            not isinstance(trusted_repository, str)
+            or not isinstance(approved_ref, str)
+            or not isinstance(compose_files, list)
+            or not all(isinstance(path, str) for path in compose_files)
+            or starting_state
+            not in {"INITIAL_DEPLOYMENT", "MANAGED_REDEPLOYMENT"}
+        ):
+            raise OSError("deployment policy or preflight evidence is incomplete")
+        approved_branch = approved_ref.rsplit("/", 1)[-1]
+        request = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "target_alias": configuration.target_alias,
+            "deployment_commit": commit,
+            "deploy_dir": configuration.vps_deploy_dir,
+            "project_name": configuration.vps_project_name,
+            "trusted_repository": trusted_repository,
+            "approved_branch": approved_branch,
+            "starting_state": starting_state,
+            "compose_files": compose_files,
+            "cpu_limit": configuration.field_tarpit_cpu_limit,
+            "memory_limit": configuration.field_tarpit_memory_limit,
+        }
+        encoded_request = base64.urlsafe_b64encode(
+            json.dumps(
+                request,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).decode("ascii")
+        program = self.deployment_program_path.read_bytes()
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "GIT_TERMINAL_PROMPT": "0",
+                "LC_ALL": "C",
+            }
+        )
+        completed = subprocess.run(
+            [
+                str(self.ssh_executable),
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-p",
+                str(configuration.vps_ssh_port),
+                "-i",
+                str(configuration.vps_ssh_key),
+                f"{configuration.vps_user}@{configuration.vps_host}",
+                "python3",
+                "-",
+                encoded_request,
+            ],
+            input=program,
+            capture_output=True,
+            check=False,
+            env=environment,
+            timeout=self.timeout_seconds,
+        )
+        return RemoteDeploymentExecution(
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+
+
 def _remote_preflight_evidence_is_valid(
     evidence: object,
     configuration: TargetConfiguration,
@@ -956,6 +1090,475 @@ class SshRemotePreflight:
         )
 
 
+def _safe_evidence_text(value: object, maximum: int = 240) -> bool:
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= maximum
+        and all(
+            ord(character) >= 0x20 and ord(character) != 0x7F
+            for character in value
+        )
+    )
+
+
+def _compose_config_evidence_is_valid(
+    document: object,
+    configuration: TargetConfiguration,
+    commit: str,
+    policy: dict[str, object],
+) -> bool:
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "deployment_commit",
+        "project_name",
+        "platform",
+        "rendered_config_sha256",
+        "services",
+        "volumes",
+    }:
+        return False
+    services = document["services"]
+    if (
+        document["schema_version"] != COMPOSE_CONFIG_SCHEMA_VERSION
+        or document["deployment_commit"] != commit
+        or document["project_name"] != configuration.vps_project_name
+        or document["platform"] != "linux/amd64"
+        or not isinstance(document["rendered_config_sha256"], str)
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            document["rendered_config_sha256"],
+        )
+        is None
+        or document["volumes"]
+        != ["grafana-storage", "prometheus-data", "tarpit-sock"]
+        or not isinstance(services, list)
+        or len(services) != 6
+    ):
+        return False
+    field_build = policy.get("field_build")
+    if not isinstance(field_build, dict):
+        return False
+    compose_images = field_build.get("compose_images")
+    if not isinstance(compose_images, dict):
+        return False
+    expected_sources = {
+        "cadvisor": ("PINNED_IMAGE", compose_images.get("cadvisor")),
+        "grafana": ("PINNED_IMAGE", compose_images.get("grafana")),
+        "mqtt_pit": ("BUILD", "docker/tarpits/Dockerfile"),
+        "prometheus": ("PINNED_IMAGE", compose_images.get("prometheus")),
+        "prometheus-exporter": (
+            "BUILD",
+            "docker/prometheus/Dockerfile",
+        ),
+        "telnet_pit": ("BUILD", "docker/tarpits/Dockerfile"),
+    }
+    expected_ports = {
+        "cadvisor": ("127.0.0.1", 8081, 8080),
+        "grafana": ("127.0.0.1", 3000, 3000),
+        "mqtt_pit": ("0.0.0.0", 1883, 1883),
+        "prometheus": ("127.0.0.1", 9090, 9090),
+        "prometheus-exporter": ("127.0.0.1", 9101, 9101),
+        "telnet_pit": ("0.0.0.0", 23, 23),
+    }
+    expected_names = list(expected_sources)
+    if [service.get("name") for service in services] != expected_names:
+        return False
+    for service in services:
+        if not isinstance(service, dict) or set(service) != {
+            "name",
+            "source_type",
+            "source",
+            "platform",
+            "ports",
+            "restart",
+            "logging_driver",
+            "cpu_limit",
+            "memory_limit_bytes",
+            "privileged",
+            "volumes",
+        }:
+            return False
+        name = service["name"]
+        source_type, source = expected_sources[name]
+        ports = service["ports"]
+        if (
+            service["source_type"] != source_type
+            or service["source"] != source
+            or service["platform"] != "linux/amd64"
+            or service["restart"] != "unless-stopped"
+            or service["logging_driver"]
+            != ("none" if name in {"mqtt_pit", "telnet_pit"} else "json-file")
+            or service["privileged"] != (name == "cadvisor")
+            or not isinstance(ports, list)
+            or len(ports) != 1
+        ):
+            return False
+        port = ports[0]
+        if (
+            not isinstance(port, dict)
+            or set(port) != {"host_ip", "published", "target", "protocol"}
+            or (
+                port["host_ip"],
+                port["published"],
+                port["target"],
+            )
+            != expected_ports[name]
+            or port["protocol"] != "tcp"
+        ):
+            return False
+        is_tarpit = name in {"mqtt_pit", "telnet_pit"}
+        cpu_limit = service["cpu_limit"]
+        memory_limit = service["memory_limit_bytes"]
+        if is_tarpit:
+            try:
+                cpu_matches = (
+                    isinstance(cpu_limit, str)
+                    and Decimal(cpu_limit)
+                    == Decimal(configuration.field_tarpit_cpu_limit)
+                )
+            except InvalidOperation:
+                return False
+            if not cpu_matches or (
+                configuration.field_tarpit_memory_limit is not None
+                and (
+                    type(memory_limit) is not int
+                    or memory_limit <= 0
+                )
+            ) or (
+                configuration.field_tarpit_memory_limit is None
+                and memory_limit is not None
+            ):
+                return False
+        elif cpu_limit is not None or memory_limit is not None:
+            return False
+        volumes = service["volumes"]
+        if not isinstance(volumes, list) or len(volumes) > 8:
+            return False
+        for volume in volumes:
+            if (
+                not isinstance(volume, dict)
+                or set(volume) != {"type", "target", "read_only"}
+                or volume["type"] not in {"bind", "volume"}
+                or not isinstance(volume["target"], str)
+                or re.fullmatch(r"/[A-Za-z0-9._/-]+", volume["target"]) is None
+                or type(volume["read_only"]) is not bool
+            ):
+                return False
+    return True
+
+
+def _image_ids_are_valid(
+    value: object,
+    *,
+    require_all: bool,
+) -> bool:
+    expected = {
+        "cadvisor",
+        "grafana",
+        "mqtt_pit",
+        "prometheus",
+        "prometheus-exporter",
+        "telnet_pit",
+    }
+    if not isinstance(value, dict):
+        return False
+    if (require_all and set(value) != expected) or (
+        not require_all and not set(value).issubset(expected)
+    ):
+        return False
+    return all(
+        isinstance(image_id, str)
+        and re.fullmatch(r"sha256:[0-9a-f]{64}", image_id) is not None
+        for image_id in value.values()
+    )
+
+
+def _volume_names_are_valid(value: object) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) <= 32
+        and len(set(value)) == len(value)
+        and all(
+            isinstance(name, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", name)
+            is not None
+            for name in value
+        )
+    )
+
+
+def _deployment_manifest_evidence_is_valid(
+    document: object,
+    configuration: TargetConfiguration,
+    commit: str,
+    policy: dict[str, object],
+    preflight: dict[str, object],
+    run_id: str,
+    result: str,
+    compose_config: dict[str, object],
+) -> bool:
+    if not isinstance(document, dict) or set(document) != {
+        "schema_version",
+        "run_id",
+        "target_alias",
+        "deployment_commit",
+        "repository_commit",
+        "compose_project_name",
+        "trusted_repository",
+        "approved_branch",
+        "starting_state",
+        "deployed_utc",
+        "platform",
+        "head_verified",
+        "worktree_clean",
+        "docker_version",
+        "compose_version",
+        "rendered_compose_sha256",
+        "pinned_inputs",
+        "service_image_ids",
+        "volume_names",
+        "prior_deployment",
+        "cleanup",
+        "result",
+    }:
+        return False
+    field_build = policy.get("field_build")
+    if not isinstance(field_build, dict):
+        return False
+    base_images = field_build.get("base_images")
+    compose_images = field_build.get("compose_images")
+    if not isinstance(base_images, list) or not isinstance(compose_images, dict):
+        return False
+    expected_pinned_inputs = sorted([*base_images, *compose_images.values()])
+    if (
+        document["schema_version"] != DEPLOYMENT_MANIFEST_SCHEMA_VERSION
+        or document["run_id"] != run_id
+        or document["target_alias"] != configuration.target_alias
+        or document["deployment_commit"] != commit
+        or document["repository_commit"] != commit
+        or document["compose_project_name"] != configuration.vps_project_name
+        or document["trusted_repository"] != policy.get("trusted_repository")
+        or document["approved_branch"] != "GSoC_2026"
+        or document["starting_state"] != preflight.get("starting_state")
+        or document["platform"] != "linux/amd64"
+        or document["head_verified"] is not True
+        or document["worktree_clean"] is not True
+        or not _safe_evidence_text(document["docker_version"], 100)
+        or not _safe_evidence_text(document["compose_version"], 100)
+        or document["rendered_compose_sha256"]
+        != compose_config.get("rendered_config_sha256")
+        or document["pinned_inputs"] != expected_pinned_inputs
+        or not _image_ids_are_valid(
+            document["service_image_ids"],
+            require_all=result == "PASS",
+        )
+        or not _volume_names_are_valid(document["volume_names"])
+        or document["result"] != result
+    ):
+        return False
+    try:
+        deployed = datetime.fromisoformat(
+            str(document["deployed_utc"]).replace("Z", "+00:00")
+        )
+    except ValueError:
+        return False
+    if deployed.tzinfo is None:
+        return False
+    prior = document["prior_deployment"]
+    if not isinstance(prior, dict) or set(prior) != {
+        "commit",
+        "service_image_ids",
+        "volume_names",
+    }:
+        return False
+    prior_commit = prior["commit"]
+    if (
+        prior_commit is not None
+        and (
+            not isinstance(prior_commit, str)
+            or FULL_SHA_PATTERN.fullmatch(prior_commit) is None
+        )
+    ):
+        return False
+    if not _image_ids_are_valid(
+        prior["service_image_ids"],
+        require_all=False,
+    ) or not _volume_names_are_valid(prior["volume_names"]):
+        return False
+    cleanup = document["cleanup"]
+    if (
+        not isinstance(cleanup, dict)
+        or set(cleanup) != {"attempted", "succeeded"}
+        or type(cleanup["attempted"]) is not bool
+        or (
+            cleanup["succeeded"] is not None
+            and type(cleanup["succeeded"]) is not bool
+        )
+        or (
+            not cleanup["attempted"]
+            and cleanup["succeeded"] is not None
+        )
+        or (
+            cleanup["attempted"]
+            and type(cleanup["succeeded"]) is not bool
+        )
+    ):
+        return False
+    return not (
+        result == "PASS"
+        and (
+            cleanup["attempted"]
+            or cleanup["succeeded"] is not None
+        )
+    )
+
+
+def _remote_deployment_evidence_is_valid(
+    evidence: object,
+    configuration: TargetConfiguration,
+    commit: str,
+    policy: dict[str, object],
+    preflight: dict[str, object],
+    run_id: str,
+) -> bool:
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "schema_version",
+        "run_id",
+        "target_alias",
+        "deployment_commit",
+        "result",
+        "blocker",
+        "remote_mutation_occurred",
+        "field_services_running",
+        "compose_config",
+        "deployment_manifest",
+    }:
+        return False
+    result = evidence["result"]
+    blocker = evidence["blocker"]
+    compose_config = evidence["compose_config"]
+    deployment_manifest = evidence["deployment_manifest"]
+    if (
+        evidence["schema_version"] != 1
+        or evidence["run_id"] != run_id
+        or evidence["target_alias"] != configuration.target_alias
+        or evidence["deployment_commit"] != commit
+        or result not in {"PASS", "BLOCKED", "FAIL", "INCONCLUSIVE", "ERROR"}
+        or type(evidence["remote_mutation_occurred"]) is not bool
+        or type(evidence["field_services_running"]) is not bool
+        or not isinstance(compose_config, dict)
+        or not isinstance(deployment_manifest, dict)
+    ):
+        return False
+    if result == "PASS":
+        return (
+            blocker is None
+            and evidence["remote_mutation_occurred"]
+            and evidence["field_services_running"]
+            and _compose_config_evidence_is_valid(
+                compose_config,
+                configuration,
+                commit,
+                policy,
+            )
+            and _deployment_manifest_evidence_is_valid(
+                deployment_manifest,
+                configuration,
+                commit,
+                policy,
+                preflight,
+                run_id,
+                result,
+                compose_config,
+            )
+        )
+    if not _safe_evidence_text(blocker):
+        return False
+    if compose_config and not _compose_config_evidence_is_valid(
+        compose_config,
+        configuration,
+        commit,
+        policy,
+    ):
+        return False
+    return not deployment_manifest or _deployment_manifest_evidence_is_valid(
+        deployment_manifest,
+        configuration,
+        commit,
+        policy,
+        preflight,
+        run_id,
+        result,
+        compose_config,
+    )
+
+
+@dataclass(frozen=True)
+class SshExactSourceDeployment:
+    transport: RemoteDeploymentTransportCapabilities
+
+    @staticmethod
+    def _malfunction() -> RemoteDeploymentVerification:
+        return RemoteDeploymentVerification(
+            passed=False,
+            outcome="ERROR",
+            blocker=(
+                "Remote deployment transport or evidence collection malfunctioned; "
+                "inspect the authorized VPS and stop the field project if needed."
+            ),
+            remote_mutation_occurred=True,
+            field_services_running=True,
+            compose_config={},
+            deployment_manifest={},
+        )
+
+    def deploy(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+        preflight: dict[str, object],
+        run_id: str,
+    ) -> RemoteDeploymentVerification:
+        try:
+            execution = self.transport.execute(
+                configuration,
+                commit,
+                policy,
+                preflight,
+                run_id,
+            )
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            return self._malfunction()
+        if execution.returncode != 0:
+            return self._malfunction()
+        try:
+            if len(execution.stdout) > 1024 * 1024:
+                raise ValueError
+            evidence = json.loads(execution.stdout.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, ValueError):
+            return self._malfunction()
+        if not _remote_deployment_evidence_is_valid(
+            evidence,
+            configuration,
+            commit,
+            policy,
+            preflight,
+            run_id,
+        ):
+            return self._malfunction()
+        result = evidence["result"]
+        return RemoteDeploymentVerification(
+            passed=result == "PASS",
+            outcome=result,
+            blocker=evidence["blocker"],
+            remote_mutation_occurred=evidence["remote_mutation_occurred"],
+            field_services_running=evidence["field_services_running"],
+            compose_config=evidence["compose_config"],
+            deployment_manifest=evidence["deployment_manifest"],
+        )
+
+
 @dataclass(frozen=True)
 class ControllerAdapters:
     clock: Clock
@@ -964,6 +1567,7 @@ class ControllerAdapters:
     trusted_ci: TrustedCiCapabilities | None = None
     remote: RemoteCapabilities | None = None
     authorization: AuthorizationCapabilities | None = None
+    deployment: DeploymentCapabilities | None = None
 
 
 @dataclass(frozen=True)
@@ -1052,6 +1656,15 @@ class DeploymentResult:
 class EvidenceError(RuntimeError):
     """Raised when safe run-scoped evidence cannot be written."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        result: DeploymentResult | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.result = result
+
 
 class ContractError(RuntimeError):
     """Raised when versioned deployment policy is unsupported or malformed."""
@@ -1113,6 +1726,8 @@ def _load_policy() -> tuple[dict[str, object], str]:
             "evidence_index_schema_version",
             "ci_proof_schema_version",
             "remote_preflight_schema_version",
+            "compose_config_schema_version",
+            "deployment_manifest_schema_version",
         },
         "deployment policy",
     )
@@ -1126,6 +1741,10 @@ def _load_policy() -> tuple[dict[str, object], str]:
         "evidence_index_schema_version": EVIDENCE_INDEX_SCHEMA_VERSION,
         "ci_proof_schema_version": CI_PROOF_SCHEMA_VERSION,
         "remote_preflight_schema_version": REMOTE_PREFLIGHT_SCHEMA_VERSION,
+        "compose_config_schema_version": COMPOSE_CONFIG_SCHEMA_VERSION,
+        "deployment_manifest_schema_version": (
+            DEPLOYMENT_MANIFEST_SCHEMA_VERSION
+        ),
     }
     for name, expected in expected_constants.items():
         if policy[name] != expected:
@@ -1617,6 +2236,8 @@ def run(
     highest_state: str | None = None
     outcome = "BLOCKED"
     exit_code_override: int | None = None
+    remote_mutation_occurred = False
+    field_services_running = False
     policy: dict[str, object] | None = None
     policy_sha256: str | None = None
 
@@ -2011,25 +2632,139 @@ def run(
                                                     ),
                                                 )
                                             )
-                                            next_action = (
-                                                "Implement exact-source remote "
-                                                "deployment."
-                                            )
-                                            checks.append(
-                                                CheckResult(
-                                                    check_id=(
-                                                        "exact_source_deployment_"
-                                                        "foundation"
-                                                    ),
-                                                    phase=6,
-                                                    status="BLOCKER",
-                                                    summary=(
-                                                        "Remote mutation remains "
-                                                        "unimplemented."
-                                                    ),
-                                                    next_action=next_action,
+                                            if adapters.deployment is None:
+                                                next_action = (
+                                                    "Implement exact-source remote "
+                                                    "deployment."
                                                 )
-                                            )
+                                                checks.append(
+                                                    CheckResult(
+                                                        check_id=(
+                                                            "exact_source_deployment_"
+                                                            "foundation"
+                                                        ),
+                                                        phase=6,
+                                                        status="BLOCKER",
+                                                        summary=(
+                                                            "Remote mutation remains "
+                                                            "unimplemented."
+                                                        ),
+                                                        next_action=next_action,
+                                                    )
+                                                )
+                                            else:
+                                                deployment = (
+                                                    adapters.deployment.deploy(
+                                                        target_configuration,
+                                                        commit,
+                                                        policy,
+                                                        remote_preflight.evidence,
+                                                        run_id,
+                                                    )
+                                                )
+                                                remote_mutation_occurred = (
+                                                    deployment
+                                                    .remote_mutation_occurred
+                                                )
+                                                field_services_running = (
+                                                    deployment
+                                                    .field_services_running
+                                                )
+                                                if deployment.compose_config:
+                                                    json_artifacts[
+                                                        "compose-config.json"
+                                                    ] = deployment.compose_config
+                                                if deployment.deployment_manifest:
+                                                    json_artifacts[
+                                                        "deployment-manifest.json"
+                                                    ] = (
+                                                        deployment
+                                                        .deployment_manifest
+                                                    )
+                                                if deployment.passed:
+                                                    checks.append(
+                                                        CheckResult(
+                                                            check_id=(
+                                                                "exact_source_"
+                                                                "deployment"
+                                                            ),
+                                                            phase=6,
+                                                            status="PASS",
+                                                            summary=(
+                                                                "Exact source was "
+                                                                "deployed on the "
+                                                                "authorized VPS."
+                                                            ),
+                                                        )
+                                                    )
+                                                    next_action = (
+                                                        "Implement runtime health "
+                                                        "and private/public port "
+                                                        "verification."
+                                                    )
+                                                    checks.append(
+                                                        CheckResult(
+                                                            check_id=(
+                                                                "runtime_"
+                                                                "verification_"
+                                                                "foundation"
+                                                            ),
+                                                            phase=7,
+                                                            status="BLOCKER",
+                                                            summary=(
+                                                                "Runtime "
+                                                                "verification "
+                                                                "remains "
+                                                                "unimplemented."
+                                                            ),
+                                                            next_action=next_action,
+                                                        )
+                                                    )
+                                                else:
+                                                    if deployment.outcome in {
+                                                        "FAIL",
+                                                        "ERROR",
+                                                        "INCONCLUSIVE",
+                                                    }:
+                                                        outcome = (
+                                                            deployment.outcome
+                                                        )
+                                                    next_action = (
+                                                        deployment.blocker
+                                                        or (
+                                                            "Inspect redacted "
+                                                            "deployment evidence "
+                                                            "and retry."
+                                                        )
+                                                    )
+                                                    deployment_status = {
+                                                        "FAIL": "FAIL",
+                                                        "ERROR": "ERROR",
+                                                        "INCONCLUSIVE": (
+                                                            "INCONCLUSIVE"
+                                                        ),
+                                                    }.get(
+                                                        deployment.outcome,
+                                                        "BLOCKER",
+                                                    )
+                                                    checks.append(
+                                                        CheckResult(
+                                                            check_id=(
+                                                                "exact_source_"
+                                                                "deployment"
+                                                            ),
+                                                            phase=6,
+                                                            status=(
+                                                                deployment_status
+                                                            ),
+                                                            summary=(
+                                                                "Exact-source "
+                                                                "deployment did "
+                                                                "not pass."
+                                                            ),
+                                                            next_action=next_action,
+                                                        )
+                                                    )
 
     finished = adapters.clock.now()
     evidence = {
@@ -2045,6 +2780,10 @@ def run(
         evidence["remote_preflight"] = "remote-preflight.json"
     if "authorization.json" in json_artifacts:
         evidence["authorization"] = "authorization.json"
+    if "compose-config.json" in json_artifacts:
+        evidence["compose_config"] = "compose-config.json"
+    if "deployment-manifest.json" in json_artifacts:
+        evidence["deployment_manifest"] = "deployment-manifest.json"
     result = DeploymentResult(
         schema_version=RESULT_SCHEMA_VERSION,
         run_id=run_id,
@@ -2055,18 +2794,22 @@ def run(
         exit_code=exit_code_override or EXIT_CODES[outcome],
         started_utc=_utc_text(started),
         finished_utc=_utc_text(finished),
-        remote_mutation_occurred=False,
-        field_services_running=False,
+        remote_mutation_occurred=remote_mutation_occurred,
+        field_services_running=field_services_running,
         checks=tuple(checks),
         evidence=evidence,
         next_action=next_action,
     )
-    _write_evidence(
-        result,
-        run_directory,
-        _utc_text(finished),
-        json_artifacts=json_artifacts,
-    )
+    try:
+        _write_evidence(
+            result,
+            run_directory,
+            _utc_text(finished),
+            json_artifacts=json_artifacts,
+        )
+    except EvidenceError as error:
+        error.result = result
+        raise
     return result
 
 
@@ -2172,6 +2915,13 @@ def production_adapters(
             )
         ),
         authorization=authorization,
+        deployment=SshExactSourceDeployment(
+            SystemSshDeploymentTransport(
+                deployment_program_path=(
+                    REPO_ROOT / "scripts/vps_field_remote_deploy.py"
+                ),
+            )
+        ),
     )
 
 
@@ -2206,18 +2956,41 @@ def main(arguments: Sequence[str] | None = None) -> int:
             request,
             production_adapters(),
         )
-    except EvidenceError:
+    except EvidenceError as error:
+        failed_result = error.result
         fallback = {
             "schema_version": RESULT_SCHEMA_VERSION,
             "operation": request.operation,
             "target_state": request.target_state,
-            "highest_state": None,
+            "highest_state": (
+                failed_result.highest_state
+                if failed_result is not None
+                else None
+            ),
             "outcome": "ERROR",
             "exit_code": EXIT_CODES["ERROR"],
-            "remote_mutation_occurred": False,
-            "field_services_running": False,
-            "next_action": "Choose a safe writable evidence output directory.",
+            "remote_mutation_occurred": (
+                failed_result.remote_mutation_occurred
+                if failed_result is not None
+                else False
+            ),
+            "field_services_running": (
+                failed_result.field_services_running
+                if failed_result is not None
+                else False
+            ),
+            "next_action": (
+                (
+                    "Inspect the authorized field services, then choose a safe "
+                    "writable evidence output directory."
+                )
+                if failed_result is not None
+                and failed_result.remote_mutation_occurred
+                else "Choose a safe writable evidence output directory."
+            ),
         }
+        if failed_result is not None:
+            fallback["run_id"] = failed_result.run_id
         print(json.dumps(fallback, sort_keys=True), file=sys.stderr)
         return EXIT_CODES["ERROR"]
     document = result.to_dict()

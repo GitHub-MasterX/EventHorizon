@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eventhorizon.invalid/schemas/compose-config.schema.json",
+  "title": "EventHorizon normalized rendered Compose configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "deployment_commit",
+    "project_name",
+    "platform",
+    "rendered_config_sha256",
+    "services",
+    "volumes"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "deployment_commit": {
+      "$ref": "#/$defs/commit"
+    },
+    "project_name": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,62}$"
+    },
+    "platform": {
+      "const": "linux/amd64"
+    },
+    "rendered_config_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "services": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/service"
+      }
+    },
+    "volumes": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "const": "grafana-storage"
+        },
+        {
+          "const": "prometheus-data"
+        },
+        {
+          "const": "tarpit-sock"
+        }
+      ],
+      "items": false,
+      "minItems": 3,
+      "maxItems": 3
+    }
+  },
+  "$defs": {
+    "commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "source_type",
+        "source",
+        "platform",
+        "ports",
+        "restart",
+        "logging_driver",
+        "cpu_limit",
+        "memory_limit_bytes",
+        "privileged",
+        "volumes"
+      ],
+      "properties": {
+        "name": {
+          "enum": [
+            "cadvisor",
+            "grafana",
+            "mqtt_pit",
+            "prometheus",
+            "prometheus-exporter",
+            "telnet_pit"
+          ]
+        },
+        "source_type": {
+          "enum": [
+            "BUILD",
+            "PINNED_IMAGE"
+          ]
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "pattern": "^[A-Za-z0-9._/@:-]+$"
+        },
+        "platform": {
+          "const": "linux/amd64"
+        },
+        "ports": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": {
+            "$ref": "#/$defs/port"
+          }
+        },
+        "restart": {
+          "const": "unless-stopped"
+        },
+        "logging_driver": {
+          "enum": [
+            "json-file",
+            "none"
+          ]
+        },
+        "cpu_limit": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9]+(?:[.][0-9]+)?$"
+        },
+        "memory_limit_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "privileged": {
+          "type": "boolean"
+        },
+        "volumes": {
+          "type": "array",
+          "maxItems": 8,
+          "items": {
+            "$ref": "#/$defs/volume"
+          }
+        }
+      }
+    },
+    "port": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "host_ip",
+        "published",
+        "target",
+        "protocol"
+      ],
+      "properties": {
+        "host_ip": {
+          "enum": [
+            "0.0.0.0",
+            "127.0.0.1"
+          ]
+        },
+        "published": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "target": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "protocol": {
+          "const": "tcp"
+        }
+      }
+    },
+    "volume": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "target",
+        "read_only"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "bind",
+            "volume"
+          ]
+        },
+        "target": {
+          "type": "string",
+          "pattern": "^/[A-Za-z0-9._/-]+$",
+          "maxLength": 240
+        },
+        "read_only": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

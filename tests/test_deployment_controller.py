@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -25,10 +26,15 @@ from scripts.deployment_controller import (
     EvidenceError,
     GitHubApiError,
     LocalGitRepository,
+    RemoteDeploymentExecution,
+    RemoteDeploymentVerification,
     RemoteProbeExecution,
     RemotePreflightVerification,
+    SshExactSourceDeployment,
     SshRemotePreflight,
+    SystemSshDeploymentTransport,
     SystemSshProbeTransport,
+    TargetConfiguration,
     TrustedGitHubActions,
     production_adapters,
     run,
@@ -107,12 +113,175 @@ class DeploymentContractArtifactTests(unittest.TestCase):
             "scripts/vps_field_remote_probe.py",
             policy["protected_paths"],
         )
+        self.assertIn(
+            "scripts/vps_field_remote_deploy.py",
+            policy["protected_paths"],
+        )
         self.assertIn(".github/workflows/ci.yml", policy["protected_paths"])
         self.assertIn(
             "deploy/schemas/remote-preflight.schema.json",
             policy["protected_paths"],
         )
         self.assertEqual(policy["remote_preflight_schema_version"], 1)
+        self.assertEqual(policy["compose_config_schema_version"], 1)
+        self.assertEqual(policy["deployment_manifest_schema_version"], 1)
+
+    def test_phase_six_artifact_schemas_are_strict(self) -> None:
+        compose_schema = json.loads(
+            (
+                REPO_ROOT / "deploy/schemas/compose-config.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        manifest_schema = json.loads(
+            (
+                REPO_ROOT / "deploy/schemas/deployment-manifest.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        port_map = {
+            "cadvisor": ("127.0.0.1", 8081, 8080),
+            "grafana": ("127.0.0.1", 3000, 3000),
+            "mqtt_pit": ("0.0.0.0", 1883, 1883),
+            "prometheus": ("127.0.0.1", 9090, 9090),
+            "prometheus-exporter": ("127.0.0.1", 9101, 9101),
+            "telnet_pit": ("0.0.0.0", 23, 23),
+        }
+        build_sources = {
+            "mqtt_pit": "docker/tarpits/Dockerfile",
+            "prometheus-exporter": "docker/prometheus/Dockerfile",
+            "telnet_pit": "docker/tarpits/Dockerfile",
+        }
+        image_sources = {
+            "cadvisor": "ghcr.io/google/cadvisor:v0.57.0@sha256:" + "3" * 64,
+            "grafana": "grafana/grafana-oss:12.1.0@sha256:" + "2" * 64,
+            "prometheus": "prom/prometheus:v3.5.0@sha256:" + "1" * 64,
+        }
+        services = []
+        for name in (
+            "cadvisor",
+            "grafana",
+            "mqtt_pit",
+            "prometheus",
+            "prometheus-exporter",
+            "telnet_pit",
+        ):
+            host_ip, published, target = port_map[name]
+            source_type = "BUILD" if name in build_sources else "PINNED_IMAGE"
+            services.append(
+                {
+                    "name": name,
+                    "source_type": source_type,
+                    "source": (
+                        build_sources.get(name) or image_sources[name]
+                    ),
+                    "platform": "linux/amd64",
+                    "ports": [
+                        {
+                            "host_ip": host_ip,
+                            "published": published,
+                            "target": target,
+                            "protocol": "tcp",
+                        }
+                    ],
+                    "restart": "unless-stopped",
+                    "logging_driver": (
+                        "none" if name in {"mqtt_pit", "telnet_pit"}
+                        else "json-file"
+                    ),
+                    "cpu_limit": (
+                        "0.5" if name in {"mqtt_pit", "telnet_pit"} else None
+                    ),
+                    "memory_limit_bytes": (
+                        268435456
+                        if name in {"mqtt_pit", "telnet_pit"}
+                        else None
+                    ),
+                    "privileged": name == "cadvisor",
+                    "volumes": [],
+                }
+            )
+        compose_config = {
+            "schema_version": 1,
+            "deployment_commit": "1" * 40,
+            "project_name": "eventhorizon-field",
+            "platform": "linux/amd64",
+            "rendered_config_sha256": "a" * 64,
+            "services": services,
+            "volumes": [
+                "grafana-storage",
+                "prometheus-data",
+                "tarpit-sock",
+            ],
+        }
+        manifest = {
+            "schema_version": 1,
+            "run_id": "deploy-20260730T170000Z-a1b2c3",
+            "target_alias": "field-host",
+            "deployment_commit": "1" * 40,
+            "repository_commit": "1" * 40,
+            "compose_project_name": "eventhorizon-field",
+            "trusted_repository": "honeynet/EventHorizon",
+            "approved_branch": "GSoC_2026",
+            "starting_state": "INITIAL_DEPLOYMENT",
+            "deployed_utc": "2026-07-30T17:00:00Z",
+            "platform": "linux/amd64",
+            "head_verified": True,
+            "worktree_clean": True,
+            "docker_version": "27.5.1",
+            "compose_version": "2.32.4",
+            "rendered_compose_sha256": "a" * 64,
+            "pinned_inputs": [
+                f"example.invalid/input-{index}:1@sha256:{index}" + "0" * 63
+                for index in range(1, 7)
+            ],
+            "service_image_ids": {
+                name: "sha256:" + str(index) * 64
+                for index, name in enumerate(port_map, start=1)
+            },
+            "volume_names": [
+                "eventhorizon-field_grafana-storage",
+                "eventhorizon-field_prometheus-data",
+                "eventhorizon-field_tarpit-sock",
+            ],
+            "prior_deployment": {
+                "commit": None,
+                "service_image_ids": {},
+                "volume_names": [],
+            },
+            "cleanup": {
+                "attempted": False,
+                "succeeded": None,
+            },
+            "result": "PASS",
+        }
+
+        Draft202012Validator(compose_schema).validate(compose_config)
+        Draft202012Validator(manifest_schema).validate(manifest)
+        with self.assertRaises(ValidationError):
+            Draft202012Validator(compose_schema).validate(
+                dict(compose_config, unexpected=True)
+            )
+        with self.assertRaises(ValidationError):
+            Draft202012Validator(compose_schema).validate(
+                dict(compose_config, deployment_commit="1" * 64)
+            )
+        with self.assertRaises(ValidationError):
+            Draft202012Validator(compose_schema).validate(
+                dict(compose_config, rendered_config_sha256="a" * 40)
+            )
+        with self.assertRaises(ValidationError):
+            Draft202012Validator(manifest_schema).validate(
+                dict(manifest, schema_version=2)
+            )
+        inconsistent_cleanup = json.loads(json.dumps(manifest))
+        inconsistent_cleanup["result"] = "ERROR"
+        inconsistent_cleanup["cleanup"] = {
+            "attempted": False,
+            "succeeded": True,
+        }
+        with self.assertRaises(ValidationError):
+            Draft202012Validator(manifest_schema).validate(
+                inconsistent_cleanup
+            )
 
     def test_result_schema_accepts_partial_failure_and_rejects_drift(self) -> None:
         schema = json.loads(
@@ -392,6 +561,10 @@ class DeploymentContractArtifactTests(unittest.TestCase):
             "scripts/vps_field_remote_probe.py",
             deployment_controller_script,
         )
+        self.assertIn(
+            "scripts/vps_field_remote_deploy.py",
+            deployment_controller_script,
+        )
 
     def test_field_build_inputs_are_platform_specific_and_immutable(self) -> None:
         policy = json.loads(
@@ -538,6 +711,33 @@ class DeploymentOperatorCliTests(unittest.TestCase):
                 completed.stdout,
             )
             self.assertEqual(completed.stderr, "")
+
+    def test_internal_remote_deployment_help_is_side_effect_free(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        REPO_ROOT
+                        / "scripts/vps_field_remote_deploy.py"
+                    ),
+                    "--help",
+                ],
+                cwd=temporary_path,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertIn(
+                "usage: vps_field_remote_deploy.py <encoded-request>",
+                completed.stdout,
+            )
+            self.assertEqual(completed.stderr, "")
+            self.assertEqual(list(temporary_path.iterdir()), [])
 
     def test_invalid_commit_is_blocked_with_matching_partial_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -996,11 +1196,20 @@ else:
             current_commit = git("rev-parse", "HEAD")
             validation_output = deploy_dir / "validation-output"
             validation_output.mkdir()
-            (validation_output / "deployment_manifest.json").write_text(
+            deployment_evidence = (
+                validation_output
+                / "deployments"
+                / "deploy-20260730T160000Z-a1b2c3"
+            )
+            deployment_evidence.mkdir(parents=True)
+            (
+                deployment_evidence / "deployment-manifest.json"
+            ).write_text(
                 json.dumps(
                     {
                         "repository_commit": current_commit,
                         "compose_project_name": "eventhorizon-field",
+                        "result": "PASS",
                     }
                 ),
                 encoding="utf-8",
@@ -1283,6 +1492,609 @@ def successful_ci_proof(
     }
 
 
+class RemoteDeploymentProgramIntegrationTests(unittest.TestCase):
+    def test_failed_initial_clone_does_not_strand_deployment_directory(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            fake_bin = temporary_path / "fake-bin"
+            fake_bin.mkdir()
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                """#!/usr/bin/env python3
+from pathlib import Path
+import sys
+
+if sys.argv[1] != "clone":
+    raise SystemExit(91)
+target = Path(sys.argv[-1])
+target.mkdir(parents=True, exist_ok=True)
+(target / "partial-clone").write_text("incomplete\\n")
+raise SystemExit(92)
+""",
+                encoding="utf-8",
+            )
+            fake_git.chmod(0o700)
+            deploy_dir = (
+                temporary_path
+                / "authorized"
+                / "vps"
+                / "eventhorizon-field"
+            )
+            request = {
+                "schema_version": 1,
+                "run_id": "deploy-20260730T165900Z-a1b2c3",
+                "target_alias": "field-host",
+                "deployment_commit": "1" * 40,
+                "deploy_dir": str(deploy_dir),
+                "project_name": "eventhorizon-field",
+                "trusted_repository": "honeynet/EventHorizon",
+                "approved_branch": "GSoC_2026",
+                "starting_state": "INITIAL_DEPLOYMENT",
+                "compose_files": [
+                    "docker-compose.yml",
+                    "docker-compose.cost.yml",
+                    "docker-compose.field.yml",
+                ],
+                "cpu_limit": "0.50",
+                "memory_limit": None,
+            }
+            environment = os.environ.copy()
+            environment["PATH"] = (
+                str(fake_bin) + os.pathsep + environment["PATH"]
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        REPO_ROOT
+                        / "scripts/vps_field_remote_deploy.py"
+                    ),
+                    base64.urlsafe_b64encode(
+                        json.dumps(request).encode("utf-8")
+                    ).decode("ascii"),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            response = json.loads(completed.stdout)
+            self.assertEqual(response["result"], "ERROR")
+            self.assertTrue(response["remote_mutation_occurred"])
+            self.assertFalse(response["field_services_running"])
+            self.assertFalse(deploy_dir.exists())
+            self.assertEqual(list(deploy_dir.parent.iterdir()), [])
+
+            deploy_dir.mkdir()
+            marker = deploy_dir / "operator-owned-file"
+            marker.write_text("must remain untouched\n", encoding="utf-8")
+            blocked_request = dict(
+                request,
+                run_id="deploy-20260730T165901Z-d4e5f6",
+            )
+            blocked = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        REPO_ROOT
+                        / "scripts/vps_field_remote_deploy.py"
+                    ),
+                    base64.urlsafe_b64encode(
+                        json.dumps(blocked_request).encode("utf-8")
+                    ).decode("ascii"),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+                timeout=10,
+            )
+            self.assertEqual(blocked.returncode, 0, blocked.stderr)
+            blocked_response = json.loads(blocked.stdout)
+            self.assertEqual(blocked_response["result"], "BLOCKED")
+            self.assertFalse(
+                blocked_response["remote_mutation_occurred"]
+            )
+            self.assertEqual(
+                marker.read_text(encoding="utf-8"),
+                "must remain untouched\n",
+            )
+
+    def test_initial_deployment_checks_out_an_exact_ancestor_and_starts_stack(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            source = temporary_path / "source"
+            upstream = temporary_path / "upstream.git"
+            source.mkdir()
+
+            def git(*arguments: str, cwd: Path = source) -> str:
+                return subprocess.run(
+                    ["git", *arguments],
+                    cwd=cwd,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                ).stdout.strip()
+
+            git("init", "-q", "-b", "GSoC_2026")
+            git("config", "user.name", "Deployment Test")
+            git("config", "user.email", "deployment@example.invalid")
+            (source / "deploy").mkdir()
+            shutil.copy2(
+                REPO_ROOT / "deploy/deployment-policy.json",
+                source / "deploy/deployment-policy.json",
+            )
+            for compose_file in (
+                "docker-compose.yml",
+                "docker-compose.cost.yml",
+                "docker-compose.field.yml",
+            ):
+                (source / compose_file).write_text(
+                    "services: {}\n",
+                    encoding="utf-8",
+                )
+            (source / ".env").write_text(
+                "TELNET_PORT=23\nMQTT_PORT=1883\n",
+                encoding="utf-8",
+            )
+            (source / ".gitignore").write_text(
+                "validation-output/\n",
+                encoding="utf-8",
+            )
+            git("add", ".")
+            git("commit", "-qm", "deployable ancestor")
+            deployment_commit = git("rev-parse", "HEAD")
+            (source / "later.txt").write_text(
+                "branch tip may advance\n",
+                encoding="utf-8",
+            )
+            git("add", "later.txt")
+            git("commit", "-qm", "later branch tip")
+            git("init", "--bare", "-q", str(upstream))
+            git("remote", "add", "origin", str(upstream))
+            git("push", "-q", "origin", "GSoC_2026")
+
+            deploy_dir = (
+                temporary_path
+                / "authorized"
+                / "vps"
+                / "eventhorizon-field"
+            )
+            fixture_policy = json.loads(
+                (source / "deploy/deployment-policy.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            compose_images = fixture_policy["field_build"]["compose_images"]
+            rendered_config = {
+                "name": "eventhorizon-field",
+                "services": {
+                    "prometheus-exporter": {
+                        "build": {
+                            "context": str(deploy_dir),
+                            "dockerfile": "./docker/prometheus/Dockerfile",
+                        },
+                        "platform": "linux/amd64",
+                        "ports": [
+                            {
+                                "host_ip": "127.0.0.1",
+                                "published": "9101",
+                                "target": 9101,
+                                "protocol": "tcp",
+                            }
+                        ],
+                        "restart": "unless-stopped",
+                        "logging": {"driver": "json-file"},
+                        "volumes": [
+                            {
+                                "type": "bind",
+                                "source": str(deploy_dir / "private"),
+                                "target": "/data/GeoLite2-Country.mmdb",
+                                "read_only": True,
+                            }
+                        ],
+                    },
+                    "telnet_pit": {
+                        "build": {
+                            "context": str(deploy_dir),
+                            "dockerfile": "./docker/tarpits/Dockerfile",
+                        },
+                        "platform": "linux/amd64",
+                        "ports": [
+                            {
+                                "host_ip": "0.0.0.0",
+                                "published": "23",
+                                "target": 23,
+                                "protocol": "tcp",
+                            }
+                        ],
+                        "restart": "unless-stopped",
+                        "logging": {"driver": "none"},
+                        "cpus": 0.5,
+                        "mem_limit": "268435456",
+                    },
+                    "mqtt_pit": {
+                        "build": {
+                            "context": str(deploy_dir),
+                            "dockerfile": "./docker/tarpits/Dockerfile",
+                        },
+                        "platform": "linux/amd64",
+                        "ports": [
+                            {
+                                "host_ip": "0.0.0.0",
+                                "published": "1883",
+                                "target": 1883,
+                                "protocol": "tcp",
+                            }
+                        ],
+                        "restart": "unless-stopped",
+                        "logging": {"driver": "none"},
+                        "cpus": 0.5,
+                        "mem_limit": "268435456",
+                    },
+                    "prometheus": {
+                        "image": compose_images["prometheus"],
+                        "platform": "linux/amd64",
+                        "ports": [
+                            {
+                                "host_ip": "127.0.0.1",
+                                "published": "9090",
+                                "target": 9090,
+                                "protocol": "tcp",
+                            }
+                        ],
+                        "restart": "unless-stopped",
+                        "logging": {"driver": "json-file"},
+                    },
+                    "grafana": {
+                        "image": compose_images["grafana"],
+                        "platform": "linux/amd64",
+                        "ports": [
+                            {
+                                "host_ip": "127.0.0.1",
+                                "published": "3000",
+                                "target": 3000,
+                                "protocol": "tcp",
+                            }
+                        ],
+                        "restart": "unless-stopped",
+                        "logging": {"driver": "json-file"},
+                    },
+                    "cadvisor": {
+                        "image": compose_images["cadvisor"],
+                        "platform": "linux/amd64",
+                        "privileged": True,
+                        "ports": [
+                            {
+                                "host_ip": "127.0.0.1",
+                                "published": "8081",
+                                "target": 8080,
+                                "protocol": "tcp",
+                            }
+                        ],
+                        "restart": "unless-stopped",
+                        "logging": {"driver": "json-file"},
+                    },
+                },
+                "volumes": {
+                    "grafana-storage": {},
+                    "prometheus-data": {},
+                    "tarpit-sock": {},
+                },
+            }
+            rendered_path = temporary_path / "rendered-compose.json"
+            rendered_path.write_text(
+                json.dumps(rendered_config),
+                encoding="utf-8",
+            )
+            fake_bin = temporary_path / "fake-bin"
+            fake_bin.mkdir()
+            fake_docker = fake_bin / "docker"
+            fake_docker.write_text(
+                """#!/usr/bin/env python3
+import hashlib
+import os
+from pathlib import Path
+import sys
+
+arguments = sys.argv[1:]
+if arguments[:2] == ["compose", "version"]:
+    print("2.32.4")
+elif arguments and arguments[0] == "compose" and "config" in arguments:
+    print(Path(os.environ["FAKE_RENDERED_CONFIG"]).read_text())
+elif arguments and arguments[0] == "compose" and "up" in arguments:
+    Path(os.environ["FAKE_STACK_STATE"]).write_text("running\\n")
+    if os.environ.get("FAKE_FAIL_AFTER_START") == "yes":
+        raise SystemExit(88)
+elif arguments and arguments[0] == "compose" and "stop" in arguments:
+    Path(os.environ["FAKE_STACK_STATE"]).write_text("stopped\\n")
+elif arguments and arguments[0] == "compose" and "ps" in arguments:
+    print("container-" + arguments[-1])
+elif arguments and arguments[0] == "inspect":
+    print("sha256:" + hashlib.sha256(arguments[-1].encode()).hexdigest())
+elif arguments[:2] == ["volume", "ls"]:
+    print("eventhorizon-field_grafana-storage")
+    print("eventhorizon-field_prometheus-data")
+    print("eventhorizon-field_tarpit-sock")
+elif arguments and arguments[0] == "version":
+    print("27.5.1")
+else:
+    raise SystemExit(90)
+""",
+                encoding="utf-8",
+            )
+            fake_docker.chmod(0o700)
+
+            run_id = "deploy-20260730T170000Z-a1b2c3"
+            request = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "target_alias": "field-host",
+                "deployment_commit": deployment_commit,
+                "deploy_dir": str(deploy_dir),
+                "project_name": "eventhorizon-field",
+                "trusted_repository": "honeynet/EventHorizon",
+                "approved_branch": "GSoC_2026",
+                "starting_state": "INITIAL_DEPLOYMENT",
+                "compose_files": [
+                    "docker-compose.yml",
+                    "docker-compose.cost.yml",
+                    "docker-compose.field.yml",
+                ],
+                "cpu_limit": "0.50",
+                "memory_limit": "256m",
+            }
+            encoded_request = base64.urlsafe_b64encode(
+                json.dumps(request).encode("utf-8")
+            ).decode("ascii")
+            stack_state = temporary_path / "stack-state"
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{fake_bin}:{environment['PATH']}",
+                    "FAKE_RENDERED_CONFIG": str(rendered_path),
+                    "FAKE_STACK_STATE": str(stack_state),
+                    "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": (
+                        f"url.{upstream.resolve().as_uri()}.insteadOf"
+                    ),
+                    "GIT_CONFIG_VALUE_0": (
+                        "https://github.com/honeynet/EventHorizon.git"
+                    ),
+                }
+            )
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts/vps_field_remote_deploy.py"),
+                    encoded_request,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+                timeout=30,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            response = json.loads(completed.stdout)
+            self.assertEqual(response["result"], "PASS", response)
+            self.assertTrue(response["remote_mutation_occurred"])
+            self.assertTrue(response["field_services_running"])
+
+            class CapturedDeploymentTransport:
+                def __init__(self, payload: str) -> None:
+                    self.payload = payload
+
+                def execute(
+                    self,
+                    configuration,
+                    commit,
+                    policy,
+                    preflight,
+                    requested_run_id,
+                ) -> RemoteDeploymentExecution:
+                    return RemoteDeploymentExecution(
+                        returncode=0,
+                        stdout=self.payload.encode("utf-8"),
+                        stderr=b"",
+                    )
+
+            target_configuration = TargetConfiguration(
+                target_alias="field-host",
+                vps_host="example.invalid",
+                vps_user="deploy",
+                vps_ssh_port=22,
+                vps_ssh_key=temporary_path / "unused-test-key",
+                vps_deploy_dir=str(deploy_dir),
+                vps_project_name="eventhorizon-field",
+                admin_source_cidr="192.0.2.1/32",
+                field_tarpit_cpu_limit="0.50",
+                field_tarpit_memory_limit="256m",
+            )
+            workstation_verification = SshExactSourceDeployment(
+                CapturedDeploymentTransport(completed.stdout)
+            ).deploy(
+                target_configuration,
+                deployment_commit,
+                fixture_policy,
+                {"starting_state": "INITIAL_DEPLOYMENT"},
+                run_id,
+            )
+            self.assertTrue(
+                workstation_verification.passed,
+                json.dumps(response, indent=2, sort_keys=True),
+            )
+            self.assertEqual(
+                git("-C", str(deploy_dir), "rev-parse", "HEAD"),
+                deployment_commit,
+            )
+            self.assertEqual(
+                git(
+                    "-C",
+                    str(deploy_dir),
+                    "status",
+                    "--porcelain",
+                    "--untracked-files=normal",
+                ),
+                "",
+            )
+            self.assertEqual(stack_state.read_text(), "running\n")
+            run_directory = (
+                deploy_dir / "validation-output" / "deployments" / run_id
+            )
+            collected_documents = {}
+            for artifact_name in (
+                "compose-config.json",
+                "deployment-manifest.json",
+            ):
+                artifact = run_directory / artifact_name
+                self.assertTrue(artifact.is_file())
+                self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o600)
+                collected_documents[artifact_name] = json.loads(
+                    artifact.read_text(encoding="utf-8")
+                )
+            Draft202012Validator(
+                json.loads(
+                    (
+                        REPO_ROOT
+                        / "deploy/schemas/compose-config.schema.json"
+                    ).read_text(encoding="utf-8")
+                )
+            ).validate(collected_documents["compose-config.json"])
+            Draft202012Validator(
+                json.loads(
+                    (
+                        REPO_ROOT
+                        / "deploy/schemas/deployment-manifest.schema.json"
+                    ).read_text(encoding="utf-8")
+                )
+            ).validate(collected_documents["deployment-manifest.json"])
+            self.assertEqual(
+                response["compose_config"],
+                collected_documents["compose-config.json"],
+            )
+            self.assertEqual(
+                response["deployment_manifest"],
+                collected_documents["deployment-manifest.json"],
+            )
+            retained = json.dumps(response)
+            self.assertNotIn(str(source), retained)
+            self.assertNotIn(str(deploy_dir), retained)
+
+            git(
+                "-C",
+                str(deploy_dir),
+                "remote",
+                "set-url",
+                "origin",
+                "https://github.com/honeynet/EventHorizon.git",
+            )
+            failed_run_id = "deploy-20260730T170100Z-d4e5f6"
+            failed_request = dict(
+                request,
+                run_id=failed_run_id,
+                deployment_commit=git("rev-parse", "HEAD"),
+                starting_state="MANAGED_REDEPLOYMENT",
+            )
+            failed_environment = dict(
+                environment,
+                FAKE_FAIL_AFTER_START="yes",
+            )
+            failed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts/vps_field_remote_deploy.py"),
+                    base64.urlsafe_b64encode(
+                        json.dumps(failed_request).encode("utf-8")
+                    ).decode("ascii"),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=failed_environment,
+                timeout=30,
+            )
+
+            self.assertEqual(failed.returncode, 0, failed.stderr)
+            failed_response = json.loads(failed.stdout)
+            self.assertEqual(
+                failed_response["result"],
+                "ERROR",
+                failed_response,
+            )
+            self.assertTrue(failed_response["remote_mutation_occurred"])
+            self.assertFalse(failed_response["field_services_running"])
+            self.assertEqual(stack_state.read_text(), "stopped\n")
+            self.assertEqual(
+                failed_response["deployment_manifest"]["cleanup"],
+                {"attempted": True, "succeeded": True},
+            )
+            failed_run_directory = (
+                deploy_dir
+                / "validation-output"
+                / "deployments"
+                / failed_run_id
+            )
+            self.assertTrue(
+                (failed_run_directory / "compose-config.json").is_file()
+            )
+            self.assertTrue(
+                (failed_run_directory / "deployment-manifest.json").is_file()
+            )
+            failed_manifest = json.loads(
+                (
+                    failed_run_directory / "deployment-manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            Draft202012Validator(
+                json.loads(
+                    (
+                        REPO_ROOT
+                        / "deploy/schemas/deployment-manifest.schema.json"
+                    ).read_text(encoding="utf-8")
+                )
+            ).validate(failed_manifest)
+            self.assertEqual(
+                failed_manifest["prior_deployment"]["commit"],
+                deployment_commit,
+            )
+            failed_workstation_verification = SshExactSourceDeployment(
+                CapturedDeploymentTransport(failed.stdout)
+            ).deploy(
+                target_configuration,
+                failed_request["deployment_commit"],
+                fixture_policy,
+                {"starting_state": "MANAGED_REDEPLOYMENT"},
+                failed_run_id,
+            )
+            self.assertFalse(failed_workstation_verification.passed)
+            self.assertEqual(
+                failed_workstation_verification.outcome,
+                "ERROR",
+            )
+            self.assertTrue(
+                failed_workstation_verification.remote_mutation_occurred
+            )
+            self.assertFalse(
+                failed_workstation_verification.field_services_running,
+                json.dumps(
+                    failed_response,
+                    indent=2,
+                    sort_keys=True,
+                ),
+            )
+
+
 class StaticGitHubActionsApi:
     def __init__(
         self,
@@ -1446,6 +2258,7 @@ class ReadyRemote:
             passed=True,
             evidence={
                 "target_alias": "field-host",
+                "starting_state": "INITIAL_DEPLOYMENT",
                 "result": "PASS",
             },
             blocker=None,
@@ -1527,9 +2340,52 @@ class PrivacyExpandingRemoteProbe:
         )
 
 
+class PrivacyExpandingDeploymentTransport:
+    def execute(
+        self,
+        configuration: object,
+        commit: str,
+        policy: dict[str, object],
+        preflight: dict[str, object],
+        run_id: str,
+    ) -> RemoteDeploymentExecution:
+        return RemoteDeploymentExecution(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "target_alias": "field-host",
+                    "deployment_commit": commit,
+                    "result": "PASS",
+                    "blocker": None,
+                    "remote_mutation_occurred": True,
+                    "field_services_running": True,
+                    "compose_config": {
+                        "schema_version": 1,
+                        "deployment_commit": commit,
+                        "vps_host": "198.51.100.10",
+                    },
+                    "deployment_manifest": {
+                        "schema_version": 1,
+                        "run_id": run_id,
+                        "deployment_commit": commit,
+                        "result": "PASS",
+                    },
+                }
+            ).encode("utf-8"),
+            stderr=b"",
+        )
+
+
 class DeclinedAuthorization:
     def authorize(self, phrase: str) -> AuthorizationDecision:
         return AuthorizationDecision(authorized=False)
+
+
+class ApprovedAuthorization:
+    def authorize(self, phrase: str) -> AuthorizationDecision:
+        return AuthorizationDecision(authorized=True)
 
 
 class InterruptedAuthorization:
@@ -1543,6 +2399,160 @@ class InteractiveTextStream(io.StringIO):
 
 
 class DeploymentControllerApiTests(unittest.TestCase):
+    def test_evidence_write_failure_preserves_proven_remote_state(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            target_file, _ = write_strict_target_configuration(
+                temporary_path
+            )
+            output_directory = temporary_path / "evidence"
+
+            class WriteBreakingDeployment:
+                def deploy(
+                    self,
+                    configuration: object,
+                    deployment_commit: str,
+                    policy: dict[str, object],
+                    preflight: dict[str, object],
+                    run_id: str,
+                ) -> RemoteDeploymentVerification:
+                    run_directory = (
+                        output_directory / "deployments" / run_id
+                    )
+                    run_directory.chmod(0o500)
+                    return RemoteDeploymentVerification(
+                        passed=True,
+                        outcome="PASS",
+                        blocker=None,
+                        remote_mutation_occurred=True,
+                        field_services_running=True,
+                        compose_config={},
+                        deployment_manifest={},
+                    )
+
+            try:
+                with self.assertRaises(EvidenceError) as caught:
+                    run(
+                        DeploymentRequest(
+                            check_only=False,
+                            commit="1" * 40,
+                            env_file=target_file,
+                            output_dir=output_directory,
+                        ),
+                        ControllerAdapters(
+                            clock=FixedClock(),
+                            randomness=FixedRandomSource(),
+                            repository=ProvenRepository(),
+                            trusted_ci=ProvenTrustedCi(),
+                            remote=ReadyRemote(),
+                            authorization=ApprovedAuthorization(),
+                            deployment=WriteBreakingDeployment(),
+                        ),
+                    )
+                self.assertIsNotNone(caught.exception.result)
+                self.assertTrue(
+                    caught.exception.result.remote_mutation_occurred
+                )
+                self.assertTrue(
+                    caught.exception.result.field_services_running
+                )
+                self.assertEqual(
+                    caught.exception.result.highest_state,
+                    "CI_VALIDATED",
+                )
+            finally:
+                deployments = output_directory / "deployments"
+                if deployments.is_dir():
+                    for run_directory in deployments.iterdir():
+                        run_directory.chmod(0o700)
+
+    def test_successful_exact_source_deployment_advances_to_runtime_verification(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            target_file, _ = write_strict_target_configuration(temporary_path)
+            output_directory = temporary_path / "evidence"
+            commit = "1" * 40
+
+            class ReadyDeployment:
+                def deploy(
+                    self,
+                    configuration: object,
+                    deployment_commit: str,
+                    policy: dict[str, object],
+                    preflight: dict[str, object],
+                    run_id: str,
+                ) -> RemoteDeploymentVerification:
+                    return RemoteDeploymentVerification(
+                        passed=True,
+                        outcome="PASS",
+                        blocker=None,
+                        remote_mutation_occurred=True,
+                        field_services_running=True,
+                        compose_config={
+                            "schema_version": 1,
+                            "deployment_commit": deployment_commit,
+                        },
+                        deployment_manifest={
+                            "schema_version": 1,
+                            "run_id": run_id,
+                            "deployment_commit": deployment_commit,
+                            "result": "PASS",
+                        },
+                    )
+
+            result = run(
+                DeploymentRequest(
+                    check_only=False,
+                    commit=commit,
+                    env_file=target_file,
+                    output_dir=output_directory,
+                ),
+                ControllerAdapters(
+                    clock=FixedClock(),
+                    randomness=FixedRandomSource(),
+                    repository=ProvenRepository(),
+                    trusted_ci=ProvenTrustedCi(),
+                    remote=ReadyRemote(),
+                    authorization=ApprovedAuthorization(),
+                    deployment=ReadyDeployment(),
+                ),
+            )
+
+            checks = {check.check_id: check for check in result.checks}
+            self.assertEqual(checks["exact_source_deployment"].status, "PASS")
+            self.assertEqual(
+                checks["runtime_verification_foundation"].status,
+                "BLOCKER",
+            )
+            self.assertTrue(result.remote_mutation_occurred)
+            self.assertTrue(result.field_services_running)
+            self.assertEqual(result.highest_state, "CI_VALIDATED")
+            self.assertEqual(result.outcome, "BLOCKED")
+
+            run_directory = (
+                output_directory / "deployments" / result.run_id
+            )
+            self.assertEqual(
+                json.loads(
+                    (run_directory / "compose-config.json").read_text(
+                        encoding="utf-8"
+                    )
+                )["deployment_commit"],
+                commit,
+            )
+            self.assertEqual(
+                json.loads(
+                    (run_directory / "deployment-manifest.json").read_text(
+                        encoding="utf-8"
+                    )
+                )["result"],
+                "PASS",
+            )
+
     def test_production_authorization_accepts_the_exact_tty_phrase(self) -> None:
         phrase = (
             "AUTHORIZE DEPLOY "
@@ -1669,6 +2679,7 @@ class DeploymentControllerApiTests(unittest.TestCase):
         self.assertIsNotNone(adapters.repository)
         self.assertIsNotNone(adapters.trusted_ci)
         self.assertIsNotNone(adapters.remote)
+        self.assertIsNotNone(adapters.deployment)
 
     def test_run_returns_a_deterministic_structured_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2114,6 +3125,128 @@ print(json.dumps({
                 if check.check_id == "remote_preflight"
             )
             self.assertEqual(remote_check.status, "PASS")
+
+    def test_production_ssh_transport_runs_bounded_deployment_program(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            target_file, _ = write_strict_target_configuration(
+                temporary_path
+            )
+            fake_ssh = temporary_path / "ssh"
+            fake_ssh.write_text(
+                """#!/usr/bin/env python3
+import base64
+import json
+import sys
+
+required = {
+    "BatchMode=yes",
+    "IdentitiesOnly=yes",
+    "StrictHostKeyChecking=yes",
+    "ConnectTimeout=10",
+}
+if not required.issubset(set(sys.argv)):
+    raise SystemExit(91)
+if sys.argv[-2] != "-" or sys.argv[-3] != "python3":
+    raise SystemExit(92)
+program = sys.stdin.buffer.read()
+if b"EventHorizon exact-source remote deployment" not in program:
+    raise SystemExit(93)
+request = json.loads(base64.urlsafe_b64decode(sys.argv[-1]))
+print(json.dumps({
+    "schema_version": 1,
+    "run_id": request["run_id"],
+    "target_alias": request["target_alias"],
+    "deployment_commit": request["deployment_commit"],
+    "result": "BLOCKED",
+    "blocker": "Injected post-authorization policy blocker.",
+    "remote_mutation_occurred": True,
+    "field_services_running": False,
+    "compose_config": {},
+    "deployment_manifest": {}
+}))
+""",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o700)
+
+            result = run(
+                DeploymentRequest(
+                    check_only=False,
+                    commit="1" * 40,
+                    env_file=target_file,
+                    output_dir=temporary_path / "evidence",
+                ),
+                ControllerAdapters(
+                    clock=FixedClock(),
+                    randomness=FixedRandomSource(),
+                    repository=ProvenRepository(),
+                    trusted_ci=ProvenTrustedCi(),
+                    remote=ReadyRemote(),
+                    authorization=ApprovedAuthorization(),
+                    deployment=SshExactSourceDeployment(
+                        SystemSshDeploymentTransport(
+                            ssh_executable=fake_ssh,
+                            deployment_program_path=(
+                                REPO_ROOT
+                                / "scripts/vps_field_remote_deploy.py"
+                            ),
+                        )
+                    ),
+                ),
+            )
+
+            self.assertTrue(result.remote_mutation_occurred)
+            self.assertFalse(result.field_services_running)
+            deployment_check = next(
+                check
+                for check in result.checks
+                if check.check_id == "exact_source_deployment"
+            )
+            self.assertEqual(deployment_check.status, "BLOCKER")
+
+    def test_privacy_expanding_deployment_evidence_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            target_file, _ = write_strict_target_configuration(
+                temporary_path
+            )
+            output_directory = temporary_path / "evidence"
+
+            result = run(
+                DeploymentRequest(
+                    check_only=False,
+                    commit="1" * 40,
+                    env_file=target_file,
+                    output_dir=output_directory,
+                ),
+                ControllerAdapters(
+                    clock=FixedClock(),
+                    randomness=FixedRandomSource(),
+                    repository=ProvenRepository(),
+                    trusted_ci=ProvenTrustedCi(),
+                    remote=ReadyRemote(),
+                    authorization=ApprovedAuthorization(),
+                    deployment=SshExactSourceDeployment(
+                        PrivacyExpandingDeploymentTransport()
+                    ),
+                ),
+            )
+
+            self.assertEqual(result.outcome, "ERROR")
+            self.assertEqual(result.highest_state, "CI_VALIDATED")
+            run_directory = (
+                output_directory / "deployments" / result.run_id
+            )
+            self.assertFalse((run_directory / "compose-config.json").exists())
+            self.assertFalse(
+                (run_directory / "deployment-manifest.json").exists()
+            )
+            retained = "".join(
+                path.read_text(encoding="utf-8")
+                for path in run_directory.iterdir()
+            )
+            self.assertNotIn("198.51.100.10", retained)
 
     def test_target_file_security_and_strict_data_violations_are_blocked(
         self,
