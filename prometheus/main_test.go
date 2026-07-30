@@ -346,6 +346,26 @@ func TestMalformedMetricMessagesAreCounted(t *testing.T) {
 	assertCounter(t, m.exporterMessages.WithLabelValues("rejected"), 5)
 }
 
+func TestFieldSafeModeDoesNotRequireGeoDatabase(t *testing.T) {
+	db = nil
+	t.Cleanup(func() {
+		if db != nil {
+			_ = db.Close()
+		}
+		db = nil
+	})
+
+	if err := openGeoDatabase("/missing/field-safe.mmdb", true); err != nil {
+		t.Fatalf("field-safe mode unexpectedly required GeoIP data: %v", err)
+	}
+	if db != nil {
+		t.Fatal("field-safe mode unexpectedly opened a GeoIP database")
+	}
+	if err := openGeoDatabase("/missing/non-field.mmdb", false); err == nil {
+		t.Fatal("non-field mode accepted a missing GeoIP database")
+	}
+}
+
 func TestFieldSafeModeRetainsBoundedMetricsWithoutRawSeriesOrLogs(t *testing.T) {
 	t.Setenv("EVENTHORIZON_FIELD_SAFE_MODE", "true")
 

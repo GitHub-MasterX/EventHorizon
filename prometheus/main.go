@@ -228,15 +228,27 @@ func fieldSafeModeEnabled() bool {
 	return enabled
 }
 
-func main() {
-	var err error
-	geoliteDbPath := os.Getenv("GEO_DB")
-	// fmt.Print(geoliteDbPath+"\n")
-	db, err = maxminddb.Open(geoliteDbPath)
+func openGeoDatabase(path string, fieldSafe bool) error {
+	if fieldSafe {
+		db = nil
+		return nil
+	}
+	database, err := maxminddb.Open(path)
 	if err != nil {
+		return err
+	}
+	db = database
+	return nil
+}
+
+func main() {
+	geoliteDbPath := os.Getenv("GEO_DB")
+	if err := openGeoDatabase(geoliteDbPath, fieldSafeModeEnabled()); err != nil {
 		log.Fatal("Cannot open GeoLite2 database: ", err)
 	}
-	defer db.Close()
+	if db != nil {
+		defer db.Close()
+	}
 
 	// Register metrics
 	m := NewMetrics()
