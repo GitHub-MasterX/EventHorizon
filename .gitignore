@@ -15,3 +15,6 @@ masscan_*.xml
 scanner-output/
 __pycache__/
 *.py[cod]
+/.scratch/
+/AGENTS.md
+/CONTEXT.md
