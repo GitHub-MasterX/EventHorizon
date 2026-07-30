@@ -16,7 +16,8 @@
     "supported_compose_files",
     "result_schema_version",
     "evidence_index_schema_version",
-    "ci_proof_schema_version"
+    "ci_proof_schema_version",
+    "remote_preflight_schema_version"
   ],
   "properties": {
     "schema_version": {
@@ -184,6 +185,9 @@
       "const": 1
     },
     "ci_proof_schema_version": {
+      "const": 1
+    },
+    "remote_preflight_schema_version": {
       "const": 1
     }
   }

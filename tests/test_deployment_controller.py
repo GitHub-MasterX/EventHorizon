@@ -1,9 +1,11 @@
+import base64
 import hashlib
 import json
 import os
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -22,13 +24,46 @@ from scripts.deployment_controller import (
     EvidenceError,
     GitHubApiError,
     LocalGitRepository,
+    RemoteProbeExecution,
     RemotePreflightVerification,
+    SshRemotePreflight,
+    SystemSshProbeTransport,
     TrustedGitHubActions,
+    production_adapters,
     run,
 )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def write_strict_target_configuration(
+    directory: Path,
+) -> tuple[Path, Path]:
+    ssh_key = directory / "operator_key"
+    ssh_key.write_text("test-only-private-key\n", encoding="utf-8")
+    ssh_key.chmod(0o600)
+    target_file = directory / "field.env"
+    target_file.write_text(
+        "\n".join(
+            (
+                "TARGET_ALIAS=field-host",
+                "VPS_HOST=198.51.100.10",
+                "VPS_USER=deploy",
+                "VPS_SSH_PORT=22",
+                f"VPS_SSH_KEY={ssh_key}",
+                "VPS_DEPLOY_DIR=/srv/eventhorizon-field",
+                "VPS_PROJECT_NAME=eventhorizon-field",
+                "ADMIN_SOURCE_CIDR=203.0.113.9/32",
+                "FIELD_TARPIT_CPU_LIMIT=0.50",
+                "FIELD_TARPIT_MEMORY_LIMIT=",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+    target_file.chmod(0o600)
+    return target_file, ssh_key
 
 
 class DeploymentContractArtifactTests(unittest.TestCase):
@@ -67,7 +102,16 @@ class DeploymentContractArtifactTests(unittest.TestCase):
         )
         self.assertIn("scripts/vps_field_deploy.sh", policy["protected_paths"])
         self.assertIn("scripts/deployment_controller.py", policy["protected_paths"])
+        self.assertIn(
+            "scripts/vps_field_remote_probe.py",
+            policy["protected_paths"],
+        )
         self.assertIn(".github/workflows/ci.yml", policy["protected_paths"])
+        self.assertIn(
+            "deploy/schemas/remote-preflight.schema.json",
+            policy["protected_paths"],
+        )
+        self.assertEqual(policy["remote_preflight_schema_version"], 1)
 
     def test_result_schema_accepts_partial_failure_and_rejects_drift(self) -> None:
         schema = json.loads(
@@ -212,6 +256,38 @@ class DeploymentContractArtifactTests(unittest.TestCase):
                 )
             )
 
+    def test_remote_preflight_schema_is_strict_and_redacted(self) -> None:
+        schema = json.loads(
+            (
+                REPO_ROOT / "deploy/schemas/remote-preflight.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        evidence = {
+            "schema_version": 1,
+            "target_alias": "field-host",
+            "deployment_commit": "1" * 40,
+            "checked_utc": "2026-07-30T01:02:03Z",
+            "starting_state": "INITIAL_DEPLOYMENT",
+            "result": "PASS",
+            "checks": [
+                {
+                    "id": "operating_system",
+                    "status": "PASS",
+                    "summary": "Authorized VPS runs Linux.",
+                }
+            ],
+        }
+        validator = Draft202012Validator(
+            schema,
+            format_checker=Draft202012Validator.FORMAT_CHECKER,
+        )
+
+        validator.validate(evidence)
+        with self.assertRaises(ValidationError):
+            validator.validate(dict(evidence, vps_host="198.51.100.10"))
+        with self.assertRaises(ValidationError):
+            validator.validate(dict(evidence, schema_version=2))
+
     def test_target_configuration_example_contains_only_strict_keys(self) -> None:
         entries = {}
         for line in (
@@ -305,6 +381,15 @@ class DeploymentContractArtifactTests(unittest.TestCase):
         self.assertIn(
             "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1",
             workflow_text,
+        )
+        deployment_controller_script = "\n".join(
+            step.get("run", "")
+            for step in workflow["jobs"]["deployment-controller"]["steps"]
+            if isinstance(step, dict)
+        )
+        self.assertIn(
+            "scripts/vps_field_remote_probe.py",
+            deployment_controller_script,
         )
 
     def test_field_build_inputs_are_platform_specific_and_immutable(self) -> None:
@@ -415,6 +500,35 @@ class DeploymentOperatorCliTests(unittest.TestCase):
             self.assertIn("--check-only", completed.stdout)
             self.assertEqual(completed.stderr, "")
             self.assertFalse(output_base.exists())
+
+    def test_internal_remote_preflight_help_is_side_effect_free(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            environment = os.environ.copy()
+            environment["VPS_FIELD_ENV_FILE"] = str(
+                Path(temporary_directory) / "must-not-be-read.env"
+            )
+
+            completed = subprocess.run(
+                [
+                    str(
+                        REPO_ROOT
+                        / "scripts/vps_field_remote_preflight.sh"
+                    ),
+                    "--help",
+                ],
+                cwd=REPO_ROOT,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertIn(
+                "usage: vps_field_remote_preflight.sh",
+                completed.stdout,
+            )
+            self.assertEqual(completed.stderr, "")
 
     def test_invalid_commit_is_blocked_with_matching_partial_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -609,6 +723,463 @@ class DeploymentOperatorCliTests(unittest.TestCase):
             run_directory = next((output_base / "deployments").iterdir())
             self.assertTrue((run_directory / "result.json").is_file())
             self.assertEqual(completed.stderr, "")
+
+
+class RemoteProbeIntegrationTests(unittest.TestCase):
+    def test_missing_remote_tools_are_blocked_not_transport_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            tools = temporary_path / "tools"
+            tools.mkdir()
+            dispatcher = tools / "fake-system-tool"
+            dispatcher.write_text(
+                """#!/usr/bin/python3
+import sys
+from pathlib import Path
+
+tool = Path(sys.argv[0]).name
+if tool == "uname":
+    print("Linux" if sys.argv[1:] == ["-s"] else "x86_64")
+elif tool == "getconf":
+    print("2")
+elif tool == "df":
+    print("Filesystem 1024-blocks Used Available Capacity Mounted on")
+    print("/dev/test 20971520 1024 10485760 1% /")
+else:
+    raise SystemExit(83)
+""",
+                encoding="utf-8",
+            )
+            dispatcher.chmod(0o700)
+            for tool_name in ("uname", "getconf", "df"):
+                (tools / tool_name).symlink_to(dispatcher)
+
+            request = {
+                "schema_version": 1,
+                "target_alias": "field-host",
+                "deployment_commit": "1" * 40,
+                "deploy_dir": str(temporary_path / "eventhorizon-field"),
+                "project_name": "eventhorizon-field",
+                "trusted_repository": "honeynet/EventHorizon",
+                "memory_limit": None,
+                "reference_epoch": int(
+                    datetime.now(timezone.utc).timestamp()
+                ),
+            }
+            encoded_request = base64.urlsafe_b64encode(
+                json.dumps(request).encode("utf-8")
+            ).decode("ascii")
+            environment = os.environ.copy()
+            environment["PATH"] = str(tools)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts/vps_field_remote_probe.py"),
+                    encoded_request,
+                ],
+                cwd=temporary_path,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = json.loads(completed.stdout)
+            self.assertEqual(evidence["result"], "BLOCKED")
+            blockers = {
+                check["id"]
+                for check in evidence["checks"]
+                if check["status"] == "BLOCKER"
+            }
+            self.assertTrue(
+                {
+                    "docker_engine",
+                    "docker_compose",
+                    "git",
+                    "curl",
+                    "socket_inspection",
+                }.issubset(blockers)
+            )
+
+    def test_clean_initial_deployment_passes_without_remote_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            tools = temporary_path / "tools"
+            tools.mkdir()
+            dispatcher = tools / "fake-system-tool"
+            dispatcher.write_text(
+                """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+tool = Path(sys.argv[0]).name
+arguments = sys.argv[1:]
+if tool == "uname":
+    print("Linux" if arguments == ["-s"] else "x86_64")
+elif tool == "getconf":
+    print("2")
+elif tool == "docker":
+    if arguments == ["info", "--format", "{{.ServerVersion}}"]:
+        print("29.5.2")
+    elif arguments == ["compose", "version", "--short"]:
+        print("5.1.4")
+    elif arguments == ["compose", "ls", "--format", "json"]:
+        print("[]")
+    elif arguments[:3] == ["ps", "-a", "--format"]:
+        pass
+    elif arguments[:2] == ["volume", "ls"]:
+        pass
+    else:
+        raise SystemExit(81)
+elif tool == "git":
+    if arguments == ["--version"]:
+        print("git version 2.43.0")
+    else:
+        raise SystemExit(82)
+elif tool == "curl":
+    print("curl 8.5.0")
+elif tool == "ss":
+    pass
+elif tool == "df":
+    print("Filesystem 1024-blocks Used Available Capacity Mounted on")
+    print("/dev/test 20971520 1024 10485760 1% /")
+else:
+    raise SystemExit(83)
+""",
+                encoding="utf-8",
+            )
+            dispatcher.chmod(0o700)
+            for tool_name in (
+                "uname",
+                "getconf",
+                "docker",
+                "git",
+                "curl",
+                "ss",
+                "df",
+            ):
+                (tools / tool_name).symlink_to(dispatcher)
+
+            request = {
+                "schema_version": 1,
+                "target_alias": "field-host",
+                "deployment_commit": "1" * 40,
+                "deploy_dir": str(temporary_path / "eventhorizon-field"),
+                "project_name": "eventhorizon-field",
+                "trusted_repository": "honeynet/EventHorizon",
+                "memory_limit": None,
+                "reference_epoch": int(
+                    datetime.now(timezone.utc).timestamp()
+                ),
+            }
+            encoded_request = base64.urlsafe_b64encode(
+                json.dumps(request).encode("utf-8")
+            ).decode("ascii")
+            environment = os.environ.copy()
+            environment["PATH"] = (
+                str(tools) + os.pathsep + environment["PATH"]
+            )
+
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(REPO_ROOT / "scripts/vps_field_remote_probe.py"),
+                    encoded_request,
+                ],
+                cwd=temporary_path,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = json.loads(completed.stdout)
+            self.assertEqual(evidence["result"], "PASS", completed.stdout)
+            self.assertEqual(
+                evidence["starting_state"],
+                "INITIAL_DEPLOYMENT",
+            )
+            schema = json.loads(
+                (
+                    REPO_ROOT
+                    / "deploy/schemas/remote-preflight.schema.json"
+                ).read_text(encoding="utf-8")
+            )
+            Draft202012Validator(
+                schema,
+                format_checker=Draft202012Validator.FORMAT_CHECKER,
+            ).validate(evidence)
+            self.assertFalse((temporary_path / "eventhorizon-field").exists())
+
+            actual_directory = temporary_path / "actual-directory"
+            actual_directory.mkdir()
+            (temporary_path / "eventhorizon-field").symlink_to(
+                actual_directory,
+                target_is_directory=True,
+            )
+            symlinked = subprocess.run(
+                [
+                    "python3",
+                    str(REPO_ROOT / "scripts/vps_field_remote_probe.py"),
+                    encoded_request,
+                ],
+                cwd=temporary_path,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(symlinked.returncode, 0, symlinked.stderr)
+            symlink_evidence = json.loads(symlinked.stdout)
+            self.assertEqual(symlink_evidence["result"], "BLOCKED")
+            directory_check = next(
+                check
+                for check in symlink_evidence["checks"]
+                if check["id"] == "deployment_directory"
+            )
+            self.assertEqual(directory_check["status"], "BLOCKER")
+
+    def test_reconciled_eventhorizon_project_is_managed_redeployment(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            deploy_dir = temporary_path / "eventhorizon-field"
+            deploy_dir.mkdir()
+
+            def git(*arguments: str) -> str:
+                completed = subprocess.run(
+                    ["git", *arguments],
+                    cwd=deploy_dir,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                )
+                return completed.stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.name", "Remote Probe Test")
+            git("config", "user.email", "probe@example.invalid")
+            git(
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:honeynet/EventHorizon.git",
+            )
+            (deploy_dir / ".gitignore").write_text(
+                "validation-output/\n",
+                encoding="utf-8",
+            )
+            (deploy_dir / "tracked.txt").write_text(
+                "managed checkout\n",
+                encoding="utf-8",
+            )
+            git("add", ".")
+            git("commit", "-qm", "managed deployment")
+            current_commit = git("rev-parse", "HEAD")
+            validation_output = deploy_dir / "validation-output"
+            validation_output.mkdir()
+            (validation_output / "deployment_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "repository_commit": current_commit,
+                        "compose_project_name": "eventhorizon-field",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (validation_output / "observation_window.json").write_text(
+                json.dumps(
+                    {
+                        "observation_start_utc": "2026-07-18T00:00:00Z",
+                        "observation_end_utc": "2026-07-19T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            tools = temporary_path / "tools"
+            tools.mkdir()
+            dispatcher = tools / "fake-system-tool"
+            dispatcher.write_text(
+                """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+tool = Path(sys.argv[0]).name
+arguments = sys.argv[1:]
+if tool == "uname":
+    print("Linux" if arguments == ["-s"] else "x86_64")
+elif tool == "getconf":
+    print("2")
+elif tool == "df":
+    print("Filesystem 1024-blocks Used Available Capacity Mounted on")
+    print("/dev/test 20971520 1024 10485760 1% /")
+elif tool == "docker":
+    if arguments == ["info", "--format", "{{.ServerVersion}}"]:
+        print("29.5.2")
+    elif arguments == ["compose", "version", "--short"]:
+        print("5.1.4")
+    elif arguments == ["compose", "ls", "--format", "json"]:
+        print(json.dumps([{"Name": "eventhorizon-field"}]))
+    elif arguments[:3] == ["ps", "-a", "--format"]:
+        rows = [
+            ("telnet", "0.0.0.0:23->23/tcp"),
+            ("mqtt", "0.0.0.0:1883->1883/tcp"),
+            ("grafana", "127.0.0.1:3000->3000/tcp"),
+            ("cadvisor", "127.0.0.1:8081->8081/tcp"),
+            ("prometheus", "127.0.0.1:9090->9090/tcp"),
+            ("exporter", "127.0.0.1:9101->9101/tcp"),
+        ]
+        for name, ports in rows:
+            print(f"{name}\\teventhorizon-field\\t{ports}")
+    elif arguments[:2] == ["volume", "ls"]:
+        print("eventhorizon-field_prometheus-data")
+        print("eventhorizon-field_grafana-storage")
+        print("eventhorizon-field_tarpit-sock")
+        if os.environ.get("FAKE_EXTRA_VOLUME") == "1":
+            print("eventhorizon-field_unmanaged-data")
+    else:
+        raise SystemExit(81)
+elif tool == "curl":
+    print("curl 8.5.0")
+elif tool == "ss":
+    if arguments != ["--version"]:
+        for port in (23, 1883, 3000, 8081, 9090, 9101):
+            print(f"LISTEN 0 4096 127.0.0.1:{port} 0.0.0.0:*")
+else:
+    raise SystemExit(83)
+""",
+                encoding="utf-8",
+            )
+            dispatcher.chmod(0o700)
+            for tool_name in (
+                "uname",
+                "getconf",
+                "docker",
+                "curl",
+                "ss",
+                "df",
+            ):
+                (tools / tool_name).symlink_to(dispatcher)
+
+            request = {
+                "schema_version": 1,
+                "target_alias": "field-host",
+                "deployment_commit": "1" * 40,
+                "deploy_dir": str(deploy_dir),
+                "project_name": "eventhorizon-field",
+                "trusted_repository": "honeynet/EventHorizon",
+                "memory_limit": None,
+                "reference_epoch": int(
+                    datetime.now(timezone.utc).timestamp()
+                ),
+            }
+            encoded_request = base64.urlsafe_b64encode(
+                json.dumps(request).encode("utf-8")
+            ).decode("ascii")
+            environment = os.environ.copy()
+            environment["PATH"] = (
+                str(tools) + os.pathsep + environment["PATH"]
+            )
+
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(REPO_ROOT / "scripts/vps_field_remote_probe.py"),
+                    encoded_request,
+                ],
+                cwd=temporary_path,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = json.loads(completed.stdout)
+            self.assertEqual(evidence["result"], "PASS", completed.stdout)
+            self.assertEqual(
+                evidence["starting_state"],
+                "MANAGED_REDEPLOYMENT",
+            )
+            self.assertEqual(git("rev-parse", "HEAD"), current_commit)
+            self.assertEqual(git("status", "--porcelain"), "")
+
+            (validation_output / "observation_window.json").write_text(
+                json.dumps(
+                    {
+                        "observation_start_utc": "2026-07-30T01:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            blocked = subprocess.run(
+                [
+                    "python3",
+                    str(REPO_ROOT / "scripts/vps_field_remote_probe.py"),
+                    encoded_request,
+                ],
+                cwd=temporary_path,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(blocked.returncode, 0, blocked.stderr)
+            blocked_evidence = json.loads(blocked.stdout)
+            self.assertEqual(blocked_evidence["result"], "BLOCKED")
+            observation_check = next(
+                check
+                for check in blocked_evidence["checks"]
+                if check["id"] == "public_observation"
+            )
+            self.assertEqual(observation_check["status"], "BLOCKER")
+
+            (validation_output / "observation_window.json").write_text(
+                json.dumps(
+                    {
+                        "observation_start_utc": "2026-07-18T00:00:00Z",
+                        "observation_end_utc": "2026-07-19T00:00:00Z",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            environment["FAKE_EXTRA_VOLUME"] = "1"
+            extra_volume = subprocess.run(
+                [
+                    "python3",
+                    str(REPO_ROOT / "scripts/vps_field_remote_probe.py"),
+                    encoded_request,
+                ],
+                cwd=temporary_path,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(extra_volume.returncode, 0, extra_volume.stderr)
+            volume_evidence = json.loads(extra_volume.stdout)
+            self.assertEqual(volume_evidence["result"], "BLOCKED")
+            volume_check = next(
+                check
+                for check in volume_evidence["checks"]
+                if check["id"] == "volume_state"
+            )
+            self.assertEqual(volume_check["status"], "BLOCKER")
 
 
 class FixedClock:
@@ -872,6 +1443,81 @@ class ReadyRemote:
         )
 
 
+class InitialDeploymentProbe:
+    def collect(
+        self,
+        configuration: object,
+        commit: str,
+        policy: dict[str, object],
+    ) -> RemoteProbeExecution:
+        return RemoteProbeExecution(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "schema_version": 1,
+                    "target_alias": "field-host",
+                    "deployment_commit": commit,
+                    "checked_utc": "2026-07-30T01:02:03Z",
+                    "starting_state": "INITIAL_DEPLOYMENT",
+                    "result": "PASS",
+                    "checks": [
+                        {
+                            "id": "operating_system",
+                            "status": "PASS",
+                            "summary": "Authorized VPS runs Linux.",
+                        }
+                    ],
+                }
+            ).encode("utf-8"),
+            stderr=b"",
+        )
+
+
+class MalfunctioningRemoteProbe:
+    def collect(
+        self,
+        configuration: object,
+        commit: str,
+        policy: dict[str, object],
+    ) -> RemoteProbeExecution:
+        return RemoteProbeExecution(
+            returncode=255,
+            stdout=b"",
+            stderr=b"ssh: sensitive transport diagnostic",
+        )
+
+
+class PrivacyExpandingRemoteProbe:
+    def collect(
+        self,
+        configuration: object,
+        commit: str,
+        policy: dict[str, object],
+    ) -> RemoteProbeExecution:
+        return RemoteProbeExecution(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "schema_version": 1,
+                    "target_alias": "field-host",
+                    "deployment_commit": commit,
+                    "checked_utc": "2026-07-30T01:02:03Z",
+                    "starting_state": "INITIAL_DEPLOYMENT",
+                    "result": "PASS",
+                    "checks": [
+                        {
+                            "id": "operating_system",
+                            "status": "PASS",
+                            "summary": "Authorized VPS runs Linux.",
+                        }
+                    ],
+                    "vps_host": "198.51.100.10",
+                }
+            ).encode("utf-8"),
+            stderr=b"",
+        )
+
+
 class DeclinedAuthorization:
     def authorize(self, phrase: str) -> AuthorizationDecision:
         return AuthorizationDecision(authorized=False)
@@ -883,6 +1529,15 @@ class InterruptedAuthorization:
 
 
 class DeploymentControllerApiTests(unittest.TestCase):
+    def test_production_adapters_include_remote_preflight_capability(
+        self,
+    ) -> None:
+        adapters = production_adapters()
+
+        self.assertIsNotNone(adapters.repository)
+        self.assertIsNotNone(adapters.trusted_ci)
+        self.assertIsNotNone(adapters.remote)
+
     def test_run_returns_a_deterministic_structured_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             request = DeploymentRequest(
@@ -1064,29 +1719,9 @@ class DeploymentControllerApiTests(unittest.TestCase):
     def test_valid_target_data_passes_without_leaking_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_path = Path(temporary_directory)
-            ssh_key = temporary_path / "operator_key"
-            ssh_key.write_text("test-only-private-key\n", encoding="utf-8")
-            ssh_key.chmod(0o600)
-            target_file = temporary_path / "field.env"
-            target_file.write_text(
-                "\n".join(
-                    (
-                        "TARGET_ALIAS=field-host",
-                        "VPS_HOST=198.51.100.10",
-                        "VPS_USER=deploy",
-                        "VPS_SSH_PORT=22",
-                        f"VPS_SSH_KEY={ssh_key}",
-                        "VPS_DEPLOY_DIR=/srv/eventhorizon-field",
-                        "VPS_PROJECT_NAME=eventhorizon-field",
-                        "ADMIN_SOURCE_CIDR=203.0.113.9/32",
-                        "FIELD_TARPIT_CPU_LIMIT=0.50",
-                        "FIELD_TARPIT_MEMORY_LIMIT=",
-                        "",
-                    )
-                ),
-                encoding="utf-8",
+            target_file, ssh_key = write_strict_target_configuration(
+                temporary_path
             )
-            target_file.chmod(0o600)
             output_directory = temporary_path / "evidence"
             request = DeploymentRequest(
                 check_only=False,
@@ -1132,6 +1767,221 @@ class DeploymentControllerApiTests(unittest.TestCase):
                 "test-only-private-key",
             ):
                 self.assertNotIn(sensitive_value, retained)
+
+    def test_initial_remote_preflight_passes_with_strict_redacted_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            target_file, ssh_key = write_strict_target_configuration(
+                temporary_path
+            )
+            output_directory = temporary_path / "evidence"
+
+            result = run(
+                DeploymentRequest(
+                    check_only=False,
+                    commit="1" * 40,
+                    env_file=target_file,
+                    output_dir=output_directory,
+                ),
+                ControllerAdapters(
+                    clock=FixedClock(),
+                    randomness=FixedRandomSource(),
+                    repository=ProvenRepository(),
+                    trusted_ci=ProvenTrustedCi(),
+                    remote=SshRemotePreflight(InitialDeploymentProbe()),
+                    authorization=DeclinedAuthorization(),
+                ),
+            )
+
+            self.assertEqual(result.highest_state, "CI_VALIDATED")
+            self.assertEqual(result.outcome, "CANCELLED")
+            remote_check = next(
+                check
+                for check in result.checks
+                if check.check_id == "remote_preflight"
+            )
+            self.assertEqual(remote_check.status, "PASS")
+            evidence = json.loads(
+                (
+                    output_directory
+                    / "deployments"
+                    / result.run_id
+                    / "remote-preflight.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(evidence["starting_state"], "INITIAL_DEPLOYMENT")
+            self.assertEqual(evidence["result"], "PASS")
+            retained = json.dumps(evidence)
+            for sensitive_value in (
+                "198.51.100.10",
+                "203.0.113.9/32",
+                str(ssh_key),
+                "test-only-private-key",
+            ):
+                self.assertNotIn(sensitive_value, retained)
+
+    def test_remote_transport_malfunction_is_redacted_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            target_file, _ = write_strict_target_configuration(
+                temporary_path
+            )
+            output_directory = temporary_path / "evidence"
+
+            result = run(
+                DeploymentRequest(
+                    check_only=False,
+                    commit="1" * 40,
+                    env_file=target_file,
+                    output_dir=output_directory,
+                ),
+                ControllerAdapters(
+                    clock=FixedClock(),
+                    randomness=FixedRandomSource(),
+                    repository=ProvenRepository(),
+                    trusted_ci=ProvenTrustedCi(),
+                    remote=SshRemotePreflight(MalfunctioningRemoteProbe()),
+                ),
+            )
+
+            self.assertEqual(result.highest_state, "CI_VALIDATED")
+            self.assertEqual(result.outcome, "ERROR")
+            self.assertEqual(result.exit_code, 5)
+            remote_check = next(
+                check
+                for check in result.checks
+                if check.check_id == "remote_preflight"
+            )
+            self.assertEqual(remote_check.status, "ERROR")
+            self.assertIn(
+                "malfunction",
+                remote_check.summary.lower(),
+            )
+            run_directory = (
+                output_directory / "deployments" / result.run_id
+            )
+            self.assertFalse((run_directory / "remote-preflight.json").exists())
+            retained = json.dumps(result.to_dict())
+            for artifact in run_directory.iterdir():
+                retained += artifact.read_text(encoding="utf-8")
+            self.assertNotIn("sensitive transport diagnostic", retained)
+
+    def test_privacy_expanding_remote_evidence_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            target_file, _ = write_strict_target_configuration(
+                temporary_path
+            )
+            output_directory = temporary_path / "evidence"
+
+            result = run(
+                DeploymentRequest(
+                    check_only=False,
+                    commit="1" * 40,
+                    env_file=target_file,
+                    output_dir=output_directory,
+                ),
+                ControllerAdapters(
+                    clock=FixedClock(),
+                    randomness=FixedRandomSource(),
+                    repository=ProvenRepository(),
+                    trusted_ci=ProvenTrustedCi(),
+                    remote=SshRemotePreflight(PrivacyExpandingRemoteProbe()),
+                ),
+            )
+
+            self.assertEqual(result.outcome, "ERROR")
+            self.assertEqual(result.highest_state, "CI_VALIDATED")
+            run_directory = (
+                output_directory / "deployments" / result.run_id
+            )
+            self.assertFalse((run_directory / "remote-preflight.json").exists())
+            retained = "".join(
+                path.read_text(encoding="utf-8")
+                for path in run_directory.iterdir()
+            )
+            self.assertNotIn("198.51.100.10", retained)
+
+    def test_production_ssh_transport_runs_the_bounded_remote_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            target_file, _ = write_strict_target_configuration(
+                temporary_path
+            )
+            fake_ssh = temporary_path / "ssh"
+            fake_ssh.write_text(
+                """#!/usr/bin/env python3
+import base64
+import json
+import sys
+
+required = {
+    "BatchMode=yes",
+    "IdentitiesOnly=yes",
+    "StrictHostKeyChecking=yes",
+    "ConnectTimeout=10",
+}
+if not required.issubset(set(sys.argv)):
+    raise SystemExit(91)
+if sys.argv[-2] != "-" or sys.argv[-3] != "python3":
+    raise SystemExit(92)
+probe = sys.stdin.buffer.read()
+if b"EventHorizon remote preflight probe" not in probe:
+    raise SystemExit(93)
+request = json.loads(base64.urlsafe_b64decode(sys.argv[-1]))
+print(json.dumps({
+    "schema_version": 1,
+    "target_alias": request["target_alias"],
+    "deployment_commit": request["deployment_commit"],
+    "checked_utc": "2026-07-30T01:02:03Z",
+    "starting_state": "INITIAL_DEPLOYMENT",
+    "result": "PASS",
+    "checks": [{
+        "id": "operating_system",
+        "status": "PASS",
+        "summary": "Authorized VPS runs Linux."
+    }]
+}))
+""",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o700)
+            output_directory = temporary_path / "evidence"
+
+            result = run(
+                DeploymentRequest(
+                    check_only=False,
+                    commit="1" * 40,
+                    env_file=target_file,
+                    output_dir=output_directory,
+                ),
+                ControllerAdapters(
+                    clock=FixedClock(),
+                    randomness=FixedRandomSource(),
+                    repository=ProvenRepository(),
+                    trusted_ci=ProvenTrustedCi(),
+                    remote=SshRemotePreflight(
+                        SystemSshProbeTransport(
+                            ssh_executable=fake_ssh,
+                            probe_path=(
+                                REPO_ROOT
+                                / "scripts/vps_field_remote_probe.py"
+                            ),
+                        )
+                    ),
+                    authorization=DeclinedAuthorization(),
+                ),
+            )
+
+            self.assertEqual(result.outcome, "CANCELLED")
+            remote_check = next(
+                check
+                for check in result.checks
+                if check.check_id == "remote_preflight"
+            )
+            self.assertEqual(remote_check.status, "PASS")
 
     def test_target_file_security_and_strict_data_violations_are_blocked(
         self,

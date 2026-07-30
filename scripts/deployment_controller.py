@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import ipaddress
 import json
@@ -25,6 +26,7 @@ from typing import NoReturn, Protocol, Sequence
 RESULT_SCHEMA_VERSION = 1
 EVIDENCE_INDEX_SCHEMA_VERSION = 1
 CI_PROOF_SCHEMA_VERSION = 1
+REMOTE_PREFLIGHT_SCHEMA_VERSION = 1
 CONTROLLER_CONTRACT_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FULL_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -82,6 +84,14 @@ class RemotePreflightVerification:
     passed: bool
     evidence: dict[str, object]
     blocker: str | None
+    outcome: str = "BLOCKED"
+
+
+@dataclass(frozen=True)
+class RemoteProbeExecution:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
 
 
 @dataclass(frozen=True)
@@ -138,6 +148,16 @@ class RemoteCapabilities(Protocol):
         policy: dict[str, object],
     ) -> RemotePreflightVerification:
         """Prove the non-mutating authorized-VPS preflight contract."""
+
+
+class RemoteProbeCapabilities(Protocol):
+    def collect(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+    ) -> RemoteProbeExecution:
+        """Collect one bounded remote preflight document over SSH."""
 
 
 class AuthorizationCapabilities(Protocol):
@@ -711,6 +731,210 @@ class SystemRandomSource:
 
 
 @dataclass(frozen=True)
+class SystemSshProbeTransport:
+    probe_path: Path
+    ssh_executable: str | Path = "ssh"
+    timeout_seconds: int = 45
+
+    def collect(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+    ) -> RemoteProbeExecution:
+        trusted_repository = policy.get("trusted_repository")
+        if not isinstance(trusted_repository, str):
+            raise OSError("deployment policy lacks a trusted repository")
+        request = {
+            "schema_version": REMOTE_PREFLIGHT_SCHEMA_VERSION,
+            "target_alias": configuration.target_alias,
+            "deployment_commit": commit,
+            "deploy_dir": configuration.vps_deploy_dir,
+            "project_name": configuration.vps_project_name,
+            "trusted_repository": trusted_repository,
+            "memory_limit": configuration.field_tarpit_memory_limit,
+            "reference_epoch": int(datetime.now(timezone.utc).timestamp()),
+        }
+        encoded_request = base64.urlsafe_b64encode(
+            json.dumps(
+                request,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).decode("ascii")
+        probe = self.probe_path.read_bytes()
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "GIT_TERMINAL_PROMPT": "0",
+                "LC_ALL": "C",
+            }
+        )
+        completed = subprocess.run(
+            [
+                str(self.ssh_executable),
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-p",
+                str(configuration.vps_ssh_port),
+                "-i",
+                str(configuration.vps_ssh_key),
+                f"{configuration.vps_user}@{configuration.vps_host}",
+                "python3",
+                "-",
+                encoded_request,
+            ],
+            input=probe,
+            capture_output=True,
+            check=False,
+            env=environment,
+            timeout=self.timeout_seconds,
+        )
+        return RemoteProbeExecution(
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+
+
+def _remote_preflight_evidence_is_valid(
+    evidence: object,
+    configuration: TargetConfiguration,
+    commit: str,
+) -> bool:
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "schema_version",
+        "target_alias",
+        "deployment_commit",
+        "checked_utc",
+        "starting_state",
+        "result",
+        "checks",
+    }:
+        return False
+    if (
+        type(evidence["schema_version"]) is not int
+        or evidence["schema_version"] != 1
+        or evidence["target_alias"] != configuration.target_alias
+        or evidence["deployment_commit"] != commit
+        or evidence["starting_state"]
+        not in {"INITIAL_DEPLOYMENT", "MANAGED_REDEPLOYMENT", "UNSUPPORTED"}
+        or evidence["result"] not in {"PASS", "BLOCKED"}
+        or not isinstance(evidence["checked_utc"], str)
+        or not isinstance(evidence["checks"], list)
+        or not 1 <= len(evidence["checks"]) <= 64
+    ):
+        return False
+    try:
+        checked = datetime.fromisoformat(
+            evidence["checked_utc"].replace("Z", "+00:00")
+        )
+    except ValueError:
+        return False
+    if checked.tzinfo is None:
+        return False
+
+    check_ids: set[str] = set()
+    statuses: list[str] = []
+    for check in evidence["checks"]:
+        if not isinstance(check, dict) or set(check) != {
+            "id",
+            "status",
+            "summary",
+        }:
+            return False
+        check_id = check["id"]
+        status_value = check["status"]
+        summary = check["summary"]
+        if (
+            not isinstance(check_id, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", check_id) is None
+            or check_id in check_ids
+            or status_value not in {"PASS", "WARNING", "BLOCKER"}
+            or not isinstance(summary, str)
+            or not 1 <= len(summary) <= 240
+        ):
+            return False
+        check_ids.add(check_id)
+        statuses.append(status_value)
+
+    if evidence["result"] == "PASS":
+        return (
+            evidence["starting_state"]
+            in {"INITIAL_DEPLOYMENT", "MANAGED_REDEPLOYMENT"}
+            and "BLOCKER" not in statuses
+        )
+    return "BLOCKER" in statuses
+
+
+@dataclass(frozen=True)
+class SshRemotePreflight:
+    transport: RemoteProbeCapabilities
+
+    def preflight(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+    ) -> RemotePreflightVerification:
+        try:
+            execution = self.transport.collect(configuration, commit, policy)
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            return RemotePreflightVerification(
+                passed=False,
+                evidence={},
+                blocker="Remote preflight transport malfunctioned.",
+                outcome="ERROR",
+            )
+        if execution.returncode != 0:
+            return RemotePreflightVerification(
+                passed=False,
+                evidence={},
+                blocker="Remote preflight transport malfunctioned.",
+                outcome="ERROR",
+            )
+        try:
+            if len(execution.stdout) > 256 * 1024:
+                raise ValueError
+            evidence = json.loads(execution.stdout.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError, ValueError):
+            return RemotePreflightVerification(
+                passed=False,
+                evidence={},
+                blocker="Remote preflight returned malformed evidence.",
+                outcome="ERROR",
+            )
+        if not _remote_preflight_evidence_is_valid(
+            evidence,
+            configuration,
+            commit,
+        ):
+            return RemotePreflightVerification(
+                passed=False,
+                evidence={},
+                blocker="Remote preflight returned malformed evidence.",
+                outcome="ERROR",
+            )
+        passed = evidence["result"] == "PASS"
+        return RemotePreflightVerification(
+            passed=passed,
+            evidence=evidence,
+            blocker=(
+                None
+                if passed
+                else "Remote preflight reported a policy or prerequisite blocker."
+            ),
+            outcome="PASS" if passed else "BLOCKED",
+        )
+
+
+@dataclass(frozen=True)
 class ControllerAdapters:
     clock: Clock
     randomness: RandomSource
@@ -866,6 +1090,7 @@ def _load_policy() -> tuple[dict[str, object], str]:
             "result_schema_version",
             "evidence_index_schema_version",
             "ci_proof_schema_version",
+            "remote_preflight_schema_version",
         },
         "deployment policy",
     )
@@ -878,6 +1103,7 @@ def _load_policy() -> tuple[dict[str, object], str]:
         "result_schema_version": RESULT_SCHEMA_VERSION,
         "evidence_index_schema_version": EVIDENCE_INDEX_SCHEMA_VERSION,
         "ci_proof_schema_version": CI_PROOF_SCHEMA_VERSION,
+        "remote_preflight_schema_version": REMOTE_PREFLIGHT_SCHEMA_VERSION,
     }
     for name, expected in expected_constants.items():
         if policy[name] != expected:
@@ -1606,18 +1832,47 @@ def run(
                                     policy,
                                 )
                                 if not remote_preflight.passed:
+                                    if remote_preflight.outcome in {
+                                        "ERROR",
+                                        "INCONCLUSIVE",
+                                    }:
+                                        outcome = remote_preflight.outcome
                                     next_action = remote_preflight.blocker or (
                                         "Resolve the remote preflight blocker."
+                                    )
+                                    remote_status = {
+                                        "ERROR": "ERROR",
+                                        "INCONCLUSIVE": "INCONCLUSIVE",
+                                    }.get(
+                                        remote_preflight.outcome,
+                                        "BLOCKER",
+                                    )
+                                    remote_summary = {
+                                        "ERROR": (
+                                            "Remote preflight tooling or "
+                                            "infrastructure malfunctioned."
+                                        ),
+                                        "INCONCLUSIVE": (
+                                            "Remote preflight evidence is "
+                                            "insufficient."
+                                        ),
+                                    }.get(
+                                        remote_preflight.outcome,
+                                        "Remote preflight is blocked.",
                                     )
                                     checks.append(
                                         CheckResult(
                                             check_id="remote_preflight",
                                             phase=4,
-                                            status="BLOCKER",
-                                            summary="Remote preflight is blocked.",
+                                            status=remote_status,
+                                            summary=remote_summary,
                                             next_action=next_action,
                                         )
                                     )
+                                    if remote_preflight.evidence:
+                                        json_artifacts[
+                                            "remote-preflight.json"
+                                        ] = remote_preflight.evidence
                                 else:
                                     checks.append(
                                         CheckResult(
@@ -1861,6 +2116,20 @@ def _best_effort_argument(
     return None
 
 
+def production_adapters() -> ControllerAdapters:
+    return ControllerAdapters(
+        clock=SystemClock(),
+        randomness=SystemRandomSource(),
+        repository=LocalGitRepository(REPO_ROOT),
+        trusted_ci=TrustedGitHubActions(GitHubCliActionsApi()),
+        remote=SshRemotePreflight(
+            SystemSshProbeTransport(
+                probe_path=REPO_ROOT / "scripts/vps_field_remote_probe.py",
+            )
+        ),
+    )
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     raw_arguments = list(sys.argv[1:] if arguments is None else arguments)
     try:
@@ -1890,12 +2159,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     try:
         result = run(
             request,
-            ControllerAdapters(
-                clock=SystemClock(),
-                randomness=SystemRandomSource(),
-                repository=LocalGitRepository(REPO_ROOT),
-                trusted_ci=TrustedGitHubActions(GitHubCliActionsApi()),
-            ),
+            production_adapters(),
         )
     except EvidenceError:
         fallback = {

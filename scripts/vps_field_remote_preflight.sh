@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+    cat <<'EOF'
+usage: vps_field_remote_preflight.sh [--help]
+
+Run the legacy read-only VPS preflight diagnostic. The supported deployment
+entry point is scripts/vps_field_deploy.sh.
+EOF
+}
+
+if (($# > 0)); then
+    if (($# == 1)) && [[ "$1" == "--help" || "$1" == "-h" ]]; then
+        usage
+        exit 0
+    fi
+    printf 'ERROR: unsupported argument; use --help\n' >&2
+    exit 2
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/vps_field_common.sh
 source "$SCRIPT_DIR/vps_field_common.sh"

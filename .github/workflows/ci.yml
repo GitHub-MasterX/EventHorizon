@@ -74,6 +74,7 @@ jobs:
           python3 -m py_compile \
             scripts/deployment_controller.py \
             scripts/ci_validate_field_inputs.py \
+            scripts/vps_field_remote_probe.py \
             tests/test_deployment_controller.py
           make test-deployment-controller
 

@@ -46,6 +46,7 @@
     "deploy/schemas/deployment-policy.schema.json",
     "deploy/schemas/deployment-result.schema.json",
     "deploy/schemas/evidence-index.schema.json",
+    "deploy/schemas/remote-preflight.schema.json",
     "deploy/vps-field.env.example",
     "docker-compose.ci.yml",
     "docker-compose.yml",
@@ -64,6 +65,7 @@
     "scripts/field_validation_preflight.sh",
     "scripts/vps_field_deploy.sh",
     "scripts/vps_field_remote_preflight.sh",
+    "scripts/vps_field_remote_probe.py",
     "scripts/vps_field_smoke_test.sh",
     "scripts/vps_field_verify_external.sh"
   ],
@@ -74,5 +76,6 @@
   ],
   "result_schema_version": 1,
   "evidence_index_schema_version": 1,
-  "ci_proof_schema_version": 1
+  "ci_proof_schema_version": 1,
+  "remote_preflight_schema_version": 1
 }
