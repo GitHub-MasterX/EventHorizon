@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eventhorizon.invalid/schemas/ci-proof.schema.json",
+  "title": "EventHorizon trusted CI proof",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "repository",
+    "workflow_path",
+    "workflow_id",
+    "run_id",
+    "run_attempt",
+    "head_sha",
+    "head_branch",
+    "event",
+    "status",
+    "conclusion",
+    "created_at",
+    "run_started_at",
+    "updated_at",
+    "jobs",
+    "url"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "repository": {
+      "const": "honeynet/EventHorizon"
+    },
+    "workflow_path": {
+      "const": ".github/workflows/ci.yml"
+    },
+    "workflow_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "run_id": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "run_attempt": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "head_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "head_branch": {
+      "const": "GSoC_2026"
+    },
+    "event": {
+      "const": "push"
+    },
+    "status": {
+      "const": "completed"
+    },
+    "conclusion": {
+      "const": "success"
+    },
+    "created_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "run_started_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "updated_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "jobs": {
+      "type": "array",
+      "minItems": 7,
+      "maxItems": 7,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/job"
+      }
+    },
+    "url": {
+      "type": "string",
+      "pattern": "^https://github[.]com/honeynet/EventHorizon/actions/runs/[0-9]+$"
+    }
+  },
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "minLength": 20,
+      "maxLength": 35
+    },
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "status",
+        "conclusion",
+        "started_at",
+        "completed_at",
+        "run_attempt"
+      ],
+      "properties": {
+        "name": {
+          "enum": [
+            "build-unit",
+            "deployment-controller",
+            "shell-quality",
+            "configuration-policy",
+            "container-builds",
+            "deterministic-smoke",
+            "ci-contract"
+          ]
+        },
+        "status": {
+          "const": "completed"
+        },
+        "conclusion": {
+          "const": "success"
+        },
+        "started_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "completed_at": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "run_attempt": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  }
+}

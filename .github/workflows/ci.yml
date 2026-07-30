@@ -1,0 +1,229 @@
+name: CI
+
+"on":
+  push:
+    branches:
+      - GSoC_2026
+  pull_request: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build-unit:
+    name: build-unit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Record build environment
+        run: |
+          set -euo pipefail
+          mkdir -p ci-artifacts
+          {
+            uname -a
+            printf 'runner_image=%s\n' "${ImageOS:-unknown}"
+            printf 'runner_image_version=%s\n' "${ImageVersion:-unknown}"
+            gcc --version | head -n 1
+            go version
+            python3 --version
+            docker version
+            docker compose version
+          } > ci-artifacts/build-environment.txt
+      - name: Build and test native code
+        run: |
+          set -euo pipefail
+          make all
+          make test-byte-metrics test-interaction-depth
+          (
+            cd prometheus
+            GOTOOLCHAIN=local GOFLAGS=-mod=readonly go test ./...
+            GOTOOLCHAIN=local GOFLAGS=-mod=readonly go vet ./...
+          )
+          git diff --exit-code -- prometheus/go.mod prometheus/go.sum
+      - name: Retain build environment
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-unit-environment
+          path: ci-artifacts/build-environment.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  deployment-controller:
+    name: deployment-controller
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install exact CI test dependencies
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check \
+            --requirement requirements-ci.txt
+          python3 -m pip freeze
+      - name: Test deployment contracts
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            scripts/deployment_controller.py \
+            scripts/ci_validate_field_inputs.py \
+            tests/test_deployment_controller.py
+          make test-deployment-controller
+
+  shell-quality:
+    name: shell-quality
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Validate supported shell scripts
+        run: |
+          set -euo pipefail
+          while IFS= read -r -d '' script; do
+            bash -n "$script"
+          done < <(find scripts -type f -name '*.sh' -print0)
+          shellcheck --severity=error scripts/*.sh
+
+  configuration-policy:
+    name: configuration-policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Render and validate field policy
+        run: |
+          set -euo pipefail
+          mkdir -p ci-artifacts
+          docker compose \
+            --env-file deploy/compose-ci.env \
+            --project-name eventhorizon-policy \
+            --file docker-compose.yml \
+            --file docker-compose.cost.yml \
+            --file docker-compose.field.yml \
+            config --format json > ci-artifacts/field-compose.json
+          python3 scripts/ci_validate_field_inputs.py \
+            --compose-json ci-artifacts/field-compose.json \
+            --output ci-artifacts/configuration-policy-summary.json
+
+  container-builds:
+    name: container-builds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build every supported field image
+        run: |
+          set -euo pipefail
+          mkdir -p ci-artifacts
+          docker build \
+            --platform linux/amd64 \
+            --file docker/tarpits/Dockerfile \
+            --tag eventhorizon/ci-tarpits:${GITHUB_SHA} \
+            .
+          docker build \
+            --platform linux/amd64 \
+            --file docker/prometheus/Dockerfile \
+            --tag eventhorizon/ci-exporter:${GITHUB_SHA} \
+            .
+          docker image inspect \
+            eventhorizon/ci-tarpits:${GITHUB_SHA} \
+            eventhorizon/ci-exporter:${GITHUB_SHA} \
+            > ci-artifacts/container-image-inspect.json
+      - name: Retain built image identities
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: container-build-identities
+          path: ci-artifacts/container-image-inspect.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  deterministic-smoke:
+    name: deterministic-smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Run isolated Telnet and MQTT smoke
+        run: scripts/ci_smoke.sh
+      - name: Retain concise smoke summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: deterministic-smoke-summary
+          path: validation-output/ci-smoke/summary.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Retain full failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: deterministic-smoke-failure
+          path: validation-output/ci-smoke
+          if-no-files-found: warn
+          retention-days: 14
+
+  ci-contract:
+    name: ci-contract
+    runs-on: ubuntu-24.04
+    if: always()
+    needs:
+      - build-unit
+      - deployment-controller
+      - shell-quality
+      - configuration-policy
+      - container-builds
+      - deterministic-smoke
+    timeout-minutes: 5
+    steps:
+      - name: Record and enforce required results
+        run: |
+          set -euo pipefail
+          mkdir -p ci-artifacts
+          cat > ci-artifacts/ci-contract-summary.json <<JSON
+          {
+            "schema_version": 1,
+            "head_sha": "${GITHUB_SHA}",
+            "jobs": {
+              "build-unit": "${{ needs['build-unit'].result }}",
+              "deployment-controller": "${{ needs['deployment-controller'].result }}",
+              "shell-quality": "${{ needs['shell-quality'].result }}",
+              "configuration-policy": "${{ needs['configuration-policy'].result }}",
+              "container-builds": "${{ needs['container-builds'].result }}",
+              "deterministic-smoke": "${{ needs['deterministic-smoke'].result }}"
+            }
+          }
+          JSON
+          test "${{ needs['build-unit'].result }}" = success
+          test "${{ needs['deployment-controller'].result }}" = success
+          test "${{ needs['shell-quality'].result }}" = success
+          test "${{ needs['configuration-policy'].result }}" = success
+          test "${{ needs['container-builds'].result }}" = success
+          test "${{ needs['deterministic-smoke'].result }}" = success
+      - name: Always retain concise CI summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ci-contract-summary
+          path: ci-artifacts/ci-contract-summary.json
+          if-no-files-found: error
+          retention-days: 14

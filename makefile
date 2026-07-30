@@ -58,7 +58,9 @@ test-byte-metrics: $(BYTE_METRIC_TEST_TARGET)
 	./$(BYTE_METRIC_TEST_TARGET)
 test-interaction-depth: $(INTERACTION_DEPTH_TEST_TARGET)
 	./$(INTERACTION_DEPTH_TEST_TARGET)
-test: test-byte-metrics test-interaction-depth
+test-deployment-controller:
+	python3 -m unittest tests/test_deployment_controller.py -v
+test: test-byte-metrics test-interaction-depth test-deployment-controller
 
 PROTOCOL ?= telnet
 SESSIONS ?= 100
@@ -74,4 +76,4 @@ validation-load:
 clean:
 	rm -f $(TELNET_TARGET) $(UPNP_TARGET) $(MQTT_TARGET) $(GO_TARGET) $(BYTE_METRIC_TEST_TARGET) $(INTERACTION_DEPTH_TEST_TARGET)
 
-.PHONY: all clean test test-byte-metrics test-interaction-depth validation-exact validation-load
+.PHONY: all clean test test-byte-metrics test-interaction-depth test-deployment-controller validation-exact validation-load

@@ -1,0 +1,30 @@
+services:
+  prometheus-exporter:
+    container_name: "${CI_PROJECT_NAME:-eventhorizon-ci}-prometheus-exporter"
+    ports: !override
+      - "127.0.0.1:19101:9101"
+    volumes: !override
+      - tarpit-sock:/tmp
+
+  telnet_pit:
+    ports: !override
+      - "127.0.0.1:23230:23/tcp"
+
+  mqtt_pit:
+    ports: !override
+      - "127.0.0.1:21883:1883/tcp"
+
+  prometheus:
+    container_name: "${CI_PROJECT_NAME:-eventhorizon-ci}-prometheus"
+    ports: !override
+      - "127.0.0.1:19090:9090"
+
+  grafana:
+    container_name: "${CI_PROJECT_NAME:-eventhorizon-ci}-grafana"
+    ports: !override
+      - "127.0.0.1:13000:3000"
+
+  cadvisor:
+    container_name: "${CI_PROJECT_NAME:-eventhorizon-ci}-cadvisor"
+    ports: !override
+      - "127.0.0.1:18081:8080"

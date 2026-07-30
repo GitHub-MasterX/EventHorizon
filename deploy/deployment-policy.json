@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "controller_contract_version": 1,
+  "trusted_repository": "honeynet/EventHorizon",
+  "trusted_remote": "upstream",
+  "approved_ref": "refs/remotes/upstream/GSoC_2026",
+  "ci": {
+    "workflow_path": ".github/workflows/ci.yml",
+    "event": "push",
+    "head_branch": "GSoC_2026",
+    "required_jobs": [
+      "build-unit",
+      "deployment-controller",
+      "shell-quality",
+      "configuration-policy",
+      "container-builds",
+      "deterministic-smoke",
+      "ci-contract"
+    ]
+  },
+  "field_build": {
+    "platform": "linux/amd64",
+    "dockerfiles": [
+      "docker/tarpits/Dockerfile",
+      "docker/prometheus/Dockerfile"
+    ],
+    "base_images": [
+      "gcc:12.5.0-bookworm@sha256:01cfb27075399638ccdffa855970683ad298a3fad61012d7ab62523abbff5d20",
+      "golang:1.23.9-bookworm@sha256:0c9738aabadd34e99cf5263ae1337ad5330126c87a1fab4ffabec2284944c991",
+      "debian:bookworm-slim@sha256:63a496b5d3b99214b39f5ed70eb71a61e590a77979c79cbee4faf991f8c0783e"
+    ],
+    "compose_images": {
+      "prometheus": "prom/prometheus:v3.5.0@sha256:8672a850efe2f9874702406c8318704edb363587f8c2ca88586b4c8fdb5cea24",
+      "grafana": "grafana/grafana-oss:12.1.0@sha256:11c2e6c7993917ea89292b942e3428f73907b2809d554154bfb8b4ceb2301cc8",
+      "cadvisor": "ghcr.io/google/cadvisor:v0.57.0@sha256:1742bab953d9d9ab166cba24604a9488efdff7d73dc6d18a087c09a1bcd6cb9d"
+    },
+    "go_toolchain": "1.23.9",
+    "go_module_mode": "readonly"
+  },
+  "protected_paths": [
+    ".dockerignore",
+    ".github/workflows/ci.yml",
+    "deploy/compose-ci.env",
+    "deploy/deployment-policy.json",
+    "deploy/schemas/ci-proof.schema.json",
+    "deploy/schemas/deployment-policy.schema.json",
+    "deploy/schemas/deployment-result.schema.json",
+    "deploy/schemas/evidence-index.schema.json",
+    "deploy/vps-field.env.example",
+    "docker-compose.ci.yml",
+    "docker-compose.yml",
+    "docker-compose.cost.yml",
+    "docker-compose.field.yml",
+    "docker/prometheus/Dockerfile",
+    "docker/tarpits/Dockerfile",
+    "makefile",
+    "prometheus/go.mod",
+    "prometheus/go.sum",
+    "requirements-ci.txt",
+    "run.sh",
+    "scripts/ci_smoke.sh",
+    "scripts/ci_validate_field_inputs.py",
+    "scripts/deployment_controller.py",
+    "scripts/field_validation_preflight.sh",
+    "scripts/vps_field_deploy.sh",
+    "scripts/vps_field_remote_preflight.sh",
+    "scripts/vps_field_smoke_test.sh",
+    "scripts/vps_field_verify_external.sh"
+  ],
+  "supported_compose_files": [
+    "docker-compose.yml",
+    "docker-compose.cost.yml",
+    "docker-compose.field.yml"
+  ],
+  "result_schema_version": 1,
+  "evidence_index_schema_version": 1,
+  "ci_proof_schema_version": 1
+}
