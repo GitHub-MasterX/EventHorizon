@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import io
 import json
 import os
 import re
@@ -498,6 +499,14 @@ class DeploymentOperatorCliTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0)
             self.assertIn("usage: vps_field_deploy.sh", completed.stdout)
             self.assertIn("--check-only", completed.stdout)
+            self.assertIn(
+                "AUTHORIZE DEPLOY <full-SHA> TO <target-alias>",
+                completed.stdout,
+            )
+            self.assertIn(
+                "Redirected input cannot authorize deployment.",
+                completed.stdout,
+            )
             self.assertEqual(completed.stderr, "")
             self.assertFalse(output_base.exists())
 
@@ -1528,7 +1537,130 @@ class InterruptedAuthorization:
         raise KeyboardInterrupt
 
 
+class InteractiveTextStream(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
 class DeploymentControllerApiTests(unittest.TestCase):
+    def test_production_authorization_accepts_the_exact_tty_phrase(self) -> None:
+        phrase = (
+            "AUTHORIZE DEPLOY "
+            "1111111111111111111111111111111111111111 TO field-host"
+        )
+        authorization_input = InteractiveTextStream(phrase + "\n")
+        prompt_output = InteractiveTextStream()
+
+        adapters = production_adapters(
+            authorization_input=authorization_input,
+            prompt_output=prompt_output,
+        )
+
+        self.assertIsNotNone(adapters.authorization)
+        decision = adapters.authorization.authorize(phrase)
+        self.assertTrue(decision.authorized)
+        self.assertIn(phrase, prompt_output.getvalue())
+
+    def test_production_authorization_explains_the_attestation(self) -> None:
+        phrase = (
+            "AUTHORIZE DEPLOY "
+            "1111111111111111111111111111111111111111 TO field-host"
+        )
+        authorization_input = InteractiveTextStream(phrase + "\n")
+        prompt_output = InteractiveTextStream()
+
+        adapters = production_adapters(
+            authorization_input=authorization_input,
+            prompt_output=prompt_output,
+        )
+        self.assertIsNotNone(adapters.authorization)
+        adapters.authorization.authorize(phrase)
+
+        prompt = prompt_output.getvalue()
+        self.assertIn("target is authorized", prompt)
+        self.assertIn("firewall policy was reviewed", prompt)
+        self.assertIn("management access is source-restricted", prompt)
+
+    def test_production_authorization_rejects_a_near_match(self) -> None:
+        phrase = (
+            "AUTHORIZE DEPLOY "
+            "1111111111111111111111111111111111111111 TO field-host"
+        )
+        authorization_input = InteractiveTextStream(phrase + " \n")
+
+        adapters = production_adapters(
+            authorization_input=authorization_input,
+            prompt_output=InteractiveTextStream(),
+        )
+
+        self.assertIsNotNone(adapters.authorization)
+        decision = adapters.authorization.authorize(phrase)
+        self.assertFalse(decision.authorized)
+
+    def test_production_authorization_rejects_non_tty_input(self) -> None:
+        phrase = (
+            "AUTHORIZE DEPLOY "
+            "1111111111111111111111111111111111111111 TO field-host"
+        )
+        redirected_input = io.StringIO(phrase + "\n")
+
+        adapters = production_adapters(
+            authorization_input=redirected_input,
+            prompt_output=InteractiveTextStream(),
+        )
+
+        self.assertIsNone(adapters.authorization)
+
+    def test_exact_production_authorization_advances_to_phase_six(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            target_file, _ = write_strict_target_configuration(temporary_path)
+            output_directory = temporary_path / "evidence"
+            commit = "1" * 40
+            phrase = f"AUTHORIZE DEPLOY {commit} TO field-host"
+            production = production_adapters(
+                authorization_input=InteractiveTextStream(phrase + "\n"),
+                prompt_output=InteractiveTextStream(),
+            )
+            self.assertIsNotNone(production.authorization)
+
+            result = run(
+                DeploymentRequest(
+                    check_only=False,
+                    commit=commit,
+                    env_file=target_file,
+                    output_dir=output_directory,
+                ),
+                ControllerAdapters(
+                    clock=FixedClock(),
+                    randomness=FixedRandomSource(),
+                    repository=ProvenRepository(),
+                    trusted_ci=ProvenTrustedCi(),
+                    remote=ReadyRemote(),
+                    authorization=production.authorization,
+                ),
+            )
+
+            self.assertEqual(result.outcome, "BLOCKED")
+            self.assertEqual(result.highest_state, "CI_VALIDATED")
+            self.assertFalse(result.remote_mutation_occurred)
+            checks = {check.check_id: check for check in result.checks}
+            self.assertEqual(checks["authorization"].status, "PASS")
+            self.assertEqual(
+                checks["exact_source_deployment_foundation"].status,
+                "BLOCKER",
+            )
+            authorization = json.loads(
+                (
+                    output_directory
+                    / "deployments"
+                    / result.run_id
+                    / "authorization.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertTrue(authorization["authorization_attested"])
+            self.assertEqual(authorization["result"], "PASS")
+
     def test_production_adapters_include_remote_preflight_capability(
         self,
     ) -> None:

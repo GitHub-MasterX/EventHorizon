@@ -20,7 +20,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
-from typing import NoReturn, Protocol, Sequence
+from typing import NoReturn, Protocol, Sequence, TextIO
 
 
 RESULT_SCHEMA_VERSION = 1
@@ -163,6 +163,28 @@ class RemoteProbeCapabilities(Protocol):
 class AuthorizationCapabilities(Protocol):
     def authorize(self, phrase: str) -> AuthorizationDecision:
         """Request exact-commit interactive operator authorization."""
+
+
+@dataclass(frozen=True)
+class InteractiveTtyAuthorization:
+    authorization_input: TextIO
+    prompt_output: TextIO
+
+    def authorize(self, phrase: str) -> AuthorizationDecision:
+        self.prompt_output.write(
+            "Authorization is required before remote mutation.\n"
+            "Typing the exact phrase attests that the target is authorized, "
+            "the firewall policy was reviewed, and management access is "
+            "source-restricted.\n"
+            "Type this exact phrase:\n"
+            f"{phrase}\n"
+            "> "
+        )
+        self.prompt_output.flush()
+        response = self.authorization_input.readline()
+        return AuthorizationDecision(
+            authorized=response.rstrip("\r\n") == phrase,
+        )
 
 
 @dataclass(frozen=True)
@@ -2060,6 +2082,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "Validate or deploy one exact trusted EventHorizon commit. "
             "Deployment remains fail-closed until every required phase is proven."
         ),
+        epilog=(
+            "After non-mutating preflight, deployment requires an interactive "
+            "TTY and the exact phrase:\n"
+            "  AUTHORIZE DEPLOY <full-SHA> TO <target-alias>\n"
+            "Redirected input cannot authorize deployment."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -2116,7 +2144,23 @@ def _best_effort_argument(
     return None
 
 
-def production_adapters() -> ControllerAdapters:
+def production_adapters(
+    *,
+    authorization_input: TextIO | None = None,
+    prompt_output: TextIO | None = None,
+) -> ControllerAdapters:
+    if authorization_input is None:
+        authorization_input = sys.stdin
+    if prompt_output is None:
+        prompt_output = sys.stderr
+    authorization = (
+        InteractiveTtyAuthorization(
+            authorization_input=authorization_input,
+            prompt_output=prompt_output,
+        )
+        if authorization_input.isatty() and prompt_output.isatty()
+        else None
+    )
     return ControllerAdapters(
         clock=SystemClock(),
         randomness=SystemRandomSource(),
@@ -2127,6 +2171,7 @@ def production_adapters() -> ControllerAdapters:
                 probe_path=REPO_ROOT / "scripts/vps_field_remote_probe.py",
             )
         ),
+        authorization=authorization,
     )
 
 
