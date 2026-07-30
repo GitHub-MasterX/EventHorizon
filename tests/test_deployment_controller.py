@@ -299,11 +299,11 @@ class DeploymentContractArtifactTests(unittest.TestCase):
                 r"^uses: [A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40} +# v[0-9]",
             )
         self.assertIn(
-            "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2",
+            "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2",
             workflow_text,
         )
         self.assertIn(
-            "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2",
+            "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1",
             workflow_text,
         )
 
