@@ -19,7 +19,8 @@
     "ci_proof_schema_version",
     "remote_preflight_schema_version",
     "compose_config_schema_version",
-    "deployment_manifest_schema_version"
+    "deployment_manifest_schema_version",
+    "health_and_ports_schema_version"
   ],
   "properties": {
     "schema_version": {
@@ -196,6 +197,9 @@
       "const": 1
     },
     "deployment_manifest_schema_version": {
+      "const": 1
+    },
+    "health_and_ports_schema_version": {
       "const": 1
     }
   }

@@ -76,6 +76,7 @@ jobs:
             scripts/ci_validate_field_inputs.py \
             scripts/vps_field_remote_deploy.py \
             scripts/vps_field_remote_probe.py \
+            scripts/vps_field_remote_runtime.py \
             tests/test_deployment_controller.py
           make test-deployment-controller
 

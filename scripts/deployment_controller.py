@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import concurrent.futures
 import hashlib
 import ipaddress
 import json
@@ -12,6 +13,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -29,6 +31,7 @@ CI_PROOF_SCHEMA_VERSION = 1
 REMOTE_PREFLIGHT_SCHEMA_VERSION = 2
 COMPOSE_CONFIG_SCHEMA_VERSION = 1
 DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 1
+HEALTH_AND_PORTS_SCHEMA_VERSION = 1
 CONTROLLER_CONTRACT_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FULL_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -101,6 +104,17 @@ class RemoteDeploymentVerification:
 
 
 @dataclass(frozen=True)
+class RuntimeVerification:
+    passed: bool
+    outcome: str
+    blocker: str | None
+    field_services_running: bool
+    evidence: dict[str, object]
+    observed_public_ports: tuple[int, ...]
+    observed_private_ports: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class RemoteProbeExecution:
     returncode: int
     stdout: bytes
@@ -109,6 +123,13 @@ class RemoteProbeExecution:
 
 @dataclass(frozen=True)
 class RemoteDeploymentExecution:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+@dataclass(frozen=True)
+class RemoteRuntimeExecution:
     returncode: int
     stdout: bytes
     stderr: bytes
@@ -182,6 +203,18 @@ class DeploymentCapabilities(Protocol):
         """Deploy one exact source commit and return bounded evidence."""
 
 
+class RuntimeCapabilities(Protocol):
+    def verify(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+        deployment_manifest: dict[str, object],
+        run_id: str,
+    ) -> RuntimeVerification:
+        """Verify runtime health, bindings, and workstation reachability."""
+
+
 class RemoteProbeCapabilities(Protocol):
     def collect(
         self,
@@ -202,6 +235,34 @@ class RemoteDeploymentTransportCapabilities(Protocol):
         run_id: str,
     ) -> RemoteDeploymentExecution:
         """Execute one authorized remote deployment and return bounded output."""
+
+
+class RuntimeRemoteTransportCapabilities(Protocol):
+    def inspect(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        expected_image_ids: dict[str, str],
+        run_id: str,
+    ) -> RemoteRuntimeExecution:
+        """Collect bounded remote runtime health and binding evidence."""
+
+    def stop(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        run_id: str,
+    ) -> bool:
+        """Stop the exact managed field service set after a later failure."""
+
+
+class WorkstationPortCapabilities(Protocol):
+    def observe(
+        self,
+        host: str,
+        ports: tuple[int, ...],
+    ) -> dict[int, bool]:
+        """Observe bounded TCP reachability from the operator workstation."""
 
 
 class AuthorizationCapabilities(Protocol):
@@ -996,6 +1057,194 @@ class SystemSshDeploymentTransport:
         )
 
 
+@dataclass(frozen=True)
+class SystemSshRuntimeTransport:
+    runtime_program_path: Path
+    ssh_executable: str | Path = "ssh"
+    timeout_seconds: int = 180
+
+    def _execute(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        run_id: str,
+        action: str,
+        expected_image_ids: dict[str, str],
+    ) -> RemoteRuntimeExecution:
+        request = {
+            "schema_version": HEALTH_AND_PORTS_SCHEMA_VERSION,
+            "action": action,
+            "run_id": run_id,
+            "target_alias": configuration.target_alias,
+            "deployment_commit": commit,
+            "deploy_dir": configuration.vps_deploy_dir,
+            "project_name": configuration.vps_project_name,
+            "expected_image_ids": expected_image_ids,
+        }
+        encoded_request = base64.urlsafe_b64encode(
+            json.dumps(
+                request,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).decode("ascii")
+        program = self.runtime_program_path.read_bytes()
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "GIT_TERMINAL_PROMPT": "0",
+                "LC_ALL": "C",
+            }
+        )
+        completed = subprocess.run(
+            [
+                str(self.ssh_executable),
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-p",
+                str(configuration.vps_ssh_port),
+                "-i",
+                str(configuration.vps_ssh_key),
+                f"{configuration.vps_user}@{configuration.vps_host}",
+                "python3",
+                "-",
+                encoded_request,
+            ],
+            input=program,
+            capture_output=True,
+            check=False,
+            env=environment,
+            timeout=self.timeout_seconds,
+        )
+        return RemoteRuntimeExecution(
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+
+    def inspect(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        expected_image_ids: dict[str, str],
+        run_id: str,
+    ) -> RemoteRuntimeExecution:
+        return self._execute(
+            configuration,
+            commit,
+            run_id,
+            "VERIFY",
+            expected_image_ids,
+        )
+
+    def stop(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        run_id: str,
+    ) -> bool:
+        execution = self._execute(
+            configuration,
+            commit,
+            run_id,
+            "STOP",
+            {},
+        )
+        if (
+            execution.returncode != 0
+            or len(execution.stdout) > 64 * 1024
+        ):
+            return False
+        try:
+            evidence = json.loads(execution.stdout)
+        except (UnicodeError, json.JSONDecodeError):
+            return False
+        return (
+            isinstance(evidence, dict)
+            and set(evidence)
+            == {
+                "schema_version",
+                "action",
+                "run_id",
+                "target_alias",
+                "deployment_commit",
+                "result",
+                "blocker",
+                "field_services_running",
+            }
+            and evidence["schema_version"]
+            == HEALTH_AND_PORTS_SCHEMA_VERSION
+            and evidence["action"] == "STOP"
+            and evidence["run_id"] == run_id
+            and evidence["target_alias"] == configuration.target_alias
+            and evidence["deployment_commit"] == commit
+            and evidence["result"] == "PASS"
+            and evidence["blocker"] is None
+            and evidence["field_services_running"] is False
+        )
+
+
+@dataclass(frozen=True)
+class SystemTcpPortProbe:
+    timeout_seconds: float = 5.0
+
+    def _observe_one(
+        self,
+        addresses: tuple[tuple[int, tuple[object, ...]], ...],
+        port: int,
+    ) -> bool:
+        for family, address in addresses:
+            destination = (address[0], port, *address[2:])
+            try:
+                with socket.socket(family, socket.SOCK_STREAM) as connection:
+                    connection.settimeout(self.timeout_seconds)
+                    connection.connect(destination)
+                return True
+            except OSError:
+                continue
+        return False
+
+    def observe(
+        self,
+        host: str,
+        ports: tuple[int, ...],
+    ) -> dict[int, bool]:
+        resolved = socket.getaddrinfo(
+            host,
+            0,
+            type=socket.SOCK_STREAM,
+        )
+        addresses = tuple(
+            dict.fromkeys(
+                (family, address)
+                for family, _type, _protocol, _name, address in resolved
+            )
+        )
+        if not addresses:
+            raise OSError("target address could not be resolved")
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(ports)
+        ) as executor:
+            futures = {
+                port: executor.submit(
+                    self._observe_one,
+                    addresses,
+                    port,
+                )
+                for port in ports
+            }
+            return {
+                port: futures[port].result()
+                for port in ports
+            }
+
+
 def _remote_preflight_evidence_is_valid(
     evidence: object,
     configuration: TargetConfiguration,
@@ -1649,6 +1898,447 @@ class SshExactSourceDeployment:
         )
 
 
+RUNTIME_SERVICES = (
+    "cadvisor",
+    "grafana",
+    "mqtt_pit",
+    "prometheus",
+    "prometheus-exporter",
+    "telnet_pit",
+)
+RUNTIME_BINDINGS = {
+    "cadvisor": (8080, 8081, "LOOPBACK"),
+    "grafana": (3000, 3000, "LOOPBACK"),
+    "mqtt_pit": (1883, 1883, "PUBLIC"),
+    "prometheus": (9090, 9090, "LOOPBACK"),
+    "prometheus-exporter": (9101, 9101, "LOOPBACK"),
+    "telnet_pit": (23, 23, "PUBLIC"),
+}
+MANAGEMENT_ENDPOINTS = {
+    "cadvisor": 8081,
+    "grafana": 3000,
+    "prometheus": 9090,
+    "prometheus-exporter": 9101,
+}
+PUBLIC_PORTS = (23, 1883)
+PRIVATE_PORTS = (3000, 8081, 9090, 9101)
+RUNTIME_PORTS = (*PUBLIC_PORTS, *PRIVATE_PORTS)
+
+
+def _runtime_service_is_valid(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value)
+        == {
+            "name",
+            "state",
+            "health",
+            "restart_count",
+            "oom_killed",
+            "image_id_verified",
+        }
+        and value["name"] in RUNTIME_SERVICES
+        and value["state"] in {"RUNNING", "STOPPED", "EXITED", "UNKNOWN"}
+        and value["health"]
+        in {
+            "HEALTHY",
+            "UNHEALTHY",
+            "STARTING",
+            "NOT_CONFIGURED",
+            "UNKNOWN",
+        }
+        and type(value["restart_count"]) is int
+        and value["restart_count"] >= 0
+        and type(value["oom_killed"]) is bool
+        and type(value["image_id_verified"]) is bool
+    )
+
+
+def _runtime_binding_is_valid(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value)
+        == {
+            "service",
+            "container_port",
+            "host_port",
+            "scope",
+            "result",
+        }
+        and value["service"] in RUNTIME_SERVICES
+        and type(value["container_port"]) is int
+        and 1 <= value["container_port"] <= 65535
+        and type(value["host_port"]) is int
+        and 1 <= value["host_port"] <= 65535
+        and value["scope"] in {"PUBLIC", "LOOPBACK"}
+        and value["result"] in {"PASS", "FAIL"}
+    )
+
+
+def _management_endpoint_is_valid(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"service", "port", "result"}
+        and value["service"] in MANAGEMENT_ENDPOINTS
+        and type(value["port"]) is int
+        and value["port"] in PRIVATE_PORTS
+        and value["result"] in {"READY", "NOT_READY"}
+    )
+
+
+def _remote_runtime_evidence_is_valid(
+    evidence: object,
+    configuration: TargetConfiguration,
+    commit: str,
+    run_id: str,
+) -> bool:
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "schema_version",
+        "run_id",
+        "target_alias",
+        "deployment_commit",
+        "checked_utc",
+        "result",
+        "blocker",
+        "field_services_running",
+        "services",
+        "bindings",
+        "management_endpoints",
+    }:
+        return False
+    if (
+        evidence["schema_version"] != 1
+        or evidence["run_id"] != run_id
+        or evidence["target_alias"] != configuration.target_alias
+        or evidence["deployment_commit"] != commit
+        or evidence["result"]
+        not in {"PASS", "BLOCKED", "FAIL", "INCONCLUSIVE", "ERROR"}
+        or type(evidence["field_services_running"]) is not bool
+        or not isinstance(evidence["checked_utc"], str)
+        or not isinstance(evidence["services"], list)
+        or len(evidence["services"]) > len(RUNTIME_SERVICES)
+        or not all(
+            _runtime_service_is_valid(service)
+            for service in evidence["services"]
+        )
+        or not isinstance(evidence["bindings"], list)
+        or len(evidence["bindings"]) > len(RUNTIME_BINDINGS)
+        or not all(
+            _runtime_binding_is_valid(binding)
+            for binding in evidence["bindings"]
+        )
+        or not isinstance(evidence["management_endpoints"], list)
+        or len(evidence["management_endpoints"]) > len(MANAGEMENT_ENDPOINTS)
+        or not all(
+            _management_endpoint_is_valid(endpoint)
+            for endpoint in evidence["management_endpoints"]
+        )
+    ):
+        return False
+    try:
+        checked = datetime.fromisoformat(
+            evidence["checked_utc"].replace("Z", "+00:00")
+        )
+    except ValueError:
+        return False
+    if checked.tzinfo is None:
+        return False
+    result = evidence["result"]
+    if result == "PASS":
+        if evidence["blocker"] is not None or not evidence[
+            "field_services_running"
+        ]:
+            return False
+        services = evidence["services"]
+        bindings = evidence["bindings"]
+        endpoints = evidence["management_endpoints"]
+        if (
+            {service["name"] for service in services}
+            != set(RUNTIME_SERVICES)
+            or {binding["service"] for binding in bindings}
+            != set(RUNTIME_BINDINGS)
+            or {endpoint["service"] for endpoint in endpoints}
+            != set(MANAGEMENT_ENDPOINTS)
+        ):
+            return False
+        service_by_name = {
+            service["name"]: service for service in services
+        }
+        if any(
+            service["state"] != "RUNNING"
+            or service["health"]
+            != (
+                "NOT_CONFIGURED"
+                if name == "cadvisor"
+                else "HEALTHY"
+            )
+            or service["restart_count"] != 0
+            or service["oom_killed"]
+            or not service["image_id_verified"]
+            for name, service in service_by_name.items()
+        ):
+            return False
+        binding_by_service = {
+            binding["service"]: binding for binding in bindings
+        }
+        if any(
+            (
+                binding["container_port"],
+                binding["host_port"],
+                binding["scope"],
+            )
+            != expected
+            or binding["result"] != "PASS"
+            for name, expected in RUNTIME_BINDINGS.items()
+            for binding in (binding_by_service[name],)
+        ):
+            return False
+        endpoint_by_service = {
+            endpoint["service"]: endpoint for endpoint in endpoints
+        }
+        return all(
+            endpoint_by_service[name]
+            == {
+                "service": name,
+                "port": port,
+                "result": "READY",
+            }
+            for name, port in MANAGEMENT_ENDPOINTS.items()
+        )
+    return _safe_evidence_text(evidence["blocker"])
+
+
+@dataclass(frozen=True)
+class SshRuntimeVerification:
+    transport: RuntimeRemoteTransportCapabilities
+    workstation_ports: WorkstationPortCapabilities
+    clock: Clock
+
+    def _failed(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        run_id: str,
+        outcome: str,
+        blocker: str,
+        remote: dict[str, object] | None = None,
+        workstation_ports: list[dict[str, object]] | None = None,
+    ) -> RuntimeVerification:
+        try:
+            cleanup_succeeded = self.transport.stop(
+                configuration,
+                commit,
+                run_id,
+            )
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            cleanup_succeeded = False
+        if not cleanup_succeeded:
+            outcome = "ERROR"
+            blocker = (
+                "Runtime verification failed and field-service cleanup "
+                "could not be proven."
+            )
+        evidence: dict[str, object] = {
+            "schema_version": HEALTH_AND_PORTS_SCHEMA_VERSION,
+            "run_id": run_id,
+            "target_alias": configuration.target_alias,
+            "deployment_commit": commit,
+            "checked_utc": _utc_text(self.clock.now()),
+            "result": outcome,
+            "services": remote["services"] if remote is not None else [],
+            "bindings": remote["bindings"] if remote is not None else [],
+            "management_endpoints": (
+                remote["management_endpoints"]
+                if remote is not None
+                else []
+            ),
+            "workstation_ports": workstation_ports or [],
+            "cleanup": {
+                "attempted": True,
+                "succeeded": cleanup_succeeded,
+            },
+        }
+        return RuntimeVerification(
+            passed=False,
+            outcome=outcome,
+            blocker=blocker,
+            field_services_running=not cleanup_succeeded,
+            evidence=evidence,
+            observed_public_ports=(),
+            observed_private_ports=(),
+        )
+
+    def verify(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+        deployment_manifest: dict[str, object],
+        run_id: str,
+    ) -> RuntimeVerification:
+        image_ids = deployment_manifest.get("service_image_ids")
+        if not _image_ids_are_valid(image_ids, require_all=True):
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "ERROR",
+                "Deployment image evidence is unavailable for runtime verification.",
+            )
+        assert isinstance(image_ids, dict)
+        try:
+            execution = self.transport.inspect(
+                configuration,
+                commit,
+                image_ids,
+                run_id,
+            )
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "ERROR",
+                "Remote runtime verification transport malfunctioned.",
+            )
+        if (
+            execution.returncode != 0
+            or len(execution.stdout) > 2 * 1024 * 1024
+        ):
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "ERROR",
+                "Remote runtime verification transport malfunctioned.",
+            )
+        try:
+            remote = json.loads(execution.stdout)
+        except (UnicodeError, json.JSONDecodeError):
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "ERROR",
+                "Remote runtime verification evidence is malformed.",
+            )
+        if not _remote_runtime_evidence_is_valid(
+            remote,
+            configuration,
+            commit,
+            run_id,
+        ):
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "ERROR",
+                "Remote runtime verification evidence is malformed.",
+            )
+        if remote["result"] != "PASS":
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                str(remote["result"]),
+                str(remote["blocker"]),
+                remote,
+            )
+
+        try:
+            observations = self.workstation_ports.observe(
+                configuration.vps_host,
+                RUNTIME_PORTS,
+            )
+        except (OSError, TimeoutError):
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "ERROR",
+                "Workstation port observation malfunctioned.",
+                remote,
+            )
+        if (
+            not isinstance(observations, dict)
+            or set(observations) != set(RUNTIME_PORTS)
+            or not all(type(value) is bool for value in observations.values())
+        ):
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "ERROR",
+                "Workstation port observation returned malformed evidence.",
+                remote,
+            )
+        workstation_evidence = []
+        for port in RUNTIME_PORTS:
+            expected_reachable = port in PUBLIC_PORTS
+            observed_reachable = observations[port]
+            workstation_evidence.append(
+                {
+                    "port": port,
+                    "expected": (
+                        "REACHABLE"
+                        if expected_reachable
+                        else "UNREACHABLE"
+                    ),
+                    "observed": (
+                        "REACHABLE"
+                        if observed_reachable
+                        else "UNREACHABLE"
+                    ),
+                    "result": (
+                        "PASS"
+                        if observed_reachable == expected_reachable
+                        else "FAIL"
+                    ),
+                }
+            )
+        if any(
+            observation["result"] != "PASS"
+            for observation in workstation_evidence
+        ):
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "BLOCKED",
+                (
+                    "Workstation-observed protocol or management port "
+                    "reachability violates the restricted validation posture."
+                ),
+                remote,
+                workstation_evidence,
+            )
+        evidence = {
+            "schema_version": HEALTH_AND_PORTS_SCHEMA_VERSION,
+            "run_id": run_id,
+            "target_alias": configuration.target_alias,
+            "deployment_commit": commit,
+            "checked_utc": _utc_text(self.clock.now()),
+            "result": "PASS",
+            "services": remote["services"],
+            "bindings": remote["bindings"],
+            "management_endpoints": remote["management_endpoints"],
+            "workstation_ports": workstation_evidence,
+            "cleanup": {
+                "attempted": False,
+                "succeeded": None,
+            },
+        }
+        return RuntimeVerification(
+            passed=True,
+            outcome="PASS",
+            blocker=None,
+            field_services_running=True,
+            evidence=evidence,
+            observed_public_ports=PUBLIC_PORTS,
+            observed_private_ports=PRIVATE_PORTS,
+        )
+
+
 @dataclass(frozen=True)
 class ControllerAdapters:
     clock: Clock
@@ -1658,6 +2348,7 @@ class ControllerAdapters:
     remote: RemoteCapabilities | None = None
     authorization: AuthorizationCapabilities | None = None
     deployment: DeploymentCapabilities | None = None
+    runtime: RuntimeCapabilities | None = None
 
 
 @dataclass(frozen=True)
@@ -1818,6 +2509,7 @@ def _load_policy() -> tuple[dict[str, object], str]:
             "remote_preflight_schema_version",
             "compose_config_schema_version",
             "deployment_manifest_schema_version",
+            "health_and_ports_schema_version",
         },
         "deployment policy",
     )
@@ -1834,6 +2526,9 @@ def _load_policy() -> tuple[dict[str, object], str]:
         "compose_config_schema_version": COMPOSE_CONFIG_SCHEMA_VERSION,
         "deployment_manifest_schema_version": (
             DEPLOYMENT_MANIFEST_SCHEMA_VERSION
+        ),
+        "health_and_ports_schema_version": (
+            HEALTH_AND_PORTS_SCHEMA_VERSION
         ),
     }
     for name, expected in expected_constants.items():
@@ -2787,29 +3482,161 @@ def run(
                                                             ),
                                                         )
                                                     )
-                                                    next_action = (
-                                                        "Implement runtime health "
-                                                        "and private/public port "
-                                                        "verification."
-                                                    )
-                                                    checks.append(
-                                                        CheckResult(
-                                                            check_id=(
-                                                                "runtime_"
-                                                                "verification_"
-                                                                "foundation"
-                                                            ),
-                                                            phase=7,
-                                                            status="BLOCKER",
-                                                            summary=(
-                                                                "Runtime "
-                                                                "verification "
-                                                                "remains "
-                                                                "unimplemented."
-                                                            ),
-                                                            next_action=next_action,
+                                                    if adapters.runtime is None:
+                                                        next_action = (
+                                                            "Implement runtime "
+                                                            "health and private/"
+                                                            "public port "
+                                                            "verification."
                                                         )
-                                                    )
+                                                        checks.append(
+                                                            CheckResult(
+                                                                check_id=(
+                                                                    "runtime_"
+                                                                    "verification_"
+                                                                    "foundation"
+                                                                ),
+                                                                phase=7,
+                                                                status="BLOCKER",
+                                                                summary=(
+                                                                    "Runtime "
+                                                                    "verification "
+                                                                    "remains "
+                                                                    "unimplemented."
+                                                                ),
+                                                                next_action=(
+                                                                    next_action
+                                                                ),
+                                                            )
+                                                        )
+                                                    else:
+                                                        runtime = (
+                                                            adapters.runtime.verify(
+                                                                target_configuration,
+                                                                commit,
+                                                                policy,
+                                                                (
+                                                                    deployment
+                                                                    .deployment_manifest
+                                                                ),
+                                                                run_id,
+                                                            )
+                                                        )
+                                                        field_services_running = (
+                                                            runtime
+                                                            .field_services_running
+                                                        )
+                                                        if runtime.evidence:
+                                                            json_artifacts[
+                                                                "health-and-ports.json"
+                                                            ] = runtime.evidence
+                                                        if runtime.passed:
+                                                            authorization_evidence[
+                                                                "observed_public_ports"
+                                                            ] = list(
+                                                                runtime
+                                                                .observed_public_ports
+                                                            )
+                                                            authorization_evidence[
+                                                                "observed_private_ports"
+                                                            ] = list(
+                                                                runtime
+                                                                .observed_private_ports
+                                                            )
+                                                            checks.append(
+                                                                CheckResult(
+                                                                    check_id=(
+                                                                        "runtime_"
+                                                                        "verification"
+                                                                    ),
+                                                                    phase=7,
+                                                                    status="PASS",
+                                                                    summary=(
+                                                                        "Runtime "
+                                                                        "health, "
+                                                                        "bindings, "
+                                                                        "and port "
+                                                                        "reachability "
+                                                                        "passed."
+                                                                    ),
+                                                                )
+                                                            )
+                                                            next_action = (
+                                                                "Implement the "
+                                                                "deterministic "
+                                                                "Telnet and MQTT "
+                                                                "deployment smoke."
+                                                            )
+                                                            checks.append(
+                                                                CheckResult(
+                                                                    check_id=(
+                                                                        "deployment_"
+                                                                        "smoke_"
+                                                                        "foundation"
+                                                                    ),
+                                                                    phase=8,
+                                                                    status=(
+                                                                        "BLOCKER"
+                                                                    ),
+                                                                    summary=(
+                                                                        "Deterministic "
+                                                                        "deployment "
+                                                                        "smoke remains "
+                                                                        "unimplemented."
+                                                                    ),
+                                                                    next_action=(
+                                                                        next_action
+                                                                    ),
+                                                                )
+                                                            )
+                                                        else:
+                                                            if runtime.outcome in {
+                                                                "FAIL",
+                                                                "ERROR",
+                                                                "INCONCLUSIVE",
+                                                            }:
+                                                                outcome = (
+                                                                    runtime.outcome
+                                                                )
+                                                            next_action = (
+                                                                runtime.blocker
+                                                                or (
+                                                                    "Resolve the "
+                                                                    "runtime "
+                                                                    "verification "
+                                                                    "blocker."
+                                                                )
+                                                            )
+                                                            runtime_status = {
+                                                                "FAIL": "FAIL",
+                                                                "ERROR": "ERROR",
+                                                                "INCONCLUSIVE": (
+                                                                    "INCONCLUSIVE"
+                                                                ),
+                                                            }.get(
+                                                                runtime.outcome,
+                                                                "BLOCKER",
+                                                            )
+                                                            checks.append(
+                                                                CheckResult(
+                                                                    check_id=(
+                                                                        "runtime_"
+                                                                        "verification"
+                                                                    ),
+                                                                    phase=7,
+                                                                    status=(
+                                                                        runtime_status
+                                                                    ),
+                                                                    summary=(
+                                                                        "Runtime "
+                                                                        "verification "
+                                                                        "did not pass."
+                                                                    ),
+                                                                    next_action=(
+                                                                        next_action
+                                                                    ),
+                                                                )
+                                                            )
                                                 else:
                                                     if deployment.outcome in {
                                                         "FAIL",
@@ -2874,6 +3701,8 @@ def run(
         evidence["compose_config"] = "compose-config.json"
     if "deployment-manifest.json" in json_artifacts:
         evidence["deployment_manifest"] = "deployment-manifest.json"
+    if "health-and-ports.json" in json_artifacts:
+        evidence["health_and_ports"] = "health-and-ports.json"
     result = DeploymentResult(
         schema_version=RESULT_SCHEMA_VERSION,
         run_id=run_id,
@@ -3011,6 +3840,15 @@ def production_adapters(
                     REPO_ROOT / "scripts/vps_field_remote_deploy.py"
                 ),
             )
+        ),
+        runtime=SshRuntimeVerification(
+            transport=SystemSshRuntimeTransport(
+                runtime_program_path=(
+                    REPO_ROOT / "scripts/vps_field_remote_runtime.py"
+                ),
+            ),
+            workstation_ports=SystemTcpPortProbe(),
+            clock=SystemClock(),
         ),
     )
 

@@ -1,0 +1,386 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eventhorizon.invalid/schemas/health-and-ports.schema.json",
+  "title": "EventHorizon runtime health and port evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "target_alias",
+    "deployment_commit",
+    "checked_utc",
+    "result",
+    "services",
+    "bindings",
+    "management_endpoints",
+    "workstation_ports",
+    "cleanup"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^deploy-[0-9]{8}T[0-9]{6}Z-[a-z0-9]{6,32}$"
+    },
+    "target_alias": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    },
+    "deployment_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "checked_utc": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "result": {
+      "enum": [
+        "PASS",
+        "BLOCKED",
+        "FAIL",
+        "INCONCLUSIVE",
+        "ERROR"
+      ]
+    },
+    "services": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 6,
+      "items": {
+        "$ref": "#/$defs/service"
+      }
+    },
+    "bindings": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 6,
+      "items": {
+        "$ref": "#/$defs/binding"
+      }
+    },
+    "management_endpoints": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 4,
+      "items": {
+        "$ref": "#/$defs/managementEndpoint"
+      }
+    },
+    "workstation_ports": {
+      "type": "array",
+      "minItems": 0,
+      "maxItems": 6,
+      "items": {
+        "$ref": "#/$defs/workstationPort"
+      }
+    },
+    "cleanup": {
+      "$ref": "#/$defs/cleanup"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "result": {
+            "const": "PASS"
+          }
+        },
+        "required": [
+          "result"
+        ]
+      },
+      "then": {
+        "properties": {
+          "services": {
+            "minItems": 6,
+            "maxItems": 6,
+            "items": {
+              "properties": {
+                "state": {
+                  "const": "RUNNING"
+                },
+                "health": {
+                  "enum": [
+                    "HEALTHY",
+                    "NOT_CONFIGURED"
+                  ]
+                },
+                "restart_count": {
+                  "const": 0
+                },
+                "oom_killed": {
+                  "const": false
+                },
+                "image_id_verified": {
+                  "const": true
+                }
+              }
+            }
+          },
+          "bindings": {
+            "minItems": 6,
+            "maxItems": 6,
+            "items": {
+              "properties": {
+                "result": {
+                  "const": "PASS"
+                }
+              }
+            }
+          },
+          "management_endpoints": {
+            "minItems": 4,
+            "maxItems": 4,
+            "items": {
+              "properties": {
+                "result": {
+                  "const": "READY"
+                }
+              }
+            }
+          },
+          "workstation_ports": {
+            "minItems": 6,
+            "maxItems": 6,
+            "items": {
+              "properties": {
+                "result": {
+                  "const": "PASS"
+                }
+              }
+            }
+          },
+          "cleanup": {
+            "properties": {
+              "attempted": {
+                "const": false
+              },
+              "succeeded": {
+                "const": null
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "serviceName": {
+      "enum": [
+        "cadvisor",
+        "grafana",
+        "mqtt_pit",
+        "prometheus",
+        "prometheus-exporter",
+        "telnet_pit"
+      ]
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "state",
+        "health",
+        "restart_count",
+        "oom_killed",
+        "image_id_verified"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/serviceName"
+        },
+        "state": {
+          "enum": [
+            "RUNNING",
+            "STOPPED",
+            "EXITED",
+            "UNKNOWN"
+          ]
+        },
+        "health": {
+          "enum": [
+            "HEALTHY",
+            "UNHEALTHY",
+            "STARTING",
+            "NOT_CONFIGURED",
+            "UNKNOWN"
+          ]
+        },
+        "restart_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "oom_killed": {
+          "type": "boolean"
+        },
+        "image_id_verified": {
+          "type": "boolean"
+        }
+      }
+    },
+    "binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "service",
+        "container_port",
+        "host_port",
+        "scope",
+        "result"
+      ],
+      "properties": {
+        "service": {
+          "$ref": "#/$defs/serviceName"
+        },
+        "container_port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "host_port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "scope": {
+          "enum": [
+            "PUBLIC",
+            "LOOPBACK"
+          ]
+        },
+        "result": {
+          "enum": [
+            "PASS",
+            "FAIL"
+          ]
+        }
+      }
+    },
+    "managementEndpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "service",
+        "port",
+        "result"
+      ],
+      "properties": {
+        "service": {
+          "enum": [
+            "cadvisor",
+            "grafana",
+            "prometheus",
+            "prometheus-exporter"
+          ]
+        },
+        "port": {
+          "enum": [
+            3000,
+            8081,
+            9090,
+            9101
+          ]
+        },
+        "result": {
+          "enum": [
+            "READY",
+            "NOT_READY"
+          ]
+        }
+      }
+    },
+    "workstationPort": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "port",
+        "expected",
+        "observed",
+        "result"
+      ],
+      "properties": {
+        "port": {
+          "enum": [
+            23,
+            1883,
+            3000,
+            8081,
+            9090,
+            9101
+          ]
+        },
+        "expected": {
+          "enum": [
+            "REACHABLE",
+            "UNREACHABLE"
+          ]
+        },
+        "observed": {
+          "enum": [
+            "REACHABLE",
+            "UNREACHABLE"
+          ]
+        },
+        "result": {
+          "enum": [
+            "PASS",
+            "FAIL"
+          ]
+        }
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "attempted",
+        "succeeded"
+      ],
+      "properties": {
+        "attempted": {
+          "type": "boolean"
+        },
+        "succeeded": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "attempted": {
+                "const": false
+              }
+            },
+            "required": [
+              "attempted"
+            ]
+          },
+          "then": {
+            "properties": {
+              "succeeded": {
+                "const": null
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "succeeded": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

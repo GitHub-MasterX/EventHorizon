@@ -30,10 +30,13 @@ from scripts.deployment_controller import (
     RemoteDeploymentVerification,
     RemoteProbeExecution,
     RemotePreflightVerification,
+    RemoteRuntimeExecution,
     SshExactSourceDeployment,
     SshRemotePreflight,
+    SshRuntimeVerification,
     SystemSshDeploymentTransport,
     SystemSshProbeTransport,
+    SystemSshRuntimeTransport,
     TargetConfiguration,
     TrustedGitHubActions,
     production_adapters,
@@ -117,14 +120,23 @@ class DeploymentContractArtifactTests(unittest.TestCase):
             "scripts/vps_field_remote_deploy.py",
             policy["protected_paths"],
         )
+        self.assertIn(
+            "scripts/vps_field_remote_runtime.py",
+            policy["protected_paths"],
+        )
         self.assertIn(".github/workflows/ci.yml", policy["protected_paths"])
         self.assertIn(
             "deploy/schemas/remote-preflight.schema.json",
             policy["protected_paths"],
         )
+        self.assertIn(
+            "deploy/schemas/health-and-ports.schema.json",
+            policy["protected_paths"],
+        )
         self.assertEqual(policy["remote_preflight_schema_version"], 2)
         self.assertEqual(policy["compose_config_schema_version"], 1)
         self.assertEqual(policy["deployment_manifest_schema_version"], 1)
+        self.assertEqual(policy["health_and_ports_schema_version"], 1)
 
     def test_phase_six_artifact_schemas_are_strict(self) -> None:
         compose_schema = json.loads(
@@ -476,6 +488,130 @@ class DeploymentContractArtifactTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             validator.validate(dict(evidence, schema_version=1))
 
+    def test_health_and_ports_schema_is_strict_and_redacted(self) -> None:
+        schema = json.loads(
+            (
+                REPO_ROOT
+                / "deploy/schemas/health-and-ports.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        evidence = {
+            "schema_version": 1,
+            "run_id": "deploy-20260730T010203Z-a1b2c3",
+            "target_alias": "field-host",
+            "deployment_commit": "1" * 40,
+            "checked_utc": "2026-07-30T01:02:03Z",
+            "result": "PASS",
+            "services": [
+                {
+                    "name": service,
+                    "state": "RUNNING",
+                    "health": (
+                        "NOT_CONFIGURED"
+                        if service == "cadvisor"
+                        else "HEALTHY"
+                    ),
+                    "restart_count": 0,
+                    "oom_killed": False,
+                    "image_id_verified": True,
+                }
+                for service in (
+                    "cadvisor",
+                    "grafana",
+                    "mqtt_pit",
+                    "prometheus",
+                    "prometheus-exporter",
+                    "telnet_pit",
+                )
+            ],
+            "bindings": [
+                {
+                    "service": service,
+                    "container_port": container_port,
+                    "host_port": host_port,
+                    "scope": scope,
+                    "result": "PASS",
+                }
+                for service, container_port, host_port, scope in (
+                    ("cadvisor", 8080, 8081, "LOOPBACK"),
+                    ("grafana", 3000, 3000, "LOOPBACK"),
+                    ("mqtt_pit", 1883, 1883, "PUBLIC"),
+                    ("prometheus", 9090, 9090, "LOOPBACK"),
+                    (
+                        "prometheus-exporter",
+                        9101,
+                        9101,
+                        "LOOPBACK",
+                    ),
+                    ("telnet_pit", 23, 23, "PUBLIC"),
+                )
+            ],
+            "management_endpoints": [
+                {
+                    "service": service,
+                    "port": port,
+                    "result": "READY",
+                }
+                for service, port in (
+                    ("cadvisor", 8081),
+                    ("grafana", 3000),
+                    ("prometheus", 9090),
+                    ("prometheus-exporter", 9101),
+                )
+            ],
+            "workstation_ports": [
+                {
+                    "port": port,
+                    "expected": expected,
+                    "observed": expected,
+                    "result": "PASS",
+                }
+                for port, expected in (
+                    (23, "REACHABLE"),
+                    (1883, "REACHABLE"),
+                    (3000, "UNREACHABLE"),
+                    (8081, "UNREACHABLE"),
+                    (9090, "UNREACHABLE"),
+                    (9101, "UNREACHABLE"),
+                )
+            ],
+            "cleanup": {
+                "attempted": False,
+                "succeeded": None,
+            },
+        }
+        validator = Draft202012Validator(
+            schema,
+            format_checker=Draft202012Validator.FORMAT_CHECKER,
+        )
+
+        validator.validate(evidence)
+        validator.validate(
+            {
+                **evidence,
+                "result": "ERROR",
+                "services": [],
+                "bindings": [],
+                "management_endpoints": [],
+                "workstation_ports": [],
+                "cleanup": {
+                    "attempted": True,
+                    "succeeded": False,
+                },
+            }
+        )
+        with self.assertRaises(ValidationError):
+            validator.validate(dict(evidence, vps_host="198.51.100.10"))
+        with self.assertRaises(ValidationError):
+            validator.validate(dict(evidence, schema_version=2))
+        with self.assertRaises(ValidationError):
+            validator.validate(
+                dict(
+                    evidence,
+                    cleanup={"attempted": True, "succeeded": True},
+                )
+            )
+
     def test_target_configuration_example_contains_only_strict_keys(self) -> None:
         entries = {}
         for line in (
@@ -752,6 +888,33 @@ class DeploymentOperatorCliTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0)
             self.assertIn(
                 "usage: vps_field_remote_deploy.py <encoded-request>",
+                completed.stdout,
+            )
+            self.assertEqual(completed.stderr, "")
+            self.assertEqual(list(temporary_path.iterdir()), [])
+
+    def test_internal_remote_runtime_help_is_side_effect_free(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        REPO_ROOT
+                        / "scripts/vps_field_remote_runtime.py"
+                    ),
+                    "--help",
+                ],
+                cwd=temporary_path,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertIn(
+                "usage: vps_field_remote_runtime.py <encoded-request>",
                 completed.stdout,
             )
             self.assertEqual(completed.stderr, "")
@@ -1678,6 +1841,80 @@ def successful_ci_proof(
     }
 
 
+def successful_remote_runtime_evidence(
+    commit: str,
+    run_id: str,
+) -> dict[str, object]:
+    services = (
+        "cadvisor",
+        "grafana",
+        "mqtt_pit",
+        "prometheus",
+        "prometheus-exporter",
+        "telnet_pit",
+    )
+    return {
+        "schema_version": 1,
+        "run_id": run_id,
+        "target_alias": "field-host",
+        "deployment_commit": commit,
+        "checked_utc": "2026-07-30T01:02:03Z",
+        "result": "PASS",
+        "blocker": None,
+        "field_services_running": True,
+        "services": [
+            {
+                "name": service,
+                "state": "RUNNING",
+                "health": (
+                    "NOT_CONFIGURED"
+                    if service == "cadvisor"
+                    else "HEALTHY"
+                ),
+                "restart_count": 0,
+                "oom_killed": False,
+                "image_id_verified": True,
+            }
+            for service in services
+        ],
+        "bindings": [
+            {
+                "service": service,
+                "container_port": container_port,
+                "host_port": host_port,
+                "scope": scope,
+                "result": "PASS",
+            }
+            for service, container_port, host_port, scope in (
+                ("cadvisor", 8080, 8081, "LOOPBACK"),
+                ("grafana", 3000, 3000, "LOOPBACK"),
+                ("mqtt_pit", 1883, 1883, "PUBLIC"),
+                ("prometheus", 9090, 9090, "LOOPBACK"),
+                (
+                    "prometheus-exporter",
+                    9101,
+                    9101,
+                    "LOOPBACK",
+                ),
+                ("telnet_pit", 23, 23, "PUBLIC"),
+            )
+        ],
+        "management_endpoints": [
+            {
+                "service": service,
+                "port": port,
+                "result": "READY",
+            }
+            for service, port in (
+                ("cadvisor", 8081),
+                ("grafana", 3000),
+                ("prometheus", 9090),
+                ("prometheus-exporter", 9101),
+            )
+        ],
+    }
+
+
 class RemoteDeploymentProgramIntegrationTests(unittest.TestCase):
     def test_failed_initial_clone_does_not_strand_deployment_directory(
         self,
@@ -2417,6 +2654,274 @@ else:
             )
 
 
+class RemoteRuntimeProgramIntegrationTests(unittest.TestCase):
+    def test_exact_runtime_is_healthy_and_uses_supported_bindings(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            deploy_dir = temporary_path / "authorized/vps/eventhorizon-field"
+            deploy_dir.mkdir(parents=True)
+
+            def git(*arguments: str) -> str:
+                return subprocess.run(
+                    ["git", *arguments],
+                    cwd=deploy_dir,
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                ).stdout.strip()
+
+            git("init", "-q")
+            git("config", "user.name", "Runtime Test")
+            git("config", "user.email", "runtime@example.invalid")
+            (deploy_dir / ".gitignore").write_text(
+                "validation-output/\n",
+                encoding="utf-8",
+            )
+            (deploy_dir / "tracked.txt").write_text(
+                "exact deployed source\n",
+                encoding="utf-8",
+            )
+            git("add", ".")
+            git("commit", "-qm", "exact deployed source")
+            deployment_commit = git("rev-parse", "HEAD")
+
+            services = (
+                "cadvisor",
+                "grafana",
+                "mqtt_pit",
+                "prometheus",
+                "prometheus-exporter",
+                "telnet_pit",
+            )
+            image_ids = {
+                service: "sha256:" + str(index) * 64
+                for index, service in enumerate(services, start=1)
+            }
+            tools = temporary_path / "tools"
+            tools.mkdir()
+            dispatcher = tools / "fake-runtime-tool"
+            dispatcher.write_text(
+                """#!/usr/bin/env python3
+import json
+import os
+import sys
+from pathlib import Path
+
+tool = Path(sys.argv[0]).name
+arguments = sys.argv[1:]
+services = {
+    "cadvisor": (8080, 8081, "127.0.0.1"),
+    "grafana": (3000, 3000, "127.0.0.1"),
+    "mqtt_pit": (1883, 1883, "0.0.0.0"),
+    "prometheus": (9090, 9090, "127.0.0.1"),
+    "prometheus-exporter": (9101, 9101, "127.0.0.1"),
+    "telnet_pit": (23, 23, "0.0.0.0"),
+}
+if tool == "docker":
+    if arguments and arguments[0] == "compose" and "ps" in arguments:
+        print("container-" + arguments[-1])
+    elif arguments and arguments[0] == "inspect":
+        service = arguments[-1].removeprefix("container-")
+        container_port, host_port, host_ip = services[service]
+        state = {
+            "Status": "running",
+            "OOMKilled": False,
+        }
+        if service != "cadvisor":
+            health = "healthy"
+            transient_marker = os.environ.get(
+                "FAKE_TRANSIENT_HEALTH_MARKER"
+            )
+            if (
+                service == "grafana"
+                and transient_marker
+                and not Path(transient_marker).exists()
+            ):
+                Path(transient_marker).write_text("observed\\n")
+                health = "starting"
+            state["Health"] = {"Status": health}
+        print(json.dumps({
+            "Image": json.loads(os.environ["FAKE_IMAGE_IDS"])[service],
+            "RestartCount": 0,
+            "Config": {
+                "Labels": {
+                    "com.docker.compose.project": "eventhorizon-field",
+                    "com.docker.compose.service": service,
+                }
+            },
+            "State": state,
+            "NetworkSettings": {
+                "Ports": {
+                    f"{container_port}/tcp": (
+                        [{
+                            "HostIp": host_ip,
+                            "HostPort": str(host_port),
+                        }]
+                        + (
+                            [{
+                                "HostIp": "::",
+                                "HostPort": str(host_port),
+                            }]
+                            if host_ip == "0.0.0.0"
+                            else []
+                        )
+                    )
+                }
+            },
+        }))
+    elif arguments and arguments[0] == "ps":
+        stopped = Path(os.environ["FAKE_STOP_MARKER"]).exists()
+        if "-a" in arguments:
+            for service in services:
+                print(
+                    f"container-{service}\\t"
+                    f"eventhorizon-field\\t{service}"
+                )
+        elif not stopped:
+            for service in services:
+                print("container-" + service)
+    elif arguments and arguments[0] == "stop":
+        Path(os.environ["FAKE_STOP_MARKER"]).write_text("stopped\\n")
+    else:
+        raise SystemExit(81)
+elif tool == "curl":
+    raise SystemExit(0)
+else:
+    raise SystemExit(83)
+""",
+                encoding="utf-8",
+            )
+            dispatcher.chmod(0o700)
+            for tool_name in ("docker", "curl"):
+                (tools / tool_name).symlink_to(dispatcher)
+
+            request = {
+                "schema_version": 1,
+                "action": "VERIFY",
+                "run_id": "deploy-20260730T010203Z-a1b2c3",
+                "target_alias": "field-host",
+                "deployment_commit": deployment_commit,
+                "deploy_dir": str(deploy_dir),
+                "project_name": "eventhorizon-field",
+                "expected_image_ids": image_ids,
+            }
+            environment = os.environ.copy()
+            environment["PATH"] = (
+                str(tools) + os.pathsep + environment["PATH"]
+            )
+            environment["FAKE_IMAGE_IDS"] = json.dumps(image_ids)
+            stop_marker = temporary_path / "stopped"
+            environment["FAKE_STOP_MARKER"] = str(stop_marker)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        REPO_ROOT
+                        / "scripts/vps_field_remote_runtime.py"
+                    ),
+                    base64.urlsafe_b64encode(
+                        json.dumps(request).encode("utf-8")
+                    ).decode("ascii"),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = json.loads(completed.stdout)
+            self.assertEqual(evidence["result"], "PASS", evidence)
+            self.assertTrue(evidence["field_services_running"])
+            self.assertEqual(
+                {service["name"] for service in evidence["services"]},
+                set(services),
+            )
+            self.assertTrue(
+                all(
+                    binding["result"] == "PASS"
+                    for binding in evidence["bindings"]
+                )
+            )
+            self.assertTrue(
+                all(
+                    endpoint["result"] == "READY"
+                    for endpoint in evidence["management_endpoints"]
+                )
+            )
+            self.assertNotIn(str(deploy_dir), completed.stdout)
+
+            transient_marker = temporary_path / "transient-health"
+            environment["FAKE_TRANSIENT_HEALTH_MARKER"] = str(
+                transient_marker
+            )
+            transient_request = dict(
+                request,
+                run_id="deploy-20260730T010204Z-d4e5f6",
+            )
+            transient = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        REPO_ROOT
+                        / "scripts/vps_field_remote_runtime.py"
+                    ),
+                    base64.urlsafe_b64encode(
+                        json.dumps(transient_request).encode("utf-8")
+                    ).decode("ascii"),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+                timeout=15,
+            )
+            self.assertEqual(
+                transient.returncode,
+                0,
+                transient.stderr,
+            )
+            transient_evidence = json.loads(transient.stdout)
+            self.assertEqual(
+                transient_evidence["result"],
+                "PASS",
+                transient_evidence,
+            )
+            self.assertTrue(transient_marker.is_file())
+            environment.pop("FAKE_TRANSIENT_HEALTH_MARKER")
+
+            stop_request = dict(
+                request,
+                action="STOP",
+                expected_image_ids={},
+            )
+            stopped = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        REPO_ROOT
+                        / "scripts/vps_field_remote_runtime.py"
+                    ),
+                    base64.urlsafe_b64encode(
+                        json.dumps(stop_request).encode("utf-8")
+                    ).decode("ascii"),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+                timeout=10,
+            )
+            self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            stop_evidence = json.loads(stopped.stdout)
+            self.assertEqual(stop_evidence["result"], "PASS")
+            self.assertFalse(stop_evidence["field_services_running"])
+            self.assertTrue(stop_marker.is_file())
+
+
 class StaticGitHubActionsApi:
     def __init__(
         self,
@@ -2751,6 +3256,370 @@ class InteractiveTextStream(io.StringIO):
 
 
 class DeploymentControllerApiTests(unittest.TestCase):
+    def test_runtime_verification_combines_remote_and_workstation_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            target_file, _ = write_strict_target_configuration(temporary_path)
+            configuration = TargetConfiguration(
+                target_alias="field-host",
+                vps_host="198.51.100.10",
+                vps_user="deploy",
+                vps_ssh_port=22,
+                vps_ssh_key=temporary_path / "operator_key",
+                vps_deploy_dir="/srv/eventhorizon-field",
+                vps_project_name="eventhorizon-field",
+                admin_source_cidr="203.0.113.9/32",
+                field_tarpit_cpu_limit="0.50",
+                field_tarpit_memory_limit=None,
+            )
+            commit = "1" * 40
+            run_id = "deploy-20260730T010203Z-a1b2c3"
+            services = (
+                "cadvisor",
+                "grafana",
+                "mqtt_pit",
+                "prometheus",
+                "prometheus-exporter",
+                "telnet_pit",
+            )
+            image_ids = {
+                service: "sha256:" + str(index) * 64
+                for index, service in enumerate(services, start=1)
+            }
+            remote_evidence = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "target_alias": "field-host",
+                "deployment_commit": commit,
+                "checked_utc": "2026-07-30T01:02:03Z",
+                "result": "PASS",
+                "blocker": None,
+                "field_services_running": True,
+                "services": [
+                    {
+                        "name": service,
+                        "state": "RUNNING",
+                        "health": (
+                            "NOT_CONFIGURED"
+                            if service == "cadvisor"
+                            else "HEALTHY"
+                        ),
+                        "restart_count": 0,
+                        "oom_killed": False,
+                        "image_id_verified": True,
+                    }
+                    for service in services
+                ],
+                "bindings": [
+                    {
+                        "service": service,
+                        "container_port": container_port,
+                        "host_port": host_port,
+                        "scope": scope,
+                        "result": "PASS",
+                    }
+                    for service, container_port, host_port, scope in (
+                        ("cadvisor", 8080, 8081, "LOOPBACK"),
+                        ("grafana", 3000, 3000, "LOOPBACK"),
+                        ("mqtt_pit", 1883, 1883, "PUBLIC"),
+                        ("prometheus", 9090, 9090, "LOOPBACK"),
+                        (
+                            "prometheus-exporter",
+                            9101,
+                            9101,
+                            "LOOPBACK",
+                        ),
+                        ("telnet_pit", 23, 23, "PUBLIC"),
+                    )
+                ],
+                "management_endpoints": [
+                    {
+                        "service": service,
+                        "port": port,
+                        "result": "READY",
+                    }
+                    for service, port in (
+                        ("cadvisor", 8081),
+                        ("grafana", 3000),
+                        ("prometheus", 9090),
+                        ("prometheus-exporter", 9101),
+                    )
+                ],
+            }
+
+            class RemoteRuntime:
+                def inspect(
+                    self,
+                    target: object,
+                    deployment_commit: str,
+                    expected_image_ids: dict[str, str],
+                    requested_run_id: str,
+                ) -> RemoteRuntimeExecution:
+                    return RemoteRuntimeExecution(
+                        returncode=0,
+                        stdout=json.dumps(remote_evidence).encode("utf-8"),
+                        stderr=b"",
+                    )
+
+                def stop(
+                    self,
+                    target: object,
+                    deployment_commit: str,
+                    requested_run_id: str,
+                ) -> bool:
+                    raise AssertionError("passing verification must not stop")
+
+            class WorkstationPorts:
+                def observe(
+                    self,
+                    host: str,
+                    ports: tuple[int, ...],
+                ) -> dict[int, bool]:
+                    return {
+                        23: True,
+                        1883: True,
+                        3000: False,
+                        8081: False,
+                        9090: False,
+                        9101: False,
+                    }
+
+            verification = SshRuntimeVerification(
+                transport=RemoteRuntime(),
+                workstation_ports=WorkstationPorts(),
+                clock=FixedClock(),
+            ).verify(
+                configuration,
+                commit,
+                json.loads(
+                    (
+                        REPO_ROOT / "deploy/deployment-policy.json"
+                    ).read_text(encoding="utf-8")
+                ),
+                {"service_image_ids": image_ids},
+                run_id,
+            )
+
+            self.assertTrue(verification.passed)
+            self.assertEqual(verification.outcome, "PASS")
+            self.assertTrue(verification.field_services_running)
+            self.assertEqual(
+                verification.observed_public_ports,
+                (23, 1883),
+            )
+            self.assertEqual(
+                verification.observed_private_ports,
+                (3000, 8081, 9090, 9101),
+            )
+            schema = json.loads(
+                (
+                    REPO_ROOT
+                    / "deploy/schemas/health-and-ports.schema.json"
+                ).read_text(encoding="utf-8")
+            )
+            Draft202012Validator(
+                schema,
+                format_checker=Draft202012Validator.FORMAT_CHECKER,
+            ).validate(verification.evidence)
+
+    def test_runtime_port_blocker_stops_the_exact_managed_services(
+        self,
+    ) -> None:
+        commit = "1" * 40
+        run_id = "deploy-20260730T010203Z-a1b2c3"
+        configuration = TargetConfiguration(
+            target_alias="field-host",
+            vps_host="198.51.100.10",
+            vps_user="deploy",
+            vps_ssh_port=22,
+            vps_ssh_key=Path("/tmp/test-operator-key"),
+            vps_deploy_dir="/srv/eventhorizon-field",
+            vps_project_name="eventhorizon-field",
+            admin_source_cidr="203.0.113.9/32",
+            field_tarpit_cpu_limit="0.50",
+            field_tarpit_memory_limit=None,
+        )
+        remote_evidence = successful_remote_runtime_evidence(
+            commit,
+            run_id,
+        )
+        image_ids = {
+            service["name"]: "sha256:" + str(index) * 64
+            for index, service in enumerate(
+                remote_evidence["services"],
+                start=1,
+            )
+        }
+
+        class CleanupRuntime:
+            stopped = False
+
+            def inspect(
+                self,
+                target: object,
+                deployment_commit: str,
+                expected_image_ids: dict[str, str],
+                requested_run_id: str,
+            ) -> RemoteRuntimeExecution:
+                return RemoteRuntimeExecution(
+                    returncode=0,
+                    stdout=json.dumps(remote_evidence).encode("utf-8"),
+                    stderr=b"",
+                )
+
+            def stop(
+                self,
+                target: object,
+                deployment_commit: str,
+                requested_run_id: str,
+            ) -> bool:
+                self.stopped = True
+                return True
+
+        class ExposedManagementPort:
+            def observe(
+                self,
+                host: str,
+                ports: tuple[int, ...],
+            ) -> dict[int, bool]:
+                return {
+                    23: True,
+                    1883: True,
+                    3000: True,
+                    8081: False,
+                    9090: False,
+                    9101: False,
+                }
+
+        transport = CleanupRuntime()
+        verification = SshRuntimeVerification(
+            transport=transport,
+            workstation_ports=ExposedManagementPort(),
+            clock=FixedClock(),
+        ).verify(
+            configuration,
+            commit,
+            {},
+            {"service_image_ids": image_ids},
+            run_id,
+        )
+
+        self.assertFalse(verification.passed)
+        self.assertEqual(verification.outcome, "BLOCKED")
+        self.assertFalse(verification.field_services_running)
+        self.assertTrue(transport.stopped)
+        self.assertEqual(
+            verification.evidence["cleanup"],
+            {"attempted": True, "succeeded": True},
+        )
+        port_3000 = next(
+            port
+            for port in verification.evidence["workstation_ports"]
+            if port["port"] == 3000
+        )
+        self.assertEqual(port_3000["result"], "FAIL")
+        schema = json.loads(
+            (
+                REPO_ROOT
+                / "deploy/schemas/health-and-ports.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        Draft202012Validator(
+            schema,
+            format_checker=Draft202012Validator.FORMAT_CHECKER,
+        ).validate(verification.evidence)
+
+    def test_runtime_malfunction_preserves_partial_cleanup_evidence(
+        self,
+    ) -> None:
+        commit = "1" * 40
+        run_id = "deploy-20260730T010203Z-a1b2c3"
+        configuration = TargetConfiguration(
+            target_alias="field-host",
+            vps_host="198.51.100.10",
+            vps_user="deploy",
+            vps_ssh_port=22,
+            vps_ssh_key=Path("/tmp/test-operator-key"),
+            vps_deploy_dir="/srv/eventhorizon-field",
+            vps_project_name="eventhorizon-field",
+            admin_source_cidr="203.0.113.9/32",
+            field_tarpit_cpu_limit="0.50",
+            field_tarpit_memory_limit=None,
+        )
+        image_ids = {
+            service: "sha256:" + str(index) * 64
+            for index, service in enumerate(
+                (
+                    "cadvisor",
+                    "grafana",
+                    "mqtt_pit",
+                    "prometheus",
+                    "prometheus-exporter",
+                    "telnet_pit",
+                ),
+                start=1,
+            )
+        }
+
+        class MalformedRuntime:
+            def inspect(
+                self,
+                target: object,
+                deployment_commit: str,
+                expected_image_ids: dict[str, str],
+                requested_run_id: str,
+            ) -> RemoteRuntimeExecution:
+                return RemoteRuntimeExecution(
+                    returncode=0,
+                    stdout=b"{}",
+                    stderr=b"sensitive remote detail",
+                )
+
+            def stop(
+                self,
+                target: object,
+                deployment_commit: str,
+                requested_run_id: str,
+            ) -> bool:
+                return True
+
+        verification = SshRuntimeVerification(
+            transport=MalformedRuntime(),
+            workstation_ports=None,
+            clock=FixedClock(),
+        ).verify(
+            configuration,
+            commit,
+            {},
+            {"service_image_ids": image_ids},
+            run_id,
+        )
+
+        self.assertFalse(verification.passed)
+        self.assertEqual(verification.outcome, "ERROR")
+        self.assertFalse(verification.field_services_running)
+        self.assertEqual(verification.evidence["services"], [])
+        self.assertEqual(
+            verification.evidence["cleanup"],
+            {"attempted": True, "succeeded": True},
+        )
+        self.assertNotIn(
+            "sensitive remote detail",
+            json.dumps(verification.evidence),
+        )
+        schema = json.loads(
+            (
+                REPO_ROOT
+                / "deploy/schemas/health-and-ports.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        Draft202012Validator(
+            schema,
+            format_checker=Draft202012Validator.FORMAT_CHECKER,
+        ).validate(verification.evidence)
+
     def test_evidence_write_failure_preserves_proven_remote_state(
         self,
     ) -> None:
@@ -2856,6 +3725,112 @@ class DeploymentControllerApiTests(unittest.TestCase):
                         },
                     )
 
+            health_and_ports = {
+                "schema_version": 1,
+                "run_id": "deploy-20260730T010203Z-a1b2c3",
+                "target_alias": "field-host",
+                "deployment_commit": commit,
+                "checked_utc": "2026-07-30T01:02:03Z",
+                "result": "PASS",
+                "services": [
+                    {
+                        "name": service,
+                        "state": "RUNNING",
+                        "health": (
+                            "NOT_CONFIGURED"
+                            if service == "cadvisor"
+                            else "HEALTHY"
+                        ),
+                        "restart_count": 0,
+                        "oom_killed": False,
+                        "image_id_verified": True,
+                    }
+                    for service in (
+                        "cadvisor",
+                        "grafana",
+                        "mqtt_pit",
+                        "prometheus",
+                        "prometheus-exporter",
+                        "telnet_pit",
+                    )
+                ],
+                "bindings": [
+                    {
+                        "service": service,
+                        "container_port": container_port,
+                        "host_port": host_port,
+                        "scope": scope,
+                        "result": "PASS",
+                    }
+                    for service, container_port, host_port, scope in (
+                        ("cadvisor", 8080, 8081, "LOOPBACK"),
+                        ("grafana", 3000, 3000, "LOOPBACK"),
+                        ("mqtt_pit", 1883, 1883, "PUBLIC"),
+                        ("prometheus", 9090, 9090, "LOOPBACK"),
+                        (
+                            "prometheus-exporter",
+                            9101,
+                            9101,
+                            "LOOPBACK",
+                        ),
+                        ("telnet_pit", 23, 23, "PUBLIC"),
+                    )
+                ],
+                "management_endpoints": [
+                    {
+                        "service": service,
+                        "port": port,
+                        "result": "READY",
+                    }
+                    for service, port in (
+                        ("cadvisor", 8081),
+                        ("grafana", 3000),
+                        ("prometheus", 9090),
+                        ("prometheus-exporter", 9101),
+                    )
+                ],
+                "workstation_ports": [
+                    {
+                        "port": port,
+                        "expected": expected,
+                        "observed": observed,
+                        "result": "PASS",
+                    }
+                    for port, expected, observed in (
+                        (23, "REACHABLE", "REACHABLE"),
+                        (1883, "REACHABLE", "REACHABLE"),
+                        (3000, "UNREACHABLE", "UNREACHABLE"),
+                        (8081, "UNREACHABLE", "UNREACHABLE"),
+                        (9090, "UNREACHABLE", "UNREACHABLE"),
+                        (9101, "UNREACHABLE", "UNREACHABLE"),
+                    )
+                ],
+                "cleanup": {
+                    "attempted": False,
+                    "succeeded": None,
+                },
+            }
+
+            class ReadyRuntime:
+                def verify(
+                    self,
+                    configuration: object,
+                    deployment_commit: str,
+                    policy: dict[str, object],
+                    deployment_manifest: dict[str, object],
+                    run_id: str,
+                ) -> object:
+                    class Verification:
+                        passed = True
+                        outcome = "PASS"
+                        blocker = None
+                        field_services_running = True
+                        evidence = health_and_ports
+                        observed_public_ports = (23, 1883)
+                        observed_private_ports = (3000, 8081, 9090, 9101)
+
+                    return Verification()
+
             result = run(
                 DeploymentRequest(
                     check_only=False,
@@ -2871,13 +3846,18 @@ class DeploymentControllerApiTests(unittest.TestCase):
                     remote=ReadyRemote(),
                     authorization=ApprovedAuthorization(),
                     deployment=ReadyDeployment(),
+                    runtime=ReadyRuntime(),
                 ),
             )
 
             checks = {check.check_id: check for check in result.checks}
             self.assertEqual(checks["exact_source_deployment"].status, "PASS")
             self.assertEqual(
-                checks["runtime_verification_foundation"].status,
+                checks["runtime_verification"].status,
+                "PASS",
+            )
+            self.assertEqual(
+                checks["deployment_smoke_foundation"].status,
                 "BLOCKER",
             )
             self.assertTrue(result.remote_mutation_occurred)
@@ -2903,6 +3883,27 @@ class DeploymentControllerApiTests(unittest.TestCase):
                     )
                 )["result"],
                 "PASS",
+            )
+            self.assertEqual(
+                json.loads(
+                    (run_directory / "health-and-ports.json").read_text(
+                        encoding="utf-8"
+                    )
+                ),
+                health_and_ports,
+            )
+            authorization = json.loads(
+                (run_directory / "authorization.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                authorization["observed_public_ports"],
+                [23, 1883],
+            )
+            self.assertEqual(
+                authorization["observed_private_ports"],
+                [3000, 8081, 9090, 9101],
             )
 
     def test_production_authorization_accepts_the_exact_tty_phrase(self) -> None:
@@ -3032,6 +4033,7 @@ class DeploymentControllerApiTests(unittest.TestCase):
         self.assertIsNotNone(adapters.trusted_ci)
         self.assertIsNotNone(adapters.remote)
         self.assertIsNotNone(adapters.deployment)
+        self.assertIsNotNone(adapters.runtime)
 
     def test_run_returns_a_deterministic_structured_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -3565,6 +4567,113 @@ print(json.dumps({
                 if check.check_id == "exact_source_deployment"
             )
             self.assertEqual(deployment_check.status, "BLOCKER")
+
+    def test_production_ssh_transport_runs_bounded_runtime_program(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            _, ssh_key = write_strict_target_configuration(
+                temporary_path
+            )
+            fake_ssh = temporary_path / "ssh"
+            fake_ssh.write_text(
+                """#!/usr/bin/env python3
+import base64
+import json
+import sys
+
+required = {
+    "BatchMode=yes",
+    "IdentitiesOnly=yes",
+    "StrictHostKeyChecking=yes",
+    "ConnectTimeout=10",
+}
+if not required.issubset(set(sys.argv)):
+    raise SystemExit(91)
+if sys.argv[-2] != "-" or sys.argv[-3] != "python3":
+    raise SystemExit(92)
+program = sys.stdin.buffer.read()
+if b"EventHorizon runtime health and binding evidence" not in program:
+    raise SystemExit(93)
+request = json.loads(base64.urlsafe_b64decode(sys.argv[-1]))
+if request["action"] == "VERIFY":
+    print(json.dumps({
+        "schema_version": 1,
+        "run_id": request["run_id"],
+        "target_alias": request["target_alias"],
+        "deployment_commit": request["deployment_commit"],
+        "result": "BLOCKED",
+    }))
+else:
+    if request["expected_image_ids"] != {}:
+        raise SystemExit(94)
+    print(json.dumps({
+        "schema_version": 1,
+        "action": "STOP",
+        "run_id": request["run_id"],
+        "target_alias": request["target_alias"],
+        "deployment_commit": request["deployment_commit"],
+        "result": "PASS",
+        "blocker": None,
+        "field_services_running": False,
+    }))
+""",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o700)
+            configuration = TargetConfiguration(
+                target_alias="field-host",
+                vps_host="198.51.100.10",
+                vps_user="deploy",
+                vps_ssh_port=22,
+                vps_ssh_key=ssh_key,
+                vps_deploy_dir="/srv/eventhorizon-field",
+                vps_project_name="eventhorizon-field",
+                admin_source_cidr="203.0.113.9/32",
+                field_tarpit_cpu_limit="0.50",
+                field_tarpit_memory_limit=None,
+            )
+            transport = SystemSshRuntimeTransport(
+                ssh_executable=fake_ssh,
+                runtime_program_path=(
+                    REPO_ROOT
+                    / "scripts/vps_field_remote_runtime.py"
+                ),
+            )
+            image_ids = {
+                service: "sha256:" + str(index) * 64
+                for index, service in enumerate(
+                    (
+                        "cadvisor",
+                        "grafana",
+                        "mqtt_pit",
+                        "prometheus",
+                        "prometheus-exporter",
+                        "telnet_pit",
+                    ),
+                    start=1,
+                )
+            }
+            run_id = "deploy-20260730T010203Z-a1b2c3"
+            commit = "1" * 40
+
+            inspected = transport.inspect(
+                configuration,
+                commit,
+                image_ids,
+                run_id,
+            )
+            self.assertEqual(inspected.returncode, 0)
+            self.assertEqual(
+                json.loads(inspected.stdout)["result"],
+                "BLOCKED",
+            )
+            self.assertTrue(
+                transport.stop(
+                    configuration,
+                    commit,
+                    run_id,
+                )
+            )
 
     def test_privacy_expanding_deployment_evidence_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

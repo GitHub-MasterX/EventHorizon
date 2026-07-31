@@ -48,6 +48,7 @@
     "deploy/schemas/deployment-policy.schema.json",
     "deploy/schemas/deployment-result.schema.json",
     "deploy/schemas/evidence-index.schema.json",
+    "deploy/schemas/health-and-ports.schema.json",
     "deploy/schemas/remote-preflight.schema.json",
     "deploy/vps-field.env.example",
     "docker-compose.ci.yml",
@@ -69,6 +70,7 @@
     "scripts/vps_field_remote_preflight.sh",
     "scripts/vps_field_remote_deploy.py",
     "scripts/vps_field_remote_probe.py",
+    "scripts/vps_field_remote_runtime.py",
     "scripts/vps_field_smoke_test.sh",
     "scripts/vps_field_verify_external.sh"
   ],
@@ -82,5 +84,6 @@
   "ci_proof_schema_version": 1,
   "remote_preflight_schema_version": 2,
   "compose_config_schema_version": 1,
-  "deployment_manifest_schema_version": 1
+  "deployment_manifest_schema_version": 1,
+  "health_and_ports_schema_version": 1
 }
