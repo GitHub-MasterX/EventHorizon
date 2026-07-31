@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import concurrent.futures
 import hashlib
 import ipaddress
@@ -19,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
@@ -48,7 +49,15 @@ EXPECTED_EVIDENCE = (
     "deployment-manifest.json",
     "health-and-ports.json",
     "protocol-smoke.json",
+    "remote-evidence-index.json",
     "diagnostics.json",
+)
+REMOTE_EVIDENCE_FILENAMES = (
+    "remote-preflight.json",
+    "compose-config.json",
+    "deployment-manifest.json",
+    "health-and-ports.json",
+    "protocol-smoke.json",
 )
 EXIT_CODES = {
     "PASS": 0,
@@ -126,6 +135,15 @@ class DeploymentSmokeVerification:
 
 
 @dataclass(frozen=True)
+class EvidenceRetrievalVerification:
+    passed: bool
+    outcome: str
+    blocker: str | None
+    field_services_running: bool
+    remote_index: dict[str, object]
+
+
+@dataclass(frozen=True)
 class RemoteProbeExecution:
     returncode: int
     stdout: bytes
@@ -148,6 +166,13 @@ class RemoteRuntimeExecution:
 
 @dataclass(frozen=True)
 class RemoteSmokeExecution:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+@dataclass(frozen=True)
+class RemoteEvidenceExecution:
     returncode: int
     stdout: bytes
     stderr: bytes
@@ -245,6 +270,26 @@ class DeploymentSmokeCapabilities(Protocol):
         """Run the deterministic external-path Telnet and MQTT smoke."""
 
 
+class EvidenceRetrievalCapabilities(Protocol):
+    def retrieve(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+        artifacts: dict[str, dict[str, object]],
+        run_id: str,
+    ) -> EvidenceRetrievalVerification:
+        """Retrieve and verify the final allowlisted remote evidence bundle."""
+
+    def cleanup(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        run_id: str,
+    ) -> bool:
+        """Stop exact field services when final local proof cannot be retained."""
+
+
 class RemoteProbeCapabilities(Protocol):
     def collect(
         self,
@@ -322,6 +367,26 @@ class SmokeRemoteTransportCapabilities(Protocol):
         run_id: str,
     ) -> bool:
         """Stop the exact managed field services after smoke does not pass."""
+
+
+class EvidenceRemoteTransportCapabilities(Protocol):
+    def retrieve(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+        artifacts: dict[str, dict[str, object]],
+        run_id: str,
+    ) -> RemoteEvidenceExecution:
+        """Finalize and retrieve one allowlisted remote evidence bundle."""
+
+    def stop(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        run_id: str,
+    ) -> bool:
+        """Stop the exact managed field services after retrieval fails."""
 
 
 class ProtocolSmokeClientCapabilities(Protocol):
@@ -1362,6 +1427,99 @@ class SystemSshSmokeTransport:
             run_id,
             "FINAL",
             baseline_scrape_utc,
+        )
+
+    def stop(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        run_id: str,
+    ) -> bool:
+        return self.cleanup.stop(configuration, commit, run_id)
+
+
+@dataclass(frozen=True)
+class SystemSshEvidenceTransport:
+    evidence_program_path: Path
+    cleanup: RuntimeRemoteTransportCapabilities
+    ssh_executable: str | Path = "ssh"
+    timeout_seconds: int = 120
+
+    def retrieve(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+        artifacts: dict[str, dict[str, object]],
+        run_id: str,
+    ) -> RemoteEvidenceExecution:
+        if set(artifacts) != set(REMOTE_EVIDENCE_FILENAMES):
+            raise OSError("final evidence artifact set is incomplete")
+        request = {
+            "schema_version": EVIDENCE_INDEX_SCHEMA_VERSION,
+            "run_id": run_id,
+            "target_alias": configuration.target_alias,
+            "deployment_commit": commit,
+            "deploy_dir": configuration.vps_deploy_dir,
+            "artifacts": [
+                {
+                    "filename": filename,
+                    "content_base64": base64.b64encode(
+                        _json_bytes(artifacts[filename])
+                    ).decode("ascii"),
+                }
+                for filename in (
+                    "remote-preflight.json",
+                    "health-and-ports.json",
+                    "protocol-smoke.json",
+                )
+            ],
+        }
+        encoded_request = base64.urlsafe_b64encode(
+            json.dumps(
+                request,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).decode("ascii")
+        program = self.evidence_program_path.read_bytes()
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "GIT_TERMINAL_PROMPT": "0",
+                "LC_ALL": "C",
+            }
+        )
+        completed = subprocess.run(
+            [
+                str(self.ssh_executable),
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-p",
+                str(configuration.vps_ssh_port),
+                "-i",
+                str(configuration.vps_ssh_key),
+                f"{configuration.vps_user}@{configuration.vps_host}",
+                "python3",
+                "-",
+                encoded_request,
+            ],
+            input=program,
+            capture_output=True,
+            check=False,
+            env=environment,
+            timeout=self.timeout_seconds,
+        )
+        return RemoteEvidenceExecution(
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
         )
 
     def stop(
@@ -3172,6 +3330,183 @@ class SshDeploymentSmoke:
 
 
 @dataclass(frozen=True)
+class SshEvidenceRetrieval:
+    transport: EvidenceRemoteTransportCapabilities
+
+    def cleanup(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        run_id: str,
+    ) -> bool:
+        return self.transport.stop(configuration, commit, run_id)
+
+    def _failed(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        run_id: str,
+        remote_index: dict[str, object] | None = None,
+    ) -> EvidenceRetrievalVerification:
+        try:
+            cleanup_succeeded = self.transport.stop(
+                configuration,
+                commit,
+                run_id,
+            )
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            cleanup_succeeded = False
+        blocker = (
+            "Final remote evidence retrieval or verification malfunctioned."
+            if cleanup_succeeded
+            else (
+                "Final evidence could not be proven and field-service cleanup "
+                "could not be proven."
+            )
+        )
+        return EvidenceRetrievalVerification(
+            passed=False,
+            outcome="ERROR",
+            blocker=blocker,
+            field_services_running=not cleanup_succeeded,
+            remote_index=remote_index or {},
+        )
+
+    def retrieve(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+        artifacts: dict[str, dict[str, object]],
+        run_id: str,
+    ) -> EvidenceRetrievalVerification:
+        if set(artifacts) != set(REMOTE_EVIDENCE_FILENAMES):
+            return self._failed(configuration, commit, run_id)
+        expected_payloads = {
+            filename: _json_bytes(document)
+            for filename, document in artifacts.items()
+        }
+        try:
+            execution = self.transport.retrieve(
+                configuration,
+                commit,
+                policy,
+                artifacts,
+                run_id,
+            )
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            return self._failed(configuration, commit, run_id)
+        if execution.returncode != 0 or len(execution.stdout) > 4 * 1024 * 1024:
+            return self._failed(configuration, commit, run_id)
+        try:
+            bundle = json.loads(execution.stdout.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError):
+            return self._failed(configuration, commit, run_id)
+        if (
+            not isinstance(bundle, dict)
+            or set(bundle)
+            != {
+                "schema_version",
+                "run_id",
+                "target_alias",
+                "deployment_commit",
+                "result",
+                "blocker",
+                "index",
+                "artifacts",
+            }
+            or bundle["schema_version"] != EVIDENCE_INDEX_SCHEMA_VERSION
+            or bundle["run_id"] != run_id
+            or bundle["target_alias"] != configuration.target_alias
+            or bundle["deployment_commit"] != commit
+            or bundle["result"] != "PASS"
+            or bundle["blocker"] is not None
+            or not isinstance(bundle["index"], dict)
+            or not isinstance(bundle["artifacts"], list)
+        ):
+            return self._failed(configuration, commit, run_id)
+        index = bundle["index"]
+        if (
+            set(index)
+            != {"schema_version", "run_id", "generated_utc", "artifacts"}
+            or index["schema_version"] != EVIDENCE_INDEX_SCHEMA_VERSION
+            or index["run_id"] != run_id
+            or not isinstance(index["generated_utc"], str)
+            or re.fullmatch(
+                r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+                r"[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+                index["generated_utc"],
+            )
+            is None
+            or _smoke_datetime(index["generated_utc"]) is None
+            or not isinstance(index["artifacts"], list)
+            or len(index["artifacts"]) != len(REMOTE_EVIDENCE_FILENAMES)
+        ):
+            return self._failed(configuration, commit, run_id)
+        indexed: dict[str, dict[str, object]] = {}
+        for entry in index["artifacts"]:
+            if (
+                not isinstance(entry, dict)
+                or set(entry)
+                != {
+                    "filename",
+                    "size_bytes",
+                    "sha256",
+                    "collection_status",
+                    "reason",
+                }
+                or entry["filename"] not in REMOTE_EVIDENCE_FILENAMES
+                or entry["filename"] in indexed
+                or type(entry["size_bytes"]) is not int
+                or entry["size_bytes"] < 0
+                or not isinstance(entry["sha256"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]) is None
+                or entry["collection_status"] != "COLLECTED"
+                or entry["reason"] is not None
+            ):
+                return self._failed(configuration, commit, run_id, index)
+            indexed[str(entry["filename"])] = entry
+        if set(indexed) != set(REMOTE_EVIDENCE_FILENAMES):
+            return self._failed(configuration, commit, run_id, index)
+        retrieved: dict[str, bytes] = {}
+        for entry in bundle["artifacts"]:
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != {"filename", "content_base64"}
+                or entry["filename"] not in REMOTE_EVIDENCE_FILENAMES
+                or entry["filename"] in retrieved
+                or not isinstance(entry["content_base64"], str)
+            ):
+                return self._failed(configuration, commit, run_id, index)
+            try:
+                content = base64.b64decode(
+                    entry["content_base64"],
+                    validate=True,
+                )
+            except (binascii.Error, ValueError):
+                return self._failed(configuration, commit, run_id, index)
+            retrieved[str(entry["filename"])] = content
+        if set(retrieved) != set(REMOTE_EVIDENCE_FILENAMES):
+            return self._failed(configuration, commit, run_id, index)
+        for filename, expected in expected_payloads.items():
+            content = retrieved[filename]
+            entry = indexed[filename]
+            if (
+                len(content) != entry["size_bytes"]
+                or hashlib.sha256(content).hexdigest() != entry["sha256"]
+                or content != expected
+            ):
+                return self._failed(configuration, commit, run_id, index)
+        return EvidenceRetrievalVerification(
+            passed=True,
+            outcome="PASS",
+            blocker=None,
+            field_services_running=True,
+            remote_index=index,
+        )
+
+
+@dataclass(frozen=True)
 class ControllerAdapters:
     clock: Clock
     randomness: RandomSource
@@ -3182,6 +3517,7 @@ class ControllerAdapters:
     deployment: DeploymentCapabilities | None = None
     runtime: RuntimeCapabilities | None = None
     smoke: DeploymentSmokeCapabilities | None = None
+    evidence: EvidenceRetrievalCapabilities | None = None
 
 
 @dataclass(frozen=True)
@@ -3860,6 +4196,7 @@ def run(
     field_services_running = False
     policy: dict[str, object] | None = None
     policy_sha256: str | None = None
+    target_configuration: TargetConfiguration | None = None
 
     try:
         policy, policy_sha256 = _load_policy()
@@ -4463,33 +4800,110 @@ def run(
                                                                             ),
                                                                         )
                                                                     )
-                                                                    next_action = (
-                                                                        "Implement final "
-                                                                        "allowlisted evidence "
-                                                                        "retrieval and "
-                                                                        "verification."
-                                                                    )
-                                                                    checks.append(
-                                                                        CheckResult(
-                                                                            check_id=(
-                                                                                "evidence_"
-                                                                                "retrieval_"
-                                                                                "foundation"
-                                                                            ),
-                                                                            phase=9,
-                                                                            status=(
-                                                                                "BLOCKER"
-                                                                            ),
-                                                                            summary=(
-                                                                                "Final evidence "
-                                                                                "retrieval remains "
-                                                                                "unimplemented."
-                                                                            ),
-                                                                            next_action=(
-                                                                                next_action
-                                                                            ),
+                                                                    if adapters.evidence is None:
+                                                                        next_action = (
+                                                                            "Implement final "
+                                                                            "allowlisted evidence "
+                                                                            "retrieval and "
+                                                                            "verification."
                                                                         )
-                                                                    )
+                                                                        checks.append(
+                                                                            CheckResult(
+                                                                                check_id=(
+                                                                                    "evidence_"
+                                                                                    "retrieval_"
+                                                                                    "foundation"
+                                                                                ),
+                                                                                phase=9,
+                                                                                status="BLOCKER",
+                                                                                summary=(
+                                                                                    "Final evidence "
+                                                                                    "retrieval remains "
+                                                                                    "unimplemented."
+                                                                                ),
+                                                                                next_action=next_action,
+                                                                            )
+                                                                        )
+                                                                    else:
+                                                                        final_artifacts = {
+                                                                            filename: json_artifacts[filename]
+                                                                            for filename in (
+                                                                                "remote-preflight.json",
+                                                                                "compose-config.json",
+                                                                                "deployment-manifest.json",
+                                                                                "health-and-ports.json",
+                                                                                "protocol-smoke.json",
+                                                                            )
+                                                                        }
+                                                                        retrieval = adapters.evidence.retrieve(
+                                                                            target_configuration,
+                                                                            commit,
+                                                                            policy,
+                                                                            final_artifacts,
+                                                                            run_id,
+                                                                        )
+                                                                        field_services_running = (
+                                                                            retrieval.field_services_running
+                                                                        )
+                                                                        if retrieval.remote_index:
+                                                                            json_artifacts[
+                                                                                "remote-evidence-index.json"
+                                                                            ] = retrieval.remote_index
+                                                                        if retrieval.passed:
+                                                                            highest_state = (
+                                                                                "ENVIRONMENT_VALIDATED"
+                                                                            )
+                                                                            outcome = "PASS"
+                                                                            next_action = (
+                                                                                "Retain the verified evidence "
+                                                                                "bundle and keep the field "
+                                                                                "services in restricted "
+                                                                                "validation posture."
+                                                                            )
+                                                                            checks.append(
+                                                                                CheckResult(
+                                                                                    check_id=(
+                                                                                        "evidence_retrieval"
+                                                                                    ),
+                                                                                    phase=9,
+                                                                                    status="PASS",
+                                                                                    summary=(
+                                                                                        "Final remote evidence "
+                                                                                        "was retrieved and "
+                                                                                        "verified locally."
+                                                                                    ),
+                                                                                )
+                                                                            )
+                                                                        else:
+                                                                            outcome = retrieval.outcome
+                                                                            next_action = (
+                                                                                retrieval.blocker
+                                                                                or (
+                                                                                    "Resolve final evidence "
+                                                                                    "retrieval and retry."
+                                                                                )
+                                                                            )
+                                                                            retrieval_status = {
+                                                                                "FAIL": "FAIL",
+                                                                                "INCONCLUSIVE": "INCONCLUSIVE",
+                                                                            }.get(
+                                                                                retrieval.outcome,
+                                                                                "ERROR",
+                                                                            )
+                                                                            checks.append(
+                                                                                CheckResult(
+                                                                                    check_id=(
+                                                                                        "evidence_retrieval"
+                                                                                    ),
+                                                                                    phase=9,
+                                                                                    status=retrieval_status,
+                                                                                    summary=(
+                                                                                        "Final remote evidence "
+                                                                                        "could not be proven."
+                                                                                    ),
+                                                                                    next_action=next_action,
+                                                                                )
+                                                                            )
                                                                 else:
                                                                     if smoke.outcome in {
                                                                         "FAIL",
@@ -4653,6 +5067,8 @@ def run(
         evidence["health_and_ports"] = "health-and-ports.json"
     if "protocol-smoke.json" in json_artifacts:
         evidence["protocol_smoke"] = "protocol-smoke.json"
+    if "remote-evidence-index.json" in json_artifacts:
+        evidence["remote_evidence_index"] = "remote-evidence-index.json"
     result = DeploymentResult(
         schema_version=RESULT_SCHEMA_VERSION,
         run_id=run_id,
@@ -4677,7 +5093,52 @@ def run(
             json_artifacts=json_artifacts,
         )
     except EvidenceError as error:
-        error.result = result
+        failed_result = result
+        if (
+            result.highest_state == "ENVIRONMENT_VALIDATED"
+            and adapters.evidence is not None
+            and target_configuration is not None
+            and request.commit is not None
+        ):
+            try:
+                cleanup_succeeded = adapters.evidence.cleanup(
+                    target_configuration,
+                    request.commit,
+                    run_id,
+                )
+            except (OSError, subprocess.SubprocessError, TimeoutError):
+                cleanup_succeeded = False
+            evidence_checks = (
+                *result.checks,
+                CheckResult(
+                    check_id="evidence_persistence",
+                    phase=9,
+                    status="ERROR",
+                    summary="Final local evidence could not be retained.",
+                    next_action=(
+                        "Restore safe evidence storage before retrying the "
+                        "exact deployment."
+                    ),
+                ),
+            )
+            failed_result = replace(
+                result,
+                highest_state="CI_VALIDATED",
+                outcome="ERROR",
+                exit_code=EXIT_CODES["ERROR"],
+                field_services_running=not cleanup_succeeded,
+                checks=evidence_checks,
+                next_action=(
+                    "Restore safe evidence storage and inspect the authorized "
+                    "VPS before retrying."
+                    if not cleanup_succeeded
+                    else (
+                        "Restore safe evidence storage before retrying the exact "
+                        "deployment."
+                    )
+                ),
+            )
+        error.result = failed_result
         raise
     return result
 
@@ -4698,7 +5159,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "After non-mutating preflight, deployment requires an interactive "
             "TTY and the exact phrase:\n"
             "  AUTHORIZE DEPLOY <full-SHA> TO <target-alias>\n"
-            "Redirected input cannot authorize deployment."
+            "Redirected input cannot authorize deployment.\n\n"
+            "A full run verifies policy, candidate and CI proof, target data, "
+            "remote preflight, authorization, exact-source deployment, runtime "
+            "and ports, deterministic smoke, and final evidence retrieval.\n"
+            "Only all nine phases passing reports ENVIRONMENT_VALIDATED."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -4810,6 +5275,14 @@ def production_adapters(
             ),
             clients=SystemProtocolSmokeClients(),
             clock=SystemClock(),
+        ),
+        evidence=SshEvidenceRetrieval(
+            SystemSshEvidenceTransport(
+                evidence_program_path=(
+                    REPO_ROOT / "scripts/vps_field_remote_evidence.py"
+                ),
+                cleanup=runtime_transport,
+            )
         ),
     )
 

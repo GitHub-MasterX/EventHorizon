@@ -70,6 +70,7 @@
     "scripts/vps_field_deploy.sh",
     "scripts/vps_field_remote_preflight.sh",
     "scripts/vps_field_remote_deploy.py",
+    "scripts/vps_field_remote_evidence.py",
     "scripts/vps_field_remote_probe.py",
     "scripts/vps_field_remote_runtime.py",
     "scripts/vps_field_remote_smoke.py",

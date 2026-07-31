@@ -28,15 +28,18 @@ from scripts.deployment_controller import (
     ControllerAdapters,
     DeploymentRequest,
     DeploymentResult,
+    EvidenceRetrievalVerification,
     EvidenceError,
     GitHubApiError,
     LocalGitRepository,
     RemoteDeploymentExecution,
     RemoteDeploymentVerification,
+    RemoteEvidenceExecution,
     RemoteProbeExecution,
     RemotePreflightVerification,
     RemoteRuntimeExecution,
     SshExactSourceDeployment,
+    SshEvidenceRetrieval,
     SshRemotePreflight,
     SshRuntimeVerification,
     SystemSshDeploymentTransport,
@@ -131,6 +134,10 @@ class DeploymentContractArtifactTests(unittest.TestCase):
         )
         self.assertIn(
             "scripts/vps_field_remote_smoke.py",
+            policy["protected_paths"],
+        )
+        self.assertIn(
+            "scripts/vps_field_remote_evidence.py",
             policy["protected_paths"],
         )
         self.assertIn(".github/workflows/ci.yml", policy["protected_paths"])
@@ -1065,6 +1072,33 @@ class DeploymentOperatorCliTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0)
             self.assertIn(
                 "usage: vps_field_remote_runtime.py <encoded-request>",
+                completed.stdout,
+            )
+            self.assertEqual(completed.stderr, "")
+            self.assertEqual(list(temporary_path.iterdir()), [])
+
+    def test_internal_remote_evidence_help_is_side_effect_free(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        REPO_ROOT
+                        / "scripts/vps_field_remote_evidence.py"
+                    ),
+                    "--help",
+                ],
+                cwd=temporary_path,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0)
+            self.assertIn(
+                "usage: vps_field_remote_evidence.py <encoded-request>",
                 completed.stdout,
             )
             self.assertEqual(completed.stderr, "")
@@ -3121,6 +3155,198 @@ else:
             )
 
 
+class RemoteEvidenceProgramIntegrationTests(unittest.TestCase):
+    def test_remote_finalizer_persists_and_returns_only_allowlisted_evidence(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            deploy_dir = Path(temporary_directory) / "authorized" / "field"
+            deploy_dir.mkdir(parents=True)
+            (deploy_dir / ".gitignore").write_text(
+                "validation-output/\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "init", "--quiet", str(deploy_dir)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(deploy_dir), "add", ".gitignore"],
+                check=True,
+            )
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(deploy_dir),
+                    "-c",
+                    "user.name=EventHorizon Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "fixture",
+                ],
+                check=True,
+            )
+            commit = subprocess.run(
+                ["git", "-C", str(deploy_dir), "rev-parse", "HEAD"],
+                check=True,
+                text=True,
+                capture_output=True,
+            ).stdout.strip()
+            run_id = "deploy-20260730T010203Z-a1b2c3"
+            run_directory = (
+                deploy_dir / "validation-output" / "deployments" / run_id
+            )
+            run_directory.mkdir(parents=True, mode=0o700)
+            for evidence_directory in (
+                deploy_dir / "validation-output",
+                deploy_dir / "validation-output" / "deployments",
+                run_directory,
+            ):
+                evidence_directory.chmod(0o700)
+            existing = {
+                "compose-config.json": {
+                    "schema_version": 1,
+                    "deployment_commit": commit,
+                },
+                "deployment-manifest.json": {
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "target_alias": "field-host",
+                    "deployment_commit": commit,
+                    "result": "PASS",
+                },
+            }
+            incoming = {
+                "remote-preflight.json": {
+                    "schema_version": 2,
+                    "target_alias": "field-host",
+                    "deployment_commit": commit,
+                    "result": "PASS",
+                },
+                "health-and-ports.json": {
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "target_alias": "field-host",
+                    "deployment_commit": commit,
+                    "result": "PASS",
+                },
+                "protocol-smoke.json": {
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "target_alias": "field-host",
+                    "deployment_commit": commit,
+                    "result": "PASS",
+                },
+            }
+            for filename, document in existing.items():
+                path = run_directory / filename
+                path.write_text(
+                    json.dumps(document, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                path.chmod(0o600)
+            request = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "target_alias": "field-host",
+                "deployment_commit": commit,
+                "deploy_dir": str(deploy_dir),
+                "artifacts": [
+                    {
+                        "filename": filename,
+                        "content_base64": base64.b64encode(
+                            (
+                                json.dumps(document, indent=2, sort_keys=True)
+                                + "\n"
+                            ).encode("utf-8")
+                        ).decode("ascii"),
+                    }
+                    for filename, document in incoming.items()
+                ],
+            }
+            encoded_request = base64.urlsafe_b64encode(
+                json.dumps(
+                    request,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).decode("ascii")
+
+            outside_index = Path(temporary_directory) / "outside-index.json"
+            outside_index.write_text("preserve me\n", encoding="utf-8")
+            remote_index_path = run_directory / "evidence-index.json"
+            remote_index_path.symlink_to(outside_index)
+            symlinked = subprocess.run(
+                [
+                    "python3",
+                    str(REPO_ROOT / "scripts/vps_field_remote_evidence.py"),
+                    encoded_request,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(symlinked.returncode, 0, symlinked.stderr)
+            self.assertEqual(json.loads(symlinked.stdout)["result"], "ERROR")
+            self.assertTrue(remote_index_path.is_symlink())
+            self.assertEqual(
+                outside_index.read_text(encoding="utf-8"),
+                "preserve me\n",
+            )
+            self.assertFalse(
+                any((run_directory / filename).exists() for filename in incoming)
+            )
+            remote_index_path.unlink()
+
+            completed = subprocess.run(
+                [
+                    "python3",
+                    str(REPO_ROOT / "scripts/vps_field_remote_evidence.py"),
+                    encoded_request,
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            bundle = json.loads(completed.stdout)
+            self.assertEqual(bundle["result"], "PASS", bundle)
+            self.assertEqual(
+                {item["filename"] for item in bundle["artifacts"]},
+                set(existing) | set(incoming),
+            )
+            schema = json.loads(
+                (
+                    REPO_ROOT / "deploy/schemas/evidence-index.schema.json"
+                ).read_text(encoding="utf-8")
+            )
+            Draft202012Validator(
+                schema,
+                format_checker=Draft202012Validator.FORMAT_CHECKER,
+            ).validate(bundle["index"])
+            for filename, document in incoming.items():
+                path = run_directory / filename
+                self.assertEqual(
+                    json.loads(path.read_text(encoding="utf-8")),
+                    document,
+                )
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(
+                stat.S_IMODE(
+                    (run_directory / "evidence-index.json").stat().st_mode
+                ),
+                0o600,
+            )
+
+
 class RemoteRuntimeProgramIntegrationTests(unittest.TestCase):
     def test_exact_runtime_is_healthy_and_uses_supported_bindings(
         self,
@@ -3722,6 +3948,217 @@ class InteractiveTextStream(io.StringIO):
 
 
 class DeploymentControllerApiTests(unittest.TestCase):
+    def test_retrieved_remote_index_rejects_noncanonical_timestamp(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            configuration = TargetConfiguration(
+                target_alias="field-host",
+                vps_host="198.51.100.10",
+                vps_user="deploy",
+                vps_ssh_port=22,
+                vps_ssh_key=Path(temporary_directory) / "operator_key",
+                vps_deploy_dir="/srv/eventhorizon-field",
+                vps_project_name="eventhorizon-field",
+                admin_source_cidr="203.0.113.9/32",
+                field_tarpit_cpu_limit="0.50",
+                field_tarpit_memory_limit=None,
+            )
+            commit = "1" * 40
+            run_id = "deploy-20260730T010203Z-a1b2c3"
+            artifacts = {
+                filename: {} for filename in (
+                    "remote-preflight.json",
+                    "compose-config.json",
+                    "deployment-manifest.json",
+                    "health-and-ports.json",
+                    "protocol-smoke.json",
+                )
+            }
+            content = b"{}\n"
+            index = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "generated_utc": "2026-07-30T01:02:03+00:00",
+                "artifacts": [
+                    {
+                        "filename": filename,
+                        "size_bytes": len(content),
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                        "collection_status": "COLLECTED",
+                        "reason": None,
+                    }
+                    for filename in artifacts
+                ],
+            }
+            bundle = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "target_alias": "field-host",
+                "deployment_commit": commit,
+                "result": "PASS",
+                "blocker": None,
+                "index": index,
+                "artifacts": [
+                    {
+                        "filename": filename,
+                        "content_base64": base64.b64encode(content).decode(
+                            "ascii"
+                        ),
+                    }
+                    for filename in artifacts
+                ],
+            }
+
+            class NoncanonicalIndexTransport:
+                def retrieve(self, *arguments: object) -> RemoteEvidenceExecution:
+                    return RemoteEvidenceExecution(
+                        returncode=0,
+                        stdout=json.dumps(bundle).encode("utf-8"),
+                        stderr=b"",
+                    )
+
+                def stop(self, *arguments: object) -> bool:
+                    return True
+
+            verification = SshEvidenceRetrieval(
+                NoncanonicalIndexTransport()
+            ).retrieve(configuration, commit, {}, artifacts, run_id)
+
+            self.assertFalse(verification.passed)
+            self.assertEqual(verification.outcome, "ERROR")
+            self.assertFalse(verification.field_services_running)
+
+    def test_exact_remote_bundle_is_verified_before_evidence_passes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            configuration = TargetConfiguration(
+                target_alias="field-host",
+                vps_host="198.51.100.10",
+                vps_user="deploy",
+                vps_ssh_port=22,
+                vps_ssh_key=temporary_path / "operator_key",
+                vps_deploy_dir="/srv/eventhorizon-field",
+                vps_project_name="eventhorizon-field",
+                admin_source_cidr="203.0.113.9/32",
+                field_tarpit_cpu_limit="0.50",
+                field_tarpit_memory_limit=None,
+            )
+            commit = "1" * 40
+            run_id = "deploy-20260730T010203Z-a1b2c3"
+            artifacts = {
+                "remote-preflight.json": {
+                    "schema_version": 2,
+                    "target_alias": "field-host",
+                    "deployment_commit": commit,
+                    "result": "PASS",
+                },
+                "compose-config.json": {
+                    "schema_version": 1,
+                    "deployment_commit": commit,
+                },
+                "deployment-manifest.json": {
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "target_alias": "field-host",
+                    "deployment_commit": commit,
+                    "result": "PASS",
+                },
+                "health-and-ports.json": {
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "target_alias": "field-host",
+                    "deployment_commit": commit,
+                    "result": "PASS",
+                },
+                "protocol-smoke.json": {
+                    "schema_version": 1,
+                    "run_id": run_id,
+                    "target_alias": "field-host",
+                    "deployment_commit": commit,
+                    "result": "PASS",
+                },
+            }
+            payloads = {
+                filename: (
+                    json.dumps(document, indent=2, sort_keys=True) + "\n"
+                ).encode("utf-8")
+                for filename, document in artifacts.items()
+            }
+            remote_index = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "generated_utc": "2026-07-30T01:02:03Z",
+                "artifacts": [
+                    {
+                        "filename": filename,
+                        "size_bytes": len(content),
+                        "sha256": hashlib.sha256(content).hexdigest(),
+                        "collection_status": "COLLECTED",
+                        "reason": None,
+                    }
+                    for filename, content in payloads.items()
+                ],
+            }
+            bundle = {
+                "schema_version": 1,
+                "run_id": run_id,
+                "target_alias": "field-host",
+                "deployment_commit": commit,
+                "result": "PASS",
+                "blocker": None,
+                "index": remote_index,
+                "artifacts": [
+                    {
+                        "filename": filename,
+                        "content_base64": base64.b64encode(content).decode(
+                            "ascii"
+                        ),
+                    }
+                    for filename, content in payloads.items()
+                ],
+            }
+
+            class ExactBundleTransport:
+                def retrieve(
+                    self,
+                    target: object,
+                    deployment_commit: str,
+                    policy: dict[str, object],
+                    documents: dict[str, dict[str, object]],
+                    requested_run_id: str,
+                ) -> RemoteEvidenceExecution:
+                    return RemoteEvidenceExecution(
+                        returncode=0,
+                        stdout=json.dumps(bundle).encode("utf-8"),
+                        stderr=b"",
+                    )
+
+                def stop(
+                    self,
+                    target: object,
+                    deployment_commit: str,
+                    requested_run_id: str,
+                ) -> bool:
+                    return True
+
+            verification = SshEvidenceRetrieval(
+                ExactBundleTransport()
+            ).retrieve(
+                configuration,
+                commit,
+                {},
+                artifacts,
+                run_id,
+            )
+
+            self.assertTrue(verification.passed)
+            self.assertEqual(verification.outcome, "PASS")
+            self.assertTrue(verification.field_services_running)
+            self.assertEqual(verification.remote_index, remote_index)
+
     def test_deployment_smoke_accepts_exact_depth_two_reconciliation(
         self,
     ) -> None:
@@ -4745,7 +5182,7 @@ class DeploymentControllerApiTests(unittest.TestCase):
             format_checker=Draft202012Validator.FORMAT_CHECKER,
         ).validate(verification.evidence)
 
-    def test_evidence_write_failure_preserves_proven_remote_state(
+    def test_final_local_evidence_write_failure_revokes_environment_validation(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -4755,7 +5192,7 @@ class DeploymentControllerApiTests(unittest.TestCase):
             )
             output_directory = temporary_path / "evidence"
 
-            class WriteBreakingDeployment:
+            class ReadyDeployment:
                 def deploy(
                     self,
                     configuration: object,
@@ -4764,19 +5201,69 @@ class DeploymentControllerApiTests(unittest.TestCase):
                     preflight: dict[str, object],
                     run_id: str,
                 ) -> RemoteDeploymentVerification:
-                    run_directory = (
-                        output_directory / "deployments" / run_id
-                    )
-                    run_directory.chmod(0o500)
                     return RemoteDeploymentVerification(
                         passed=True,
                         outcome="PASS",
                         blocker=None,
                         remote_mutation_occurred=True,
                         field_services_running=True,
-                        compose_config={},
-                        deployment_manifest={},
+                        compose_config={"deployment_commit": deployment_commit},
+                        deployment_manifest={
+                            "run_id": run_id,
+                            "deployment_commit": deployment_commit,
+                        },
                     )
+
+            class ReadyRuntime:
+                def verify(self, *arguments: object) -> object:
+                    class Verification:
+                        passed = True
+                        outcome = "PASS"
+                        blocker = None
+                        field_services_running = True
+                        evidence = {"result": "PASS"}
+                        observed_public_ports = (23, 1883)
+                        observed_private_ports = (3000, 8081, 9090, 9101)
+
+                    return Verification()
+
+            class ReadySmoke:
+                def verify(self, *arguments: object) -> object:
+                    class Verification:
+                        passed = True
+                        outcome = "PASS"
+                        blocker = None
+                        field_services_running = True
+                        evidence = {"result": "PASS"}
+
+                    return Verification()
+
+            class WriteBreakingEvidence:
+                def retrieve(
+                    self,
+                    configuration: object,
+                    deployment_commit: str,
+                    policy: dict[str, object],
+                    artifacts: dict[str, dict[str, object]],
+                    run_id: str,
+                ) -> EvidenceRetrievalVerification:
+                    run_directory = output_directory / "deployments" / run_id
+                    run_directory.chmod(0o500)
+                    return EvidenceRetrievalVerification(
+                        passed=True,
+                        outcome="PASS",
+                        blocker=None,
+                        field_services_running=True,
+                        remote_index={"run_id": run_id},
+                    )
+
+                def cleanup(
+                    self,
+                    configuration: object,
+                    deployment_commit: str,
+                    run_id: str,
+                ) -> bool:
+                    return True
 
             try:
                 with self.assertRaises(EvidenceError) as caught:
@@ -4794,27 +5281,30 @@ class DeploymentControllerApiTests(unittest.TestCase):
                             trusted_ci=ProvenTrustedCi(),
                             remote=ReadyRemote(),
                             authorization=ApprovedAuthorization(),
-                            deployment=WriteBreakingDeployment(),
+                            deployment=ReadyDeployment(),
+                            runtime=ReadyRuntime(),
+                            smoke=ReadySmoke(),
+                            evidence=WriteBreakingEvidence(),
                         ),
                     )
                 self.assertIsNotNone(caught.exception.result)
                 self.assertTrue(
                     caught.exception.result.remote_mutation_occurred
                 )
-                self.assertTrue(
-                    caught.exception.result.field_services_running
-                )
+                self.assertFalse(caught.exception.result.field_services_running)
                 self.assertEqual(
                     caught.exception.result.highest_state,
                     "CI_VALIDATED",
                 )
+                self.assertEqual(caught.exception.result.outcome, "ERROR")
+                self.assertEqual(caught.exception.result.exit_code, 5)
             finally:
                 deployments = output_directory / "deployments"
                 if deployments.is_dir():
                     for run_directory in deployments.iterdir():
                         run_directory.chmod(0o700)
 
-    def test_successful_deployment_smoke_advances_to_evidence_retrieval(
+    def test_verified_retrieved_evidence_proves_environment_validation(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -4975,6 +5465,31 @@ class DeploymentControllerApiTests(unittest.TestCase):
 
                     return Verification()
 
+            class ReadyEvidence:
+                def retrieve(
+                    self,
+                    configuration: object,
+                    deployment_commit: str,
+                    policy: dict[str, object],
+                    artifacts: dict[str, dict[str, object]],
+                    run_id: str,
+                ) -> EvidenceRetrievalVerification:
+                    self.artifacts = artifacts
+                    return EvidenceRetrievalVerification(
+                        passed=True,
+                        outcome="PASS",
+                        blocker=None,
+                        field_services_running=True,
+                        remote_index={
+                            "schema_version": 1,
+                            "run_id": run_id,
+                            "generated_utc": "2026-07-30T01:02:03Z",
+                            "artifacts": [],
+                        },
+                    )
+
+            ready_evidence = ReadyEvidence()
+
             result = run(
                 DeploymentRequest(
                     check_only=False,
@@ -4992,6 +5507,7 @@ class DeploymentControllerApiTests(unittest.TestCase):
                     deployment=ReadyDeployment(),
                     runtime=ReadyRuntime(),
                     smoke=ReadySmoke(),
+                    evidence=ready_evidence,
                 ),
             )
 
@@ -5006,13 +5522,24 @@ class DeploymentControllerApiTests(unittest.TestCase):
                 "PASS",
             )
             self.assertEqual(
-                checks["evidence_retrieval_foundation"].status,
-                "BLOCKER",
+                checks["evidence_retrieval"].status,
+                "PASS",
             )
             self.assertTrue(result.remote_mutation_occurred)
             self.assertTrue(result.field_services_running)
-            self.assertEqual(result.highest_state, "CI_VALIDATED")
-            self.assertEqual(result.outcome, "BLOCKED")
+            self.assertEqual(result.highest_state, "ENVIRONMENT_VALIDATED")
+            self.assertEqual(result.outcome, "PASS")
+            self.assertEqual(result.exit_code, 0)
+            self.assertEqual(
+                set(ready_evidence.artifacts),
+                {
+                    "remote-preflight.json",
+                    "compose-config.json",
+                    "deployment-manifest.json",
+                    "health-and-ports.json",
+                    "protocol-smoke.json",
+                },
+            )
 
             run_directory = (
                 output_directory / "deployments" / result.run_id
@@ -5048,6 +5575,14 @@ class DeploymentControllerApiTests(unittest.TestCase):
                     )
                 ),
                 protocol_smoke,
+            )
+            self.assertEqual(
+                json.loads(
+                    (run_directory / "remote-evidence-index.json").read_text(
+                        encoding="utf-8"
+                    )
+                )["run_id"],
+                result.run_id,
             )
             authorization = json.loads(
                 (run_directory / "authorization.json").read_text(
@@ -5192,6 +5727,7 @@ class DeploymentControllerApiTests(unittest.TestCase):
         self.assertIsNotNone(adapters.deployment)
         self.assertIsNotNone(adapters.runtime)
         self.assertIsNotNone(adapters.smoke)
+        self.assertIsNotNone(adapters.evidence)
 
     def test_run_returns_a_deterministic_structured_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

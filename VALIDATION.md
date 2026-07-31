@@ -249,11 +249,36 @@ Window C: controlled 1,000-session validation
 Window D: unsolicited public observation
 ```
 
-The repository provides `scripts/vps_field_*.sh` helpers for an authorized VPS
-deployment. Deployment requires a clean reviewed working tree, an explicit
-commit, and an exact checkout of that commit on the remote host.
+The supported path is the public deployment controller. It accepts a full SHA
+that is reachable from the trusted `GSoC_2026` branch and has a successful exact
+push-workflow proof. Local `HEAD` does not need to equal that SHA. Protected
+controller files must be byte-identical to the deployment commit; unrelated
+untracked files produce a warning and are never deployed.
 
-Run external port verification as a separate window before the smoke test:
+```bash
+DEPLOY_COMMIT=<full-40-character-sha>
+
+./scripts/vps_field_deploy.sh \
+  --check-only \
+  --commit "$DEPLOY_COMMIT"
+
+./scripts/vps_field_deploy.sh \
+  --commit "$DEPLOY_COMMIT" \
+  --env-file deploy/vps-field.env
+```
+
+The full invocation uses a fixed nine-phase sequence: policy, candidate and CI
+proof, strict target data, remote preflight, interactive authorization,
+exact-source deployment, runtime and port verification, deterministic Telnet
+and MQTT smoke, then final evidence retrieval and verification. Only all nine
+passing proves `ENVIRONMENT_VALIDATED`. Retrieval, hash, schema, or final local
+evidence-write errors leave the highest proven state at `CI_VALIDATED` and
+trigger an exact-service stop attempt while preserving volumes, images, and
+partial evidence.
+
+The public controller performs external reachability and deterministic smoke in
+separate settled windows. The lower-level commands remain advanced diagnostics;
+if used manually, keep their windows separate:
 
 ```bash
 ./scripts/vps_field_verify_external.sh
@@ -288,7 +313,16 @@ nonzero, or lifecycle/depth reconciliation has not settled.
 
 Only TCP 23 and 1883 are intended to be public for the field scope. Grafana 3000,
 Prometheus 9090, exporter 9101, and cAdvisor 8081 must remain on `127.0.0.1`.
-Verify from an independent external host.
+The controller proves reachability only as observed from the operator
+workstation; it does not prove provider firewall posture from every network.
+
+Each invocation retains an immutable mode-0700 run directory under
+`validation-output/deployments/<run-id>/`. `evidence-index.json` hashes the
+complete local allowlist. `remote-evidence-index.json` is the retrieved VPS
+manifest for the remote-preflight, Compose configuration, deployment manifest,
+health-and-port, and protocol-smoke artifacts. The controller verifies every
+remote size, SHA-256 digest, schema identity, and exact artifact byte sequence
+before reporting `ENVIRONMENT_VALIDATED`.
 
 ## 10. Expected Invariants
 
