@@ -1222,7 +1222,13 @@ elif tool == "docker":
         print("29.5.2")
     elif arguments == ["compose", "version", "--short"]:
         print("5.1.4")
-    elif arguments == ["compose", "ls", "--format", "json"]:
+    elif arguments == [
+        "compose",
+        "ls",
+        "--all",
+        "--format",
+        "json",
+    ]:
         print("[]")
     elif arguments[:3] == ["ps", "-a", "--format"]:
         pass
@@ -1344,7 +1350,7 @@ else:
             )
             self.assertEqual(directory_check["status"], "BLOCKER")
 
-    def test_reconciled_eventhorizon_project_is_managed_redeployment(
+    def test_reconciled_stopped_project_is_managed_redeployment(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1437,6 +1443,8 @@ elif tool == "docker":
     elif arguments == ["compose", "version", "--short"]:
         print("5.1.4")
     elif arguments == ["compose", "ls", "--format", "json"]:
+        print("[]")
+    elif arguments == ["compose", "ls", "--all", "--format", "json"]:
         print(json.dumps([{"Name": "eventhorizon-field"}]))
     elif arguments[:3] == ["ps", "-a", "--format"]:
         rows = [
@@ -1468,7 +1476,10 @@ elif tool == "docker":
 elif tool == "curl":
     print("curl 8.5.0")
 elif tool == "ss":
-    if arguments != ["--version"]:
+    if (
+        arguments != ["--version"]
+        and os.environ.get("FAKE_STOPPED_PROJECT") != "1"
+    ):
         for port in (23, 1883, 3000, 8081, 9090, 9101):
             missing_port = {
                 "telnet_pit": 23,
@@ -1515,6 +1526,7 @@ else:
             environment["PATH"] = (
                 str(tools) + os.pathsep + environment["PATH"]
             )
+            environment["FAKE_STOPPED_PROJECT"] = "1"
 
             completed = subprocess.run(
                 [

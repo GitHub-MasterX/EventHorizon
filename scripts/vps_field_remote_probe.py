@@ -431,7 +431,14 @@ def _collect(request: dict[str, Any]) -> dict[str, object]:
                 (fields[0], fields[1], fields[2], fields[3])
             )
 
-    projects = _command("docker", "compose", "ls", "--format", "json")
+    projects = _command(
+        "docker",
+        "compose",
+        "ls",
+        "--all",
+        "--format",
+        "json",
+    )
     try:
         project_documents = (
             json.loads(projects.stdout) if projects.returncode == 0 else None
