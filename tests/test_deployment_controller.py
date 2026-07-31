@@ -122,7 +122,7 @@ class DeploymentContractArtifactTests(unittest.TestCase):
             "deploy/schemas/remote-preflight.schema.json",
             policy["protected_paths"],
         )
-        self.assertEqual(policy["remote_preflight_schema_version"], 1)
+        self.assertEqual(policy["remote_preflight_schema_version"], 2)
         self.assertEqual(policy["compose_config_schema_version"], 1)
         self.assertEqual(policy["deployment_manifest_schema_version"], 1)
 
@@ -433,11 +433,14 @@ class DeploymentContractArtifactTests(unittest.TestCase):
             ).read_text(encoding="utf-8")
         )
         evidence = {
-            "schema_version": 1,
+            "schema_version": 2,
             "target_alias": "field-host",
             "deployment_commit": "1" * 40,
             "checked_utc": "2026-07-30T01:02:03Z",
             "starting_state": "INITIAL_DEPLOYMENT",
+            "managed_checkout_commit": None,
+            "prior_evidence_commit": None,
+            "interrupted_redeployment": False,
             "result": "PASS",
             "checks": [
                 {
@@ -453,10 +456,25 @@ class DeploymentContractArtifactTests(unittest.TestCase):
         )
 
         validator.validate(evidence)
+        managed_evidence = dict(
+            evidence,
+            starting_state="MANAGED_REDEPLOYMENT",
+            managed_checkout_commit="2" * 40,
+            prior_evidence_commit="1" * 40,
+            interrupted_redeployment=True,
+        )
+        validator.validate(managed_evidence)
+        with self.assertRaises(ValidationError):
+            validator.validate(
+                dict(
+                    managed_evidence,
+                    managed_checkout_commit=None,
+                )
+            )
         with self.assertRaises(ValidationError):
             validator.validate(dict(evidence, vps_host="198.51.100.10"))
         with self.assertRaises(ValidationError):
-            validator.validate(dict(evidence, schema_version=2))
+            validator.validate(dict(evidence, schema_version=1))
 
     def test_target_configuration_example_contains_only_strict_keys(self) -> None:
         entries = {}
@@ -964,7 +982,7 @@ else:
                 (tools / tool_name).symlink_to(dispatcher)
 
             request = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "target_alias": "field-host",
                 "deployment_commit": "1" * 40,
                 "deploy_dir": str(temporary_path / "eventhorizon-field"),
@@ -1075,7 +1093,7 @@ else:
                 (tools / tool_name).symlink_to(dispatcher)
 
             request = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "target_alias": "field-host",
                 "deployment_commit": "1" * 40,
                 "deploy_dir": str(temporary_path / "eventhorizon-field"),
@@ -1115,6 +1133,9 @@ else:
                 evidence["starting_state"],
                 "INITIAL_DEPLOYMENT",
             )
+            self.assertIsNone(evidence["managed_checkout_commit"])
+            self.assertIsNone(evidence["prior_evidence_commit"])
+            self.assertFalse(evidence["interrupted_redeployment"])
             schema = json.loads(
                 (
                     REPO_ROOT
@@ -1309,7 +1330,7 @@ else:
                 (tools / tool_name).symlink_to(dispatcher)
 
             request = {
-                "schema_version": 1,
+                "schema_version": 2,
                 "target_alias": "field-host",
                 "deployment_commit": "1" * 40,
                 "deploy_dir": str(deploy_dir),
@@ -1349,8 +1370,122 @@ else:
                 evidence["starting_state"],
                 "MANAGED_REDEPLOYMENT",
             )
+            self.assertEqual(
+                evidence["managed_checkout_commit"],
+                current_commit,
+            )
+            self.assertEqual(
+                evidence["prior_evidence_commit"],
+                current_commit,
+            )
+            self.assertFalse(evidence["interrupted_redeployment"])
             self.assertEqual(git("rev-parse", "HEAD"), current_commit)
             self.assertEqual(git("status", "--porcelain"), "")
+
+            (
+                deployment_evidence / "deployment-manifest.json"
+            ).unlink()
+            deployment_evidence.rmdir()
+            (validation_output / "deployment_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "repository_commit": current_commit,
+                        "compose_project_name": "eventhorizon-field",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (deploy_dir / "tracked.txt").write_text(
+                "interrupted deployment checkout\n",
+                encoding="utf-8",
+            )
+            git("add", "tracked.txt")
+            git("commit", "-qm", "interrupted deployment candidate")
+            interrupted_commit = git("rev-parse", "HEAD")
+            git(
+                "update-ref",
+                "refs/remotes/origin/GSoC_2026",
+                interrupted_commit,
+            )
+
+            interrupted = subprocess.run(
+                [
+                    "python3",
+                    str(REPO_ROOT / "scripts/vps_field_remote_probe.py"),
+                    encoded_request,
+                ],
+                cwd=temporary_path,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(interrupted.returncode, 0, interrupted.stderr)
+            interrupted_evidence = json.loads(interrupted.stdout)
+            self.assertEqual(
+                interrupted_evidence["result"],
+                "PASS",
+                interrupted.stdout,
+            )
+            self.assertEqual(
+                interrupted_evidence["starting_state"],
+                "MANAGED_REDEPLOYMENT",
+            )
+            self.assertEqual(
+                interrupted_evidence["managed_checkout_commit"],
+                interrupted_commit,
+            )
+            self.assertEqual(
+                interrupted_evidence["prior_evidence_commit"],
+                current_commit,
+            )
+            self.assertTrue(
+                interrupted_evidence["interrupted_redeployment"]
+            )
+            recovery_check = next(
+                check
+                for check in interrupted_evidence["checks"]
+                if check["id"] == "interrupted_redeployment"
+            )
+            self.assertEqual(recovery_check["status"], "WARNING")
+
+            git(
+                "update-ref",
+                "refs/remotes/origin/GSoC_2026",
+                current_commit,
+            )
+            untrusted_checkout = subprocess.run(
+                [
+                    "python3",
+                    str(REPO_ROOT / "scripts/vps_field_remote_probe.py"),
+                    encoded_request,
+                ],
+                cwd=temporary_path,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(
+                untrusted_checkout.returncode,
+                0,
+                untrusted_checkout.stderr,
+            )
+            untrusted_evidence = json.loads(untrusted_checkout.stdout)
+            self.assertEqual(untrusted_evidence["result"], "BLOCKED")
+            prior_check = next(
+                check
+                for check in untrusted_evidence["checks"]
+                if check["id"] == "prior_deployment_evidence"
+            )
+            self.assertEqual(prior_check["status"], "BLOCKER")
+            git(
+                "update-ref",
+                "refs/remotes/origin/GSoC_2026",
+                interrupted_commit,
+            )
 
             environment["FAKE_MISSING_SERVICE"] = "telnet_pit"
             missing_service = subprocess.run(
@@ -1583,6 +1718,9 @@ raise SystemExit(92)
                 "trusted_repository": "honeynet/EventHorizon",
                 "approved_branch": "GSoC_2026",
                 "starting_state": "INITIAL_DEPLOYMENT",
+                "managed_checkout_commit": None,
+                "prior_evidence_commit": None,
+                "interrupted_redeployment": False,
                 "compose_files": [
                     "docker-compose.yml",
                     "docker-compose.cost.yml",
@@ -1902,6 +2040,9 @@ else:
                 "trusted_repository": "honeynet/EventHorizon",
                 "approved_branch": "GSoC_2026",
                 "starting_state": "INITIAL_DEPLOYMENT",
+                "managed_checkout_commit": None,
+                "prior_evidence_commit": None,
+                "interrupted_redeployment": False,
                 "compose_files": [
                     "docker-compose.yml",
                     "docker-compose.cost.yml",
@@ -2057,12 +2198,54 @@ else:
                 "origin",
                 "https://github.com/honeynet/EventHorizon.git",
             )
+            stale_preflight_request = dict(
+                request,
+                run_id="deploy-20260730T170050Z-b2c3d4",
+                deployment_commit=deployment_commit,
+                starting_state="MANAGED_REDEPLOYMENT",
+                managed_checkout_commit="f" * 40,
+                prior_evidence_commit=deployment_commit,
+                interrupted_redeployment=True,
+            )
+            stale_preflight = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        REPO_ROOT
+                        / "scripts/vps_field_remote_deploy.py"
+                    ),
+                    base64.urlsafe_b64encode(
+                        json.dumps(stale_preflight_request).encode("utf-8")
+                    ).decode("ascii"),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+                timeout=30,
+            )
+            self.assertEqual(
+                stale_preflight.returncode,
+                0,
+                stale_preflight.stderr,
+            )
+            stale_response = json.loads(stale_preflight.stdout)
+            self.assertEqual(stale_response["result"], "BLOCKED")
+            self.assertFalse(stale_response["remote_mutation_occurred"])
+            self.assertEqual(
+                git("-C", str(deploy_dir), "rev-parse", "HEAD"),
+                deployment_commit,
+            )
+
             failed_run_id = "deploy-20260730T170100Z-d4e5f6"
             failed_request = dict(
                 request,
                 run_id=failed_run_id,
                 deployment_commit=git("rev-parse", "HEAD"),
                 starting_state="MANAGED_REDEPLOYMENT",
+                managed_checkout_commit=deployment_commit,
+                prior_evidence_commit=deployment_commit,
+                interrupted_redeployment=False,
             )
             failed_environment = dict(
                 environment,
@@ -2156,6 +2339,16 @@ else:
             recovery_request = dict(
                 failed_request,
                 run_id=recovery_run_id,
+                managed_checkout_commit=failed_request[
+                    "deployment_commit"
+                ],
+                prior_evidence_commit=failed_request[
+                    "deployment_commit"
+                ],
+            )
+            self.assertEqual(
+                git("-C", str(deploy_dir), "rev-parse", "HEAD"),
+                recovery_request["managed_checkout_commit"],
             )
             recovered = subprocess.run(
                 [
@@ -2388,6 +2581,30 @@ class ReadyRemote:
             evidence={
                 "target_alias": "field-host",
                 "starting_state": "INITIAL_DEPLOYMENT",
+                "managed_checkout_commit": None,
+                "prior_evidence_commit": None,
+                "interrupted_redeployment": False,
+                "result": "PASS",
+            },
+            blocker=None,
+        )
+
+
+class InterruptedReadyRemote:
+    def preflight(
+        self,
+        configuration: object,
+        commit: str,
+        policy: dict[str, object],
+    ) -> RemotePreflightVerification:
+        return RemotePreflightVerification(
+            passed=True,
+            evidence={
+                "target_alias": "field-host",
+                "starting_state": "MANAGED_REDEPLOYMENT",
+                "managed_checkout_commit": "2" * 40,
+                "prior_evidence_commit": "1" * 40,
+                "interrupted_redeployment": True,
                 "result": "PASS",
             },
             blocker=None,
@@ -2405,11 +2622,14 @@ class InitialDeploymentProbe:
             returncode=0,
             stdout=json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "target_alias": "field-host",
                     "deployment_commit": commit,
                     "checked_utc": "2026-07-30T01:02:03Z",
                     "starting_state": "INITIAL_DEPLOYMENT",
+                    "managed_checkout_commit": None,
+                    "prior_evidence_commit": None,
+                    "interrupted_redeployment": False,
                     "result": "PASS",
                     "checks": [
                         {
@@ -2449,11 +2669,14 @@ class PrivacyExpandingRemoteProbe:
             returncode=0,
             stdout=json.dumps(
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "target_alias": "field-host",
                     "deployment_commit": commit,
                     "checked_utc": "2026-07-30T01:02:03Z",
                     "starting_state": "INITIAL_DEPLOYMENT",
+                    "managed_checkout_commit": None,
+                    "prior_evidence_commit": None,
+                    "interrupted_redeployment": False,
                     "result": "PASS",
                     "checks": [
                         {
@@ -3204,11 +3427,14 @@ if b"EventHorizon remote preflight probe" not in probe:
     raise SystemExit(93)
 request = json.loads(base64.urlsafe_b64decode(sys.argv[-1]))
 print(json.dumps({
-    "schema_version": 1,
+    "schema_version": 2,
     "target_alias": request["target_alias"],
     "deployment_commit": request["deployment_commit"],
     "checked_utc": "2026-07-30T01:02:03Z",
     "starting_state": "INITIAL_DEPLOYMENT",
+    "managed_checkout_commit": None,
+    "prior_evidence_commit": None,
+    "interrupted_redeployment": False,
     "result": "PASS",
     "checks": [{
         "id": "operating_system",
@@ -3282,6 +3508,12 @@ program = sys.stdin.buffer.read()
 if b"EventHorizon exact-source remote deployment" not in program:
     raise SystemExit(93)
 request = json.loads(base64.urlsafe_b64decode(sys.argv[-1]))
+if (
+    request.get("managed_checkout_commit") != "2" * 40
+    or request.get("prior_evidence_commit") != "1" * 40
+    or request.get("interrupted_redeployment") is not True
+):
+    raise SystemExit(94)
 print(json.dumps({
     "schema_version": 1,
     "run_id": request["run_id"],
@@ -3311,7 +3543,7 @@ print(json.dumps({
                     randomness=FixedRandomSource(),
                     repository=ProvenRepository(),
                     trusted_ci=ProvenTrustedCi(),
-                    remote=ReadyRemote(),
+                    remote=InterruptedReadyRemote(),
                     authorization=ApprovedAuthorization(),
                     deployment=SshExactSourceDeployment(
                         SystemSshDeploymentTransport(

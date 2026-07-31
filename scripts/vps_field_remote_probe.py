@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REQUIRED_PORTS = (23, 1883, 3000, 8081, 9090, 9101)
 EXPECTED_SERVICES = {
     "cadvisor",
@@ -225,8 +225,34 @@ def _manifest_describes_safe_managed_state(
     )
 
 
+def _commit_is_reachable_from_approved_ref(
+    deploy_dir: Path,
+    commit: object,
+) -> bool:
+    if (
+        not isinstance(commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", commit) is None
+    ):
+        return False
+    return (
+        _command(
+            "git",
+            "-C",
+            str(deploy_dir),
+            "merge-base",
+            "--is-ancestor",
+            commit,
+            "refs/remotes/origin/GSoC_2026",
+        ).returncode
+        == 0
+    )
+
+
 def _collect(request: dict[str, Any]) -> dict[str, object]:
     checks: list[dict[str, str]] = []
+    managed_checkout_commit: str | None = None
+    prior_evidence_commit: str | None = None
+    interrupted_redeployment = False
 
     def record(check_id: str, status: str, summary: str) -> None:
         checks.append(
@@ -541,20 +567,66 @@ def _collect(request: dict[str, Any]) -> dict[str, object]:
             and re.fullmatch(r"[0-9a-f]{40}", head.stdout.strip())
             else None
         )
+        managed_checkout_commit = current_head
 
         manifest = _latest_deployment_manifest(deploy_dir)
-        prior_evidence_matches = (
+        manifest_commit = (
+            manifest.get("repository_commit")
+            if manifest is not None
+            else None
+        )
+        prior_evidence_commit = (
+            manifest_commit
+            if isinstance(manifest_commit, str)
+            and re.fullmatch(r"[0-9a-f]{40}", manifest_commit) is not None
+            else None
+        )
+        exact_prior_evidence_match = (
             manifest is not None
             and current_head is not None
-            and manifest.get("repository_commit") == current_head
+            and manifest_commit == current_head
             and manifest.get("compose_project_name") == project_name
             and _manifest_describes_safe_managed_state(manifest)
         )
+        interrupted_redeployment = (
+            manifest is not None
+            and current_head is not None
+            and manifest_commit != current_head
+            and manifest.get("compose_project_name") == project_name
+            and _manifest_describes_safe_managed_state(manifest)
+            and trusted_origin
+            and clean_checkout
+            and _commit_is_reachable_from_approved_ref(
+                deploy_dir,
+                manifest_commit,
+            )
+            and _commit_is_reachable_from_approved_ref(
+                deploy_dir,
+                current_head,
+            )
+        )
+        prior_evidence_matches = (
+            exact_prior_evidence_match or interrupted_redeployment
+        )
+        if interrupted_redeployment:
+            record(
+                "interrupted_redeployment",
+                "WARNING",
+                (
+                    "A clean trusted interrupted checkout differs from "
+                    "the prior deployment evidence."
+                ),
+            )
         record(
             "prior_deployment_evidence",
             "PASS" if prior_evidence_matches else "BLOCKER",
             (
-                "Prior deployment evidence reconciles with the managed checkout."
+                (
+                    "Prior deployment evidence and the clean trusted "
+                    "interrupted checkout reconcile."
+                )
+                if interrupted_redeployment
+                else "Prior deployment evidence reconciles with the managed checkout."
                 if prior_evidence_matches
                 else "Managed redeployment requires matching prior deployment evidence."
             ),
@@ -681,6 +753,9 @@ def _collect(request: dict[str, Any]) -> dict[str, object]:
         "deployment_commit": request["deployment_commit"],
         "checked_utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "starting_state": starting_state,
+        "managed_checkout_commit": managed_checkout_commit,
+        "prior_evidence_commit": prior_evidence_commit,
+        "interrupted_redeployment": interrupted_redeployment,
         "result": result,
         "checks": checks,
     }

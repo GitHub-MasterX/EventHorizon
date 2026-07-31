@@ -190,7 +190,7 @@
       "const": 1
     },
     "remote_preflight_schema_version": {
-      "const": 1
+      "const": 2
     },
     "compose_config_schema_version": {
       "const": 1

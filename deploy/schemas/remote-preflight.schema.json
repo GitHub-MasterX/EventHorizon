@@ -10,12 +10,15 @@
     "deployment_commit",
     "checked_utc",
     "starting_state",
+    "managed_checkout_commit",
+    "prior_evidence_commit",
+    "interrupted_redeployment",
     "result",
     "checks"
   ],
   "properties": {
     "schema_version": {
-      "const": 1
+      "const": 2
     },
     "target_alias": {
       "type": "string",
@@ -35,6 +38,23 @@
         "MANAGED_REDEPLOYMENT",
         "UNSUPPORTED"
       ]
+    },
+    "managed_checkout_commit": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "prior_evidence_commit": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "interrupted_redeployment": {
+      "type": "boolean"
     },
     "result": {
       "enum": [
@@ -76,6 +96,60 @@
     }
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "starting_state": {
+            "enum": [
+              "INITIAL_DEPLOYMENT",
+              "UNSUPPORTED"
+            ]
+          }
+        },
+        "required": [
+          "starting_state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "managed_checkout_commit": {
+            "const": null
+          },
+          "prior_evidence_commit": {
+            "const": null
+          },
+          "interrupted_redeployment": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "starting_state": {
+            "const": "MANAGED_REDEPLOYMENT"
+          },
+          "result": {
+            "const": "PASS"
+          }
+        },
+        "required": [
+          "starting_state",
+          "result"
+        ]
+      },
+      "then": {
+        "properties": {
+          "managed_checkout_commit": {
+            "type": "string"
+          },
+          "prior_evidence_commit": {
+            "type": "string"
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {

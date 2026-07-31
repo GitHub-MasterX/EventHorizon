@@ -26,7 +26,7 @@ from typing import NoReturn, Protocol, Sequence, TextIO
 RESULT_SCHEMA_VERSION = 1
 EVIDENCE_INDEX_SCHEMA_VERSION = 1
 CI_PROOF_SCHEMA_VERSION = 1
-REMOTE_PREFLIGHT_SCHEMA_VERSION = 1
+REMOTE_PREFLIGHT_SCHEMA_VERSION = 2
 COMPOSE_CONFIG_SCHEMA_VERSION = 1
 DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 1
 CONTROLLER_CONTRACT_VERSION = 1
@@ -887,6 +887,13 @@ class SystemSshDeploymentTransport:
         approved_ref = policy.get("approved_ref")
         compose_files = policy.get("supported_compose_files")
         starting_state = preflight.get("starting_state")
+        managed_checkout_commit = preflight.get(
+            "managed_checkout_commit"
+        )
+        prior_evidence_commit = preflight.get("prior_evidence_commit")
+        interrupted_redeployment = preflight.get(
+            "interrupted_redeployment"
+        )
         if (
             not isinstance(trusted_repository, str)
             or not isinstance(approved_ref, str)
@@ -894,6 +901,33 @@ class SystemSshDeploymentTransport:
             or not all(isinstance(path, str) for path in compose_files)
             or starting_state
             not in {"INITIAL_DEPLOYMENT", "MANAGED_REDEPLOYMENT"}
+            or type(interrupted_redeployment) is not bool
+            or (
+                starting_state == "INITIAL_DEPLOYMENT"
+                and (
+                    managed_checkout_commit is not None
+                    or prior_evidence_commit is not None
+                    or interrupted_redeployment
+                )
+            )
+            or (
+                starting_state == "MANAGED_REDEPLOYMENT"
+                and (
+                    not isinstance(managed_checkout_commit, str)
+                    or FULL_SHA_PATTERN.fullmatch(
+                        managed_checkout_commit
+                    )
+                    is None
+                    or not isinstance(prior_evidence_commit, str)
+                    or FULL_SHA_PATTERN.fullmatch(prior_evidence_commit)
+                    is None
+                    or interrupted_redeployment
+                    != (
+                        managed_checkout_commit
+                        != prior_evidence_commit
+                    )
+                )
+            )
         ):
             raise OSError("deployment policy or preflight evidence is incomplete")
         approved_branch = approved_ref.rsplit("/", 1)[-1]
@@ -907,6 +941,9 @@ class SystemSshDeploymentTransport:
             "trusted_repository": trusted_repository,
             "approved_branch": approved_branch,
             "starting_state": starting_state,
+            "managed_checkout_commit": managed_checkout_commit,
+            "prior_evidence_commit": prior_evidence_commit,
+            "interrupted_redeployment": interrupted_redeployment,
             "compose_files": compose_files,
             "cpu_limit": configuration.field_tarpit_cpu_limit,
             "memory_limit": configuration.field_tarpit_memory_limit,
@@ -970,18 +1007,44 @@ def _remote_preflight_evidence_is_valid(
         "deployment_commit",
         "checked_utc",
         "starting_state",
+        "managed_checkout_commit",
+        "prior_evidence_commit",
+        "interrupted_redeployment",
         "result",
         "checks",
     }:
         return False
     if (
         type(evidence["schema_version"]) is not int
-        or evidence["schema_version"] != 1
+        or evidence["schema_version"] != REMOTE_PREFLIGHT_SCHEMA_VERSION
         or evidence["target_alias"] != configuration.target_alias
         or evidence["deployment_commit"] != commit
         or evidence["starting_state"]
         not in {"INITIAL_DEPLOYMENT", "MANAGED_REDEPLOYMENT", "UNSUPPORTED"}
         or evidence["result"] not in {"PASS", "BLOCKED"}
+        or (
+            evidence["managed_checkout_commit"] is not None
+            and (
+                not isinstance(evidence["managed_checkout_commit"], str)
+                or re.fullmatch(
+                    r"[0-9a-f]{40}",
+                    evidence["managed_checkout_commit"],
+                )
+                is None
+            )
+        )
+        or (
+            evidence["prior_evidence_commit"] is not None
+            and (
+                not isinstance(evidence["prior_evidence_commit"], str)
+                or re.fullmatch(
+                    r"[0-9a-f]{40}",
+                    evidence["prior_evidence_commit"],
+                )
+                is None
+            )
+        )
+        or type(evidence["interrupted_redeployment"]) is not bool
         or not isinstance(evidence["checked_utc"], str)
         or not isinstance(evidence["checks"], list)
         or not 1 <= len(evidence["checks"]) <= 64
@@ -994,6 +1057,33 @@ def _remote_preflight_evidence_is_valid(
     except ValueError:
         return False
     if checked.tzinfo is None:
+        return False
+
+    starting_state = evidence["starting_state"]
+    managed_checkout_commit = evidence["managed_checkout_commit"]
+    prior_evidence_commit = evidence["prior_evidence_commit"]
+    interrupted_redeployment = evidence["interrupted_redeployment"]
+    if starting_state in {"INITIAL_DEPLOYMENT", "UNSUPPORTED"}:
+        if (
+            managed_checkout_commit is not None
+            or prior_evidence_commit is not None
+            or interrupted_redeployment
+        ):
+            return False
+    elif interrupted_redeployment:
+        if (
+            managed_checkout_commit is None
+            or prior_evidence_commit is None
+            or managed_checkout_commit == prior_evidence_commit
+        ):
+            return False
+    elif (
+        evidence["result"] == "PASS"
+        and (
+            managed_checkout_commit is None
+            or managed_checkout_commit != prior_evidence_commit
+        )
+    ):
         return False
 
     check_ids: set[str] = set()

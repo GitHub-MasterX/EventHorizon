@@ -80,7 +80,7 @@
   "result_schema_version": 1,
   "evidence_index_schema_version": 1,
   "ci_proof_schema_version": 1,
-  "remote_preflight_schema_version": 1,
+  "remote_preflight_schema_version": 2,
   "compose_config_schema_version": 1,
   "deployment_manifest_schema_version": 1
 }

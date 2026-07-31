@@ -48,6 +48,9 @@ EXPECTED_REQUEST_KEYS = {
     "trusted_repository",
     "approved_branch",
     "starting_state",
+    "managed_checkout_commit",
+    "prior_evidence_commit",
+    "interrupted_redeployment",
     "compose_files",
     "cpu_limit",
     "memory_limit",
@@ -73,6 +76,9 @@ def _decode_request(encoded: str) -> dict[str, Any]:
     deploy_dir = document["deploy_dir"]
     deploy_path = Path(deploy_dir) if isinstance(deploy_dir, str) else Path("/")
     memory_limit = document["memory_limit"]
+    managed_checkout_commit = document["managed_checkout_commit"]
+    prior_evidence_commit = document["prior_evidence_commit"]
+    interrupted_redeployment = document["interrupted_redeployment"]
     if (
         document["schema_version"] != SCHEMA_VERSION
         or not isinstance(document["run_id"], str)
@@ -104,6 +110,31 @@ def _decode_request(encoded: str) -> dict[str, Any]:
         or document["approved_branch"] != APPROVED_BRANCH
         or document["starting_state"]
         not in {"INITIAL_DEPLOYMENT", "MANAGED_REDEPLOYMENT"}
+        or type(interrupted_redeployment) is not bool
+        or (
+            document["starting_state"] == "INITIAL_DEPLOYMENT"
+            and (
+                managed_checkout_commit is not None
+                or prior_evidence_commit is not None
+                or interrupted_redeployment
+            )
+        )
+        or (
+            document["starting_state"] == "MANAGED_REDEPLOYMENT"
+            and (
+                not isinstance(managed_checkout_commit, str)
+                or re.fullmatch(
+                    r"[0-9a-f]{40}",
+                    managed_checkout_commit,
+                )
+                is None
+                or not isinstance(prior_evidence_commit, str)
+                or re.fullmatch(r"[0-9a-f]{40}", prior_evidence_commit)
+                is None
+                or interrupted_redeployment
+                != (managed_checkout_commit != prior_evidence_commit)
+            )
+        )
         or document["compose_files"] != list(EXPECTED_COMPOSE_FILES)
         or not isinstance(document["cpu_limit"], str)
         or re.fullmatch(r"[0-9]+(?:[.][0-9]+)?", document["cpu_limit"]) is None
@@ -336,6 +367,11 @@ def _prepare_checkout(
             outcome="ERROR",
             blocker="Managed checkout identity could not be inspected.",
         ).strip()
+        if prior_commit != request["managed_checkout_commit"]:
+            raise DeploymentFailure(
+                "BLOCKED",
+                "Managed checkout changed after remote preflight.",
+            )
         mark_mutation()
 
     fetch = _run(
