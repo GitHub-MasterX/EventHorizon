@@ -2066,16 +2066,11 @@ def _remote_runtime_evidence_is_valid(
         }
         if any(
             service["state"] != "RUNNING"
-            or service["health"]
-            != (
-                "NOT_CONFIGURED"
-                if name == "cadvisor"
-                else "HEALTHY"
-            )
+            or service["health"] != "HEALTHY"
             or service["restart_count"] != 0
             or service["oom_killed"]
             or not service["image_id_verified"]
-            for name, service in service_by_name.items()
+            for service in service_by_name.values()
         ):
             return False
         binding_by_service = {

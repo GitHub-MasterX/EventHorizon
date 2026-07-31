@@ -506,11 +506,7 @@ class DeploymentContractArtifactTests(unittest.TestCase):
                 {
                     "name": service,
                     "state": "RUNNING",
-                    "health": (
-                        "NOT_CONFIGURED"
-                        if service == "cadvisor"
-                        else "HEALTHY"
-                    ),
+                    "health": "HEALTHY",
                     "restart_count": 0,
                     "oom_killed": False,
                     "image_id_verified": True,
@@ -586,6 +582,14 @@ class DeploymentContractArtifactTests(unittest.TestCase):
         )
 
         validator.validate(evidence)
+        missing_healthcheck = json.loads(json.dumps(evidence))
+        next(
+            service
+            for service in missing_healthcheck["services"]
+            if service["name"] == "cadvisor"
+        )["health"] = "NOT_CONFIGURED"
+        with self.assertRaises(ValidationError):
+            validator.validate(missing_healthcheck)
         validator.validate(
             {
                 **evidence,
@@ -1866,11 +1870,7 @@ def successful_remote_runtime_evidence(
             {
                 "name": service,
                 "state": "RUNNING",
-                "health": (
-                    "NOT_CONFIGURED"
-                    if service == "cadvisor"
-                    else "HEALTHY"
-                ),
+                "health": "HEALTHY",
                 "restart_count": 0,
                 "oom_killed": False,
                 "image_id_verified": True,
@@ -2729,19 +2729,18 @@ if tool == "docker":
             "Status": "running",
             "OOMKilled": False,
         }
-        if service != "cadvisor":
-            health = "healthy"
-            transient_marker = os.environ.get(
-                "FAKE_TRANSIENT_HEALTH_MARKER"
-            )
-            if (
-                service == "grafana"
-                and transient_marker
-                and not Path(transient_marker).exists()
-            ):
-                Path(transient_marker).write_text("observed\\n")
-                health = "starting"
-            state["Health"] = {"Status": health}
+        health = "healthy"
+        transient_marker = os.environ.get(
+            "FAKE_TRANSIENT_HEALTH_MARKER"
+        )
+        if (
+            service == "grafana"
+            and transient_marker
+            and not Path(transient_marker).exists()
+        ):
+            Path(transient_marker).write_text("observed\\n")
+            health = "starting"
+        state["Health"] = {"Status": health}
         print(json.dumps({
             "Image": json.loads(os.environ["FAKE_IMAGE_IDS"])[service],
             "RestartCount": 0,
@@ -3256,7 +3255,7 @@ class InteractiveTextStream(io.StringIO):
 
 
 class DeploymentControllerApiTests(unittest.TestCase):
-    def test_runtime_verification_combines_remote_and_workstation_evidence(
+    def test_runtime_accepts_healthy_cadvisor_and_combines_port_evidence(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -3301,11 +3300,7 @@ class DeploymentControllerApiTests(unittest.TestCase):
                     {
                         "name": service,
                         "state": "RUNNING",
-                        "health": (
-                            "NOT_CONFIGURED"
-                            if service == "cadvisor"
-                            else "HEALTHY"
-                        ),
+                        "health": "HEALTHY",
                         "restart_count": 0,
                         "oom_killed": False,
                         "image_id_verified": True,
@@ -3736,11 +3731,7 @@ class DeploymentControllerApiTests(unittest.TestCase):
                     {
                         "name": service,
                         "state": "RUNNING",
-                        "health": (
-                            "NOT_CONFIGURED"
-                            if service == "cadvisor"
-                            else "HEALTHY"
-                        ),
+                        "health": "HEALTHY",
                         "restart_count": 0,
                         "oom_killed": False,
                         "image_id_verified": True,

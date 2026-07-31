@@ -406,7 +406,7 @@ def _collect_once(request: dict[str, Any]) -> dict[str, object]:
 
     services_pass = all(
         service["state"] == "RUNNING"
-        and service["health"] in {"HEALTHY", "NOT_CONFIGURED"}
+        and service["health"] == "HEALTHY"
         and service["restart_count"] == 0
         and service["oom_killed"] is False
         and service["image_id_verified"] is True
@@ -451,8 +451,7 @@ def _is_settling(evidence: dict[str, object]) -> bool:
     return (
         all(
             service["state"] == "RUNNING"
-            and service["health"]
-            in {"HEALTHY", "NOT_CONFIGURED", "STARTING"}
+            and service["health"] in {"HEALTHY", "STARTING"}
             and service["restart_count"] == 0
             and service["oom_killed"] is False
             and service["image_id_verified"] is True
