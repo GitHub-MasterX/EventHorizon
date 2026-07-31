@@ -1,20 +1,25 @@
 import base64
 import hashlib
+import http.server
 import io
 import json
 import os
 import re
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 from jsonschema import Draft202012Validator, ValidationError
+import scripts.deployment_controller as deployment_controller
 
 from scripts.deployment_controller import (
     AuthorizationDecision,
@@ -124,6 +129,10 @@ class DeploymentContractArtifactTests(unittest.TestCase):
             "scripts/vps_field_remote_runtime.py",
             policy["protected_paths"],
         )
+        self.assertIn(
+            "scripts/vps_field_remote_smoke.py",
+            policy["protected_paths"],
+        )
         self.assertIn(".github/workflows/ci.yml", policy["protected_paths"])
         self.assertIn(
             "deploy/schemas/remote-preflight.schema.json",
@@ -133,10 +142,15 @@ class DeploymentContractArtifactTests(unittest.TestCase):
             "deploy/schemas/health-and-ports.schema.json",
             policy["protected_paths"],
         )
+        self.assertIn(
+            "deploy/schemas/protocol-smoke.schema.json",
+            policy["protected_paths"],
+        )
         self.assertEqual(policy["remote_preflight_schema_version"], 2)
         self.assertEqual(policy["compose_config_schema_version"], 1)
         self.assertEqual(policy["deployment_manifest_schema_version"], 1)
         self.assertEqual(policy["health_and_ports_schema_version"], 1)
+        self.assertEqual(policy["protocol_smoke_schema_version"], 1)
 
     def test_phase_six_artifact_schemas_are_strict(self) -> None:
         compose_schema = json.loads(
@@ -616,6 +630,134 @@ class DeploymentContractArtifactTests(unittest.TestCase):
                 )
             )
 
+    def test_protocol_smoke_schema_accepts_complete_and_partial_runs(self) -> None:
+        schema = json.loads(
+            (
+                REPO_ROOT / "deploy/schemas/protocol-smoke.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        snapshot = {
+            "captured_utc": "2026-07-30T01:02:03Z",
+            "scrape_utc": "2026-07-30T01:02:02Z",
+            "malformed_messages": 0,
+            "protocols": [
+                {
+                    "protocol": protocol,
+                    "connections": 10,
+                    "completed_sessions": 10,
+                    "active_sessions": 0,
+                    "depth_0": 2,
+                    "depth_1": 2,
+                    "depth_2": 4,
+                    "depth_3": 2,
+                    "duration_count": 10,
+                    "duration_inf": 10,
+                    "application_bytes_received": 100,
+                    "application_bytes_sent": 200,
+                    "restart_count": 0,
+                    "oom_killed": False,
+                    "image_id_verified": True,
+                }
+                for protocol in ("telnet", "mqtt")
+            ],
+        }
+        final = json.loads(json.dumps(snapshot))
+        final["captured_utc"] = "2026-07-30T01:02:20Z"
+        final["scrape_utc"] = "2026-07-30T01:02:17Z"
+        for protocol in final["protocols"]:
+            protocol["connections"] += 1
+            protocol["completed_sessions"] += 1
+            protocol["depth_2"] += 1
+            protocol["duration_count"] += 1
+            protocol["duration_inf"] += 1
+            protocol["application_bytes_received"] += 8
+            protocol["application_bytes_sent"] += 4
+        evidence = {
+            "schema_version": 1,
+            "run_id": "deploy-20260730T010203Z-a1b2c3",
+            "target_alias": "field-host",
+            "deployment_commit": "1" * 40,
+            "started_utc": "2026-07-30T01:02:03Z",
+            "finished_utc": "2026-07-30T01:02:20Z",
+            "result": "PASS",
+            "reason_code": "SMOKE_PASSED",
+            "client_implementation": "PYTHON_STDLIB",
+            "baseline": snapshot,
+            "final": final,
+            "clients": [
+                {
+                    "protocol": protocol,
+                    "result": "PASS",
+                    "bytes_written": 8,
+                    "bytes_read": 4,
+                }
+                for protocol in ("telnet", "mqtt")
+            ],
+            "protocols": [
+                {
+                    "protocol": protocol,
+                    "result": "PASS",
+                    "deltas": {
+                        "connections": 1,
+                        "completed_sessions": 1,
+                        "depth_total": 1,
+                        "depth_2": 1,
+                        "duration_count": 1,
+                        "duration_inf": 1,
+                        "application_bytes_received": 8,
+                        "application_bytes_sent": 4,
+                        "malformed_messages": 0,
+                        "restarts": 0,
+                    },
+                    "checks": {
+                        "exact_connection": True,
+                        "exact_completion": True,
+                        "active_settled": True,
+                        "exact_depth_total": True,
+                        "exact_depth_2": True,
+                        "exact_duration_count": True,
+                        "exact_duration_inf": True,
+                        "positive_bytes_received": True,
+                        "positive_bytes_sent": True,
+                        "malformed_unchanged": True,
+                        "restart_unchanged": True,
+                        "oom_not_observed": True,
+                        "lifecycle_reconciled": True,
+                        "depth_reconciled": True,
+                        "duration_reconciled": True,
+                    },
+                }
+                for protocol in ("telnet", "mqtt")
+            ],
+            "cleanup": {"attempted": False, "succeeded": None},
+        }
+        validator = Draft202012Validator(
+            schema,
+            format_checker=Draft202012Validator.FORMAT_CHECKER,
+        )
+
+        validator.validate(evidence)
+        validator.validate(
+            {
+                **evidence,
+                "result": "BLOCKED",
+                "reason_code": "CLEAN_BASELINE_UNAVAILABLE",
+                "baseline": None,
+                "final": None,
+                "clients": [],
+                "protocols": [],
+                "cleanup": {"attempted": True, "succeeded": True},
+            }
+        )
+        with self.assertRaises(ValidationError):
+            validator.validate(dict(evidence, vps_host="198.51.100.10"))
+        with self.assertRaises(ValidationError):
+            validator.validate(dict(evidence, schema_version=2))
+        inconsistent_pass = json.loads(json.dumps(evidence))
+        inconsistent_pass["protocols"][0]["deltas"]["connections"] = 2
+        with self.assertRaises(ValidationError):
+            validator.validate(inconsistent_pass)
+
     def test_target_configuration_example_contains_only_strict_keys(self) -> None:
         entries = {}
         for line in (
@@ -721,6 +863,10 @@ class DeploymentContractArtifactTests(unittest.TestCase):
         )
         self.assertIn(
             "scripts/vps_field_remote_deploy.py",
+            deployment_controller_script,
+        )
+        self.assertIn(
+            "scripts/vps_field_remote_smoke.py",
             deployment_controller_script,
         )
 
@@ -1927,6 +2073,108 @@ def successful_remote_runtime_evidence(
     }
 
 
+def successful_protocol_smoke_evidence(
+    commit: str,
+    run_id: str,
+) -> dict[str, object]:
+    baseline = {
+        "captured_utc": "2026-07-30T01:02:03Z",
+        "scrape_utc": "2026-07-30T01:02:02Z",
+        "malformed_messages": 0,
+        "protocols": [
+            {
+                "protocol": protocol,
+                "connections": 10,
+                "completed_sessions": 10,
+                "active_sessions": 0,
+                "depth_0": 2,
+                "depth_1": 2,
+                "depth_2": 4,
+                "depth_3": 2,
+                "duration_count": 10,
+                "duration_inf": 10,
+                "application_bytes_received": 100,
+                "application_bytes_sent": 200,
+                "restart_count": 0,
+                "oom_killed": False,
+                "image_id_verified": True,
+            }
+            for protocol in ("telnet", "mqtt")
+        ],
+    }
+    final = json.loads(json.dumps(baseline))
+    final["captured_utc"] = "2026-07-30T01:02:20Z"
+    final["scrape_utc"] = "2026-07-30T01:02:17Z"
+    for protocol in final["protocols"]:
+        protocol["connections"] += 1
+        protocol["completed_sessions"] += 1
+        protocol["depth_2"] += 1
+        protocol["duration_count"] += 1
+        protocol["duration_inf"] += 1
+        protocol["application_bytes_received"] += 8
+        protocol["application_bytes_sent"] += 4
+    checks = {
+        "exact_connection": True,
+        "exact_completion": True,
+        "active_settled": True,
+        "exact_depth_total": True,
+        "exact_depth_2": True,
+        "exact_duration_count": True,
+        "exact_duration_inf": True,
+        "positive_bytes_received": True,
+        "positive_bytes_sent": True,
+        "malformed_unchanged": True,
+        "restart_unchanged": True,
+        "oom_not_observed": True,
+        "lifecycle_reconciled": True,
+        "depth_reconciled": True,
+        "duration_reconciled": True,
+    }
+    return {
+        "schema_version": 1,
+        "run_id": run_id,
+        "target_alias": "field-host",
+        "deployment_commit": commit,
+        "started_utc": "2026-07-30T01:02:03Z",
+        "finished_utc": "2026-07-30T01:02:20Z",
+        "result": "PASS",
+        "reason_code": "SMOKE_PASSED",
+        "client_implementation": "PYTHON_STDLIB",
+        "baseline": baseline,
+        "final": final,
+        "clients": [
+            {
+                "protocol": protocol,
+                "result": "PASS",
+                "bytes_written": 8,
+                "bytes_read": 4,
+            }
+            for protocol in ("telnet", "mqtt")
+        ],
+        "protocols": [
+            {
+                "protocol": protocol,
+                "result": "PASS",
+                "deltas": {
+                    "connections": 1,
+                    "completed_sessions": 1,
+                    "depth_total": 1,
+                    "depth_2": 1,
+                    "duration_count": 1,
+                    "duration_inf": 1,
+                    "application_bytes_received": 8,
+                    "application_bytes_sent": 4,
+                    "malformed_messages": 0,
+                    "restarts": 0,
+                },
+                "checks": checks,
+            }
+            for protocol in ("telnet", "mqtt")
+        ],
+        "cleanup": {"attempted": False, "succeeded": None},
+    }
+
+
 class RemoteDeploymentProgramIntegrationTests(unittest.TestCase):
     def test_failed_initial_clone_does_not_strand_deployment_directory(
         self,
@@ -2666,6 +2914,213 @@ else:
             )
 
 
+class RemoteSmokeProgramIntegrationTests(unittest.TestCase):
+    def test_remote_program_captures_a_fresh_zero_active_baseline(self) -> None:
+        program_path = REPO_ROOT / "scripts/vps_field_remote_smoke.py"
+        self.assertTrue(program_path.is_file())
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            fake_bin = temporary_path / "fake-bin"
+            fake_bin.mkdir()
+            commit = "1" * 40
+            run_id = "deploy-20260730T010203Z-a1b2c3"
+            expected_image_ids = {
+                service: "sha256:" + str(index) * 64
+                for index, service in enumerate(
+                    (
+                        "cadvisor",
+                        "grafana",
+                        "mqtt_pit",
+                        "prometheus",
+                        "prometheus-exporter",
+                        "telnet_pit",
+                    ),
+                    start=1,
+                )
+            }
+            fake_git = fake_bin / "git"
+            fake_git.write_text(
+                f"""#!/usr/bin/env python3
+print({commit!r})
+""",
+                encoding="utf-8",
+            )
+            fake_git.chmod(0o755)
+            fake_docker = fake_bin / "docker"
+            fake_docker.write_text(
+                f"""#!/usr/bin/env python3
+import json
+import sys
+
+images = {json.dumps(expected_image_ids)}
+if sys.argv[1:3] == ["ps", "-aq"]:
+    service_filter = next(
+        value for value in sys.argv if value.startswith("label=com.docker.compose.service=")
+    )
+    print("id-" + service_filter.rsplit("=", 1)[1])
+elif sys.argv[1] == "inspect":
+    service = sys.argv[2].removeprefix("id-")
+    print(json.dumps([{{
+        "Image": images[service],
+        "RestartCount": 0,
+        "State": {{"Status": "running", "OOMKilled": False}},
+    }}]))
+else:
+    raise SystemExit(91)
+""",
+                encoding="utf-8",
+            )
+            fake_docker.chmod(0o755)
+
+            class PrometheusHandler(http.server.BaseHTTPRequestHandler):
+                marker_calls = 0
+
+                def do_GET(self) -> None:
+                    expression = urllib.parse.parse_qs(
+                        urllib.parse.urlparse(self.path).query
+                    )["query"][0]
+                    if expression.startswith("max(timestamp("):
+                        type(self).marker_calls += 1
+                        if type(self).marker_calls == 1:
+                            value = 100
+                        elif type(self).marker_calls <= 3:
+                            value = 101
+                        elif type(self).marker_calls <= 6:
+                            value = 102
+                        else:
+                            value = 103
+                    elif "current_connected_clients" in expression:
+                        value = 0
+                    elif "total_connects" in expression:
+                        value = 10
+                    elif "completed_sessions_total" in expression:
+                        value = 10
+                    elif "session_interaction_depth_total" in expression:
+                        depth = int(re.search(r'depth_level="([0-3])"', expression)[1])
+                        value = (2, 2, 4, 2)[depth]
+                    elif "session_duration_ms_count" in expression:
+                        value = 10
+                    elif "session_duration_ms_bucket" in expression:
+                        value = 10
+                    elif "bytes_received_total" in expression:
+                        value = 100
+                    elif "bytes_sent_total" in expression:
+                        value = 200
+                    elif "exporter_malformed_messages_total" in expression:
+                        value = 0
+                    else:
+                        self.send_error(400)
+                        return
+                    payload = json.dumps(
+                        {
+                            "status": "success",
+                            "data": {
+                                "resultType": "vector",
+                                "result": [
+                                    {
+                                        "metric": {},
+                                        "value": [101, str(value)],
+                                    }
+                                ],
+                            },
+                        }
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+
+                def log_message(self, *args: object) -> None:
+                    pass
+
+            server = http.server.ThreadingHTTPServer(
+                ("127.0.0.1", 0),
+                PrometheusHandler,
+            )
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            request = {
+                "schema_version": 1,
+                "action": "BASELINE",
+                "run_id": run_id,
+                "target_alias": "field-host",
+                "deployment_commit": commit,
+                "deploy_dir": "/srv/eventhorizon-field",
+                "project_name": "eventhorizon-field",
+                "expected_image_ids": expected_image_ids,
+                "baseline_scrape_utc": None,
+                "prometheus_url": (
+                    f"http://127.0.0.1:{server.server_address[1]}"
+                ),
+                "settle_timeout_seconds": 2,
+            }
+            environment = os.environ.copy()
+            environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+
+            def invoke(document: dict[str, object]) -> subprocess.CompletedProcess[str]:
+                encoded_request = base64.urlsafe_b64encode(
+                    json.dumps(document).encode("utf-8")
+                ).decode("ascii")
+                return subprocess.run(
+                    [sys.executable, str(program_path), encoded_request],
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=environment,
+                    timeout=10,
+                )
+
+            try:
+                completed = invoke(request)
+                baseline_evidence = json.loads(completed.stdout)
+                final_completed = invoke(
+                    {
+                        **request,
+                        "action": "FINAL",
+                        "baseline_scrape_utc": baseline_evidence["snapshot"][
+                            "scrape_utc"
+                        ],
+                    }
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=3)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evidence = json.loads(completed.stdout)
+            self.assertEqual(evidence["result"], "PASS")
+            self.assertEqual(evidence["reason_code"], "SNAPSHOT_CAPTURED")
+            self.assertEqual(evidence["snapshot"]["malformed_messages"], 0)
+            self.assertEqual(
+                [
+                    protocol["active_sessions"]
+                    for protocol in evidence["snapshot"]["protocols"]
+                ],
+                [0, 0],
+            )
+            self.assertNotIn("deploy_dir", evidence)
+            self.assertNotIn("prometheus_url", evidence)
+            self.assertEqual(
+                final_completed.returncode,
+                0,
+                final_completed.stderr,
+            )
+            final_evidence = json.loads(final_completed.stdout)
+            self.assertEqual(final_evidence["result"], "PASS")
+            self.assertEqual(
+                int(
+                    datetime.fromisoformat(
+                        final_evidence["snapshot"]["scrape_utc"].replace(
+                            "Z", "+00:00"
+                        )
+                    ).timestamp()
+                ),
+                103,
+            )
+
+
 class RemoteRuntimeProgramIntegrationTests(unittest.TestCase):
     def test_exact_runtime_is_healthy_and_uses_supported_bindings(
         self,
@@ -3267,6 +3722,669 @@ class InteractiveTextStream(io.StringIO):
 
 
 class DeploymentControllerApiTests(unittest.TestCase):
+    def test_deployment_smoke_accepts_exact_depth_two_reconciliation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            configuration = TargetConfiguration(
+                target_alias="field-host",
+                vps_host="198.51.100.10",
+                vps_user="deploy",
+                vps_ssh_port=22,
+                vps_ssh_key=temporary_path / "operator_key",
+                vps_deploy_dir="/srv/eventhorizon-field",
+                vps_project_name="eventhorizon-field",
+                admin_source_cidr="203.0.113.9/32",
+                field_tarpit_cpu_limit="0.50",
+                field_tarpit_memory_limit=None,
+            )
+            commit = "1" * 40
+            run_id = "deploy-20260730T010203Z-a1b2c3"
+            expected = successful_protocol_smoke_evidence(commit, run_id)
+
+            class Execution:
+                returncode = 0
+                stderr = b""
+
+                def __init__(self, action: str, snapshot: object) -> None:
+                    self.stdout = json.dumps(
+                        {
+                            "schema_version": 1,
+                            "action": action,
+                            "run_id": run_id,
+                            "target_alias": "field-host",
+                            "deployment_commit": commit,
+                            "result": "PASS",
+                            "reason_code": "SNAPSHOT_CAPTURED",
+                            "snapshot": snapshot,
+                        }
+                    ).encode("utf-8")
+
+            class RemoteSmoke:
+                def capture_baseline(self, *args: object) -> object:
+                    return Execution("BASELINE", expected["baseline"])
+
+                def capture_final(self, *args: object) -> object:
+                    return Execution("FINAL", expected["final"])
+
+                def stop(self, *args: object) -> bool:
+                    return True
+
+            class ProtocolClients:
+                def run(self, host: str) -> tuple[dict[str, object], ...]:
+                    return tuple(expected["clients"])
+
+            verification = deployment_controller.SshDeploymentSmoke(
+                remote=RemoteSmoke(),
+                clients=ProtocolClients(),
+                clock=FixedClock(),
+            ).verify(
+                configuration,
+                commit,
+                {},
+                {
+                    "service_image_ids": {
+                        service: "sha256:" + str(index) * 64
+                        for index, service in enumerate(
+                            (
+                                "cadvisor",
+                                "grafana",
+                                "mqtt_pit",
+                                "prometheus",
+                                "prometheus-exporter",
+                                "telnet_pit",
+                            ),
+                            start=1,
+                        )
+                    }
+                },
+                run_id,
+            )
+
+            self.assertTrue(verification.passed)
+            self.assertEqual(verification.outcome, "PASS")
+            self.assertTrue(verification.field_services_running)
+            self.assertEqual(verification.evidence["result"], "PASS")
+            self.assertEqual(
+                [item["deltas"] for item in verification.evidence["protocols"]],
+                [item["deltas"] for item in expected["protocols"]],
+            )
+            schema = json.loads(
+                (
+                    REPO_ROOT / "deploy/schemas/protocol-smoke.schema.json"
+                ).read_text(encoding="utf-8")
+            )
+            Draft202012Validator(
+                schema,
+                format_checker=Draft202012Validator.FORMAT_CHECKER,
+            ).validate(verification.evidence)
+
+    def test_deployment_smoke_failure_stops_the_exact_managed_services(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            configuration = TargetConfiguration(
+                target_alias="field-host",
+                vps_host="198.51.100.10",
+                vps_user="deploy",
+                vps_ssh_port=22,
+                vps_ssh_key=temporary_path / "operator_key",
+                vps_deploy_dir="/srv/eventhorizon-field",
+                vps_project_name="eventhorizon-field",
+                admin_source_cidr="203.0.113.9/32",
+                field_tarpit_cpu_limit="0.50",
+                field_tarpit_memory_limit=None,
+            )
+            commit = "1" * 40
+            run_id = "deploy-20260730T010203Z-a1b2c3"
+            expected = successful_protocol_smoke_evidence(commit, run_id)
+            final = json.loads(json.dumps(expected["final"]))
+            mqtt = final["protocols"][1]
+            mqtt["depth_2"] -= 1
+            mqtt["depth_3"] += 1
+
+            class Execution:
+                returncode = 0
+                stderr = b""
+
+                def __init__(self, action: str, snapshot: object) -> None:
+                    self.stdout = json.dumps(
+                        {
+                            "schema_version": 1,
+                            "action": action,
+                            "run_id": run_id,
+                            "target_alias": "field-host",
+                            "deployment_commit": commit,
+                            "result": "PASS",
+                            "reason_code": "SNAPSHOT_CAPTURED",
+                            "snapshot": snapshot,
+                        }
+                    ).encode("utf-8")
+
+            class RemoteSmoke:
+                def capture_baseline(self, *args: object) -> object:
+                    return Execution("BASELINE", expected["baseline"])
+
+                def capture_final(self, *args: object) -> object:
+                    return Execution("FINAL", final)
+
+                def stop(self, *args: object) -> bool:
+                    return True
+
+            class ProtocolClients:
+                def run(self, host: str) -> tuple[dict[str, object], ...]:
+                    return tuple(expected["clients"])
+
+            verification = deployment_controller.SshDeploymentSmoke(
+                remote=RemoteSmoke(),
+                clients=ProtocolClients(),
+                clock=FixedClock(),
+            ).verify(
+                configuration,
+                commit,
+                {},
+                {
+                    "service_image_ids": {
+                        service: "sha256:" + str(index) * 64
+                        for index, service in enumerate(
+                            (
+                                "cadvisor",
+                                "grafana",
+                                "mqtt_pit",
+                                "prometheus",
+                                "prometheus-exporter",
+                                "telnet_pit",
+                            ),
+                            start=1,
+                        )
+                    }
+                },
+                run_id,
+            )
+
+            self.assertFalse(verification.passed)
+            self.assertEqual(verification.outcome, "FAIL")
+            self.assertFalse(verification.field_services_running)
+            self.assertEqual(
+                verification.evidence["cleanup"],
+                {"attempted": True, "succeeded": True},
+            )
+            self.assertFalse(
+                verification.evidence["protocols"][1]["checks"][
+                    "exact_depth_2"
+                ]
+            )
+            schema = json.loads(
+                (
+                    REPO_ROOT / "deploy/schemas/protocol-smoke.schema.json"
+                ).read_text(encoding="utf-8")
+            )
+            Draft202012Validator(
+                schema,
+                format_checker=Draft202012Validator.FORMAT_CHECKER,
+            ).validate(verification.evidence)
+
+    def test_deployment_smoke_blocks_when_clean_baseline_is_unavailable(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            configuration = TargetConfiguration(
+                target_alias="field-host",
+                vps_host="198.51.100.10",
+                vps_user="deploy",
+                vps_ssh_port=22,
+                vps_ssh_key=temporary_path / "operator_key",
+                vps_deploy_dir="/srv/eventhorizon-field",
+                vps_project_name="eventhorizon-field",
+                admin_source_cidr="203.0.113.9/32",
+                field_tarpit_cpu_limit="0.50",
+                field_tarpit_memory_limit=None,
+            )
+            commit = "1" * 40
+            run_id = "deploy-20260730T010203Z-a1b2c3"
+            expected = successful_protocol_smoke_evidence(commit, run_id)
+            unsettled = json.loads(json.dumps(expected["baseline"]))
+            unsettled["protocols"][0]["active_sessions"] = 1
+
+            class Execution:
+                returncode = 0
+                stderr = b""
+                stdout = json.dumps(
+                    {
+                        "schema_version": 1,
+                        "action": "BASELINE",
+                        "run_id": run_id,
+                        "target_alias": "field-host",
+                        "deployment_commit": commit,
+                        "result": "BLOCKED",
+                        "reason_code": "ACTIVE_SESSIONS_DID_NOT_SETTLE",
+                        "snapshot": unsettled,
+                    }
+                ).encode("utf-8")
+
+            class RemoteSmoke:
+                def capture_baseline(self, *args: object) -> object:
+                    return Execution()
+
+                def capture_final(self, *args: object) -> object:
+                    return Execution()
+
+                def stop(self, *args: object) -> bool:
+                    return True
+
+            class ProtocolClients:
+                def run(self, host: str) -> tuple[dict[str, object], ...]:
+                    return tuple(expected["clients"])
+
+            verification = deployment_controller.SshDeploymentSmoke(
+                remote=RemoteSmoke(),
+                clients=ProtocolClients(),
+                clock=FixedClock(),
+            ).verify(
+                configuration,
+                commit,
+                {},
+                {
+                    "service_image_ids": {
+                        service: "sha256:" + str(index) * 64
+                        for index, service in enumerate(
+                            (
+                                "cadvisor",
+                                "grafana",
+                                "mqtt_pit",
+                                "prometheus",
+                                "prometheus-exporter",
+                                "telnet_pit",
+                            ),
+                            start=1,
+                        )
+                    }
+                },
+                run_id,
+            )
+
+            self.assertFalse(verification.passed)
+            self.assertEqual(verification.outcome, "BLOCKED")
+            self.assertFalse(verification.field_services_running)
+            self.assertEqual(verification.evidence["baseline"], unsettled)
+            self.assertIsNone(verification.evidence["final"])
+            self.assertEqual(verification.evidence["clients"], [])
+            self.assertEqual(
+                verification.evidence["reason_code"],
+                "CLEAN_BASELINE_UNAVAILABLE",
+            )
+            schema = json.loads(
+                (
+                    REPO_ROOT / "deploy/schemas/protocol-smoke.schema.json"
+                ).read_text(encoding="utf-8")
+            )
+            Draft202012Validator(
+                schema,
+                format_checker=Draft202012Validator.FORMAT_CHECKER,
+            ).validate(verification.evidence)
+
+    def test_deployment_smoke_counter_reset_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            configuration = TargetConfiguration(
+                target_alias="field-host",
+                vps_host="198.51.100.10",
+                vps_user="deploy",
+                vps_ssh_port=22,
+                vps_ssh_key=temporary_path / "operator_key",
+                vps_deploy_dir="/srv/eventhorizon-field",
+                vps_project_name="eventhorizon-field",
+                admin_source_cidr="203.0.113.9/32",
+                field_tarpit_cpu_limit="0.50",
+                field_tarpit_memory_limit=None,
+            )
+            commit = "1" * 40
+            run_id = "deploy-20260730T010203Z-a1b2c3"
+            expected = successful_protocol_smoke_evidence(commit, run_id)
+            final = json.loads(json.dumps(expected["final"]))
+            final["protocols"][0]["connections"] = 0
+
+            class Execution:
+                returncode = 0
+                stderr = b""
+
+                def __init__(self, action: str, snapshot: object) -> None:
+                    self.stdout = json.dumps(
+                        {
+                            "schema_version": 1,
+                            "action": action,
+                            "run_id": run_id,
+                            "target_alias": "field-host",
+                            "deployment_commit": commit,
+                            "result": "PASS",
+                            "reason_code": "SNAPSHOT_CAPTURED",
+                            "snapshot": snapshot,
+                        }
+                    ).encode("utf-8")
+
+            class RemoteSmoke:
+                def capture_baseline(self, *args: object) -> object:
+                    return Execution("BASELINE", expected["baseline"])
+
+                def capture_final(self, *args: object) -> object:
+                    return Execution("FINAL", final)
+
+                def stop(self, *args: object) -> bool:
+                    return True
+
+            class ProtocolClients:
+                def run(self, host: str) -> tuple[dict[str, object], ...]:
+                    return tuple(expected["clients"])
+
+            verification = deployment_controller.SshDeploymentSmoke(
+                remote=RemoteSmoke(),
+                clients=ProtocolClients(),
+                clock=FixedClock(),
+            ).verify(
+                configuration,
+                commit,
+                {},
+                {
+                    "service_image_ids": {
+                        service: "sha256:" + str(index) * 64
+                        for index, service in enumerate(
+                            (
+                                "cadvisor",
+                                "grafana",
+                                "mqtt_pit",
+                                "prometheus",
+                                "prometheus-exporter",
+                                "telnet_pit",
+                            ),
+                            start=1,
+                        )
+                    }
+                },
+                run_id,
+            )
+
+            self.assertFalse(verification.passed)
+            self.assertEqual(verification.outcome, "INCONCLUSIVE")
+            self.assertFalse(verification.field_services_running)
+            self.assertEqual(
+                verification.evidence["reason_code"],
+                "METRIC_EVIDENCE_INSUFFICIENT",
+            )
+            self.assertEqual(
+                verification.evidence["cleanup"],
+                {"attempted": True, "succeeded": True},
+            )
+
+    def test_deployment_smoke_client_malfunction_is_redacted_error(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            configuration = TargetConfiguration(
+                target_alias="field-host",
+                vps_host="198.51.100.10",
+                vps_user="deploy",
+                vps_ssh_port=22,
+                vps_ssh_key=temporary_path / "operator_key",
+                vps_deploy_dir="/srv/eventhorizon-field",
+                vps_project_name="eventhorizon-field",
+                admin_source_cidr="203.0.113.9/32",
+                field_tarpit_cpu_limit="0.50",
+                field_tarpit_memory_limit=None,
+            )
+            commit = "1" * 40
+            run_id = "deploy-20260730T010203Z-a1b2c3"
+            expected = successful_protocol_smoke_evidence(commit, run_id)
+
+            class Execution:
+                returncode = 0
+                stderr = b""
+                stdout = json.dumps(
+                    {
+                        "schema_version": 1,
+                        "action": "BASELINE",
+                        "run_id": run_id,
+                        "target_alias": "field-host",
+                        "deployment_commit": commit,
+                        "result": "PASS",
+                        "reason_code": "SNAPSHOT_CAPTURED",
+                        "snapshot": expected["baseline"],
+                    }
+                ).encode("utf-8")
+
+            class RemoteSmoke:
+                def capture_baseline(self, *args: object) -> object:
+                    return Execution()
+
+                def capture_final(self, *args: object) -> object:
+                    return Execution()
+
+                def stop(self, *args: object) -> bool:
+                    return True
+
+            class BrokenProtocolClients:
+                def run(self, host: str) -> tuple[dict[str, object], ...]:
+                    raise OSError("sensitive target transport detail")
+
+            verification = deployment_controller.SshDeploymentSmoke(
+                remote=RemoteSmoke(),
+                clients=BrokenProtocolClients(),
+                clock=FixedClock(),
+            ).verify(
+                configuration,
+                commit,
+                {},
+                {
+                    "service_image_ids": {
+                        service: "sha256:" + str(index) * 64
+                        for index, service in enumerate(
+                            (
+                                "cadvisor",
+                                "grafana",
+                                "mqtt_pit",
+                                "prometheus",
+                                "prometheus-exporter",
+                                "telnet_pit",
+                            ),
+                            start=1,
+                        )
+                    }
+                },
+                run_id,
+            )
+
+            self.assertFalse(verification.passed)
+            self.assertEqual(verification.outcome, "ERROR")
+            self.assertFalse(verification.field_services_running)
+            self.assertEqual(
+                verification.evidence["reason_code"],
+                "CLIENT_MALFUNCTION",
+            )
+            self.assertEqual(
+                verification.evidence["baseline"],
+                expected["baseline"],
+            )
+            self.assertNotIn(
+                "sensitive target transport detail",
+                json.dumps(verification.evidence),
+            )
+
+    def test_deployment_smoke_transport_malfunction_is_redacted_error(
+        self,
+    ) -> None:
+        configuration = TargetConfiguration(
+            target_alias="field-host",
+            vps_host="198.51.100.10",
+            vps_user="deploy",
+            vps_ssh_port=22,
+            vps_ssh_key=Path("/tmp/test-only-operator-key"),
+            vps_deploy_dir="/srv/eventhorizon-field",
+            vps_project_name="eventhorizon-field",
+            admin_source_cidr="203.0.113.9/32",
+            field_tarpit_cpu_limit="0.50",
+            field_tarpit_memory_limit=None,
+        )
+        commit = "1" * 40
+        run_id = "deploy-20260730T010203Z-a1b2c3"
+
+        class BrokenRemoteSmoke:
+            def capture_baseline(self, *args: object) -> object:
+                raise OSError("sensitive SSH transport detail")
+
+            def capture_final(self, *args: object) -> object:
+                raise OSError("not reached")
+
+            def stop(self, *args: object) -> bool:
+                return True
+
+        class ProtocolClients:
+            def run(self, host: str) -> tuple[dict[str, object], ...]:
+                return ()
+
+        verification = deployment_controller.SshDeploymentSmoke(
+            remote=BrokenRemoteSmoke(),
+            clients=ProtocolClients(),
+            clock=FixedClock(),
+        ).verify(
+            configuration,
+            commit,
+            {},
+            {
+                "service_image_ids": {
+                    service: "sha256:" + str(index) * 64
+                    for index, service in enumerate(
+                        (
+                            "cadvisor",
+                            "grafana",
+                            "mqtt_pit",
+                            "prometheus",
+                            "prometheus-exporter",
+                            "telnet_pit",
+                        ),
+                        start=1,
+                    )
+                }
+            },
+            run_id,
+        )
+
+        self.assertFalse(verification.passed)
+        self.assertEqual(verification.outcome, "ERROR")
+        self.assertFalse(verification.field_services_running)
+        self.assertEqual(
+            verification.evidence["reason_code"],
+            "REMOTE_TRANSPORT_MALFUNCTION",
+        )
+        self.assertIsNone(verification.evidence["baseline"])
+        self.assertNotIn(
+            "sensitive SSH transport detail",
+            json.dumps(verification.evidence),
+        )
+
+    def test_deployment_smoke_without_fresh_final_scrape_is_inconclusive(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            configuration = TargetConfiguration(
+                target_alias="field-host",
+                vps_host="198.51.100.10",
+                vps_user="deploy",
+                vps_ssh_port=22,
+                vps_ssh_key=temporary_path / "operator_key",
+                vps_deploy_dir="/srv/eventhorizon-field",
+                vps_project_name="eventhorizon-field",
+                admin_source_cidr="203.0.113.9/32",
+                field_tarpit_cpu_limit="0.50",
+                field_tarpit_memory_limit=None,
+            )
+            commit = "1" * 40
+            run_id = "deploy-20260730T010203Z-a1b2c3"
+            expected = successful_protocol_smoke_evidence(commit, run_id)
+            stale_final = json.loads(json.dumps(expected["baseline"]))
+
+            class Execution:
+                returncode = 0
+                stderr = b""
+
+                def __init__(self, action: str) -> None:
+                    final = action == "FINAL"
+                    self.stdout = json.dumps(
+                        {
+                            "schema_version": 1,
+                            "action": action,
+                            "run_id": run_id,
+                            "target_alias": "field-host",
+                            "deployment_commit": commit,
+                            "result": "INCONCLUSIVE" if final else "PASS",
+                            "reason_code": (
+                                "FRESH_SCRAPE_UNAVAILABLE"
+                                if final
+                                else "SNAPSHOT_CAPTURED"
+                            ),
+                            "snapshot": (
+                                stale_final if final else expected["baseline"]
+                            ),
+                        }
+                    ).encode("utf-8")
+
+            class RemoteSmoke:
+                def capture_baseline(self, *args: object) -> object:
+                    return Execution("BASELINE")
+
+                def capture_final(self, *args: object) -> object:
+                    return Execution("FINAL")
+
+                def stop(self, *args: object) -> bool:
+                    return True
+
+            class ProtocolClients:
+                def run(self, host: str) -> tuple[dict[str, object], ...]:
+                    return tuple(expected["clients"])
+
+            verification = deployment_controller.SshDeploymentSmoke(
+                remote=RemoteSmoke(),
+                clients=ProtocolClients(),
+                clock=FixedClock(),
+            ).verify(
+                configuration,
+                commit,
+                {},
+                {
+                    "service_image_ids": {
+                        service: "sha256:" + str(index) * 64
+                        for index, service in enumerate(
+                            (
+                                "cadvisor",
+                                "grafana",
+                                "mqtt_pit",
+                                "prometheus",
+                                "prometheus-exporter",
+                                "telnet_pit",
+                            ),
+                            start=1,
+                        )
+                    }
+                },
+                run_id,
+            )
+
+            self.assertFalse(verification.passed)
+            self.assertEqual(verification.outcome, "INCONCLUSIVE")
+            self.assertFalse(verification.field_services_running)
+            self.assertEqual(
+                verification.evidence["reason_code"],
+                "METRIC_EVIDENCE_INSUFFICIENT",
+            )
+            self.assertEqual(verification.evidence["final"], stale_final)
+            self.assertEqual(
+                verification.evidence["clients"],
+                expected["clients"],
+            )
+
     def test_runtime_accepts_healthy_cadvisor_and_combines_port_evidence(
         self,
     ) -> None:
@@ -3696,7 +4814,7 @@ class DeploymentControllerApiTests(unittest.TestCase):
                     for run_directory in deployments.iterdir():
                         run_directory.chmod(0o700)
 
-    def test_successful_exact_source_deployment_advances_to_runtime_verification(
+    def test_successful_deployment_smoke_advances_to_evidence_retrieval(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -3834,6 +4952,29 @@ class DeploymentControllerApiTests(unittest.TestCase):
 
                     return Verification()
 
+            protocol_smoke = successful_protocol_smoke_evidence(
+                commit,
+                "deploy-20260730T010203Z-a1b2c3",
+            )
+
+            class ReadySmoke:
+                def verify(
+                    self,
+                    configuration: object,
+                    deployment_commit: str,
+                    policy: dict[str, object],
+                    deployment_manifest: dict[str, object],
+                    run_id: str,
+                ) -> object:
+                    class Verification:
+                        passed = True
+                        outcome = "PASS"
+                        blocker = None
+                        field_services_running = True
+                        evidence = protocol_smoke
+
+                    return Verification()
+
             result = run(
                 DeploymentRequest(
                     check_only=False,
@@ -3850,6 +4991,7 @@ class DeploymentControllerApiTests(unittest.TestCase):
                     authorization=ApprovedAuthorization(),
                     deployment=ReadyDeployment(),
                     runtime=ReadyRuntime(),
+                    smoke=ReadySmoke(),
                 ),
             )
 
@@ -3860,7 +5002,11 @@ class DeploymentControllerApiTests(unittest.TestCase):
                 "PASS",
             )
             self.assertEqual(
-                checks["deployment_smoke_foundation"].status,
+                checks["deployment_smoke"].status,
+                "PASS",
+            )
+            self.assertEqual(
+                checks["evidence_retrieval_foundation"].status,
                 "BLOCKER",
             )
             self.assertTrue(result.remote_mutation_occurred)
@@ -3894,6 +5040,14 @@ class DeploymentControllerApiTests(unittest.TestCase):
                     )
                 ),
                 health_and_ports,
+            )
+            self.assertEqual(
+                json.loads(
+                    (run_directory / "protocol-smoke.json").read_text(
+                        encoding="utf-8"
+                    )
+                ),
+                protocol_smoke,
             )
             authorization = json.loads(
                 (run_directory / "authorization.json").read_text(
@@ -4037,6 +5191,7 @@ class DeploymentControllerApiTests(unittest.TestCase):
         self.assertIsNotNone(adapters.remote)
         self.assertIsNotNone(adapters.deployment)
         self.assertIsNotNone(adapters.runtime)
+        self.assertIsNotNone(adapters.smoke)
 
     def test_run_returns_a_deterministic_structured_result(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -4678,6 +5833,107 @@ else:
                 )
             )
 
+    def test_production_ssh_transport_streams_bounded_smoke_program(self) -> None:
+        transport_class = deployment_controller.SystemSshSmokeTransport
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            _, ssh_key = write_strict_target_configuration(temporary_path)
+            fake_ssh = temporary_path / "ssh"
+            fake_ssh.write_text(
+                """#!/usr/bin/env python3
+import base64
+import json
+import sys
+
+required = {
+    "BatchMode=yes",
+    "IdentitiesOnly=yes",
+    "StrictHostKeyChecking=yes",
+    "ConnectTimeout=10",
+}
+if not required.issubset(set(sys.argv)):
+    raise SystemExit(91)
+if sys.argv[-2] != "-" or sys.argv[-3] != "python3":
+    raise SystemExit(92)
+program = sys.stdin.buffer.read()
+if b"EventHorizon deterministic deployment-smoke snapshot collector" not in program:
+    raise SystemExit(93)
+request = json.loads(base64.urlsafe_b64decode(sys.argv[-1]))
+if request["prometheus_url"] != "http://127.0.0.1:9090":
+    raise SystemExit(94)
+print(json.dumps({
+    "action": request["action"],
+    "baseline_scrape_utc": request["baseline_scrape_utc"],
+}))
+""",
+                encoding="utf-8",
+            )
+            fake_ssh.chmod(0o700)
+            configuration = TargetConfiguration(
+                target_alias="field-host",
+                vps_host="198.51.100.10",
+                vps_user="deploy",
+                vps_ssh_port=22,
+                vps_ssh_key=ssh_key,
+                vps_deploy_dir="/srv/eventhorizon-field",
+                vps_project_name="eventhorizon-field",
+                admin_source_cidr="203.0.113.9/32",
+                field_tarpit_cpu_limit="0.50",
+                field_tarpit_memory_limit=None,
+            )
+            image_ids = {
+                service: "sha256:" + str(index) * 64
+                for index, service in enumerate(
+                    (
+                        "cadvisor",
+                        "grafana",
+                        "mqtt_pit",
+                        "prometheus",
+                        "prometheus-exporter",
+                        "telnet_pit",
+                    ),
+                    start=1,
+                )
+            }
+
+            class Cleanup:
+                def stop(self, *args: object) -> bool:
+                    return True
+
+            transport = transport_class(
+                smoke_program_path=(
+                    REPO_ROOT / "scripts/vps_field_remote_smoke.py"
+                ),
+                cleanup=Cleanup(),
+                ssh_executable=fake_ssh,
+            )
+            baseline = transport.capture_baseline(
+                configuration,
+                "1" * 40,
+                image_ids,
+                "deploy-20260730T010203Z-a1b2c3",
+            )
+            final = transport.capture_final(
+                configuration,
+                "1" * 40,
+                image_ids,
+                "deploy-20260730T010203Z-a1b2c3",
+                "2026-07-30T01:02:03Z",
+            )
+
+            self.assertEqual(baseline.returncode, 0)
+            self.assertEqual(
+                json.loads(baseline.stdout),
+                {"action": "BASELINE", "baseline_scrape_utc": None},
+            )
+            self.assertEqual(
+                json.loads(final.stdout),
+                {
+                    "action": "FINAL",
+                    "baseline_scrape_utc": "2026-07-30T01:02:03Z",
+                },
+            )
+
     def test_privacy_expanding_deployment_evidence_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary_path = Path(temporary_directory)
@@ -5062,6 +6318,89 @@ else:
             )
             self.assertFalse(authorization["authorization_attested"])
             self.assertEqual(authorization["result"], "CANCELLED")
+
+
+class ProtocolSmokeClientIntegrationTests(unittest.TestCase):
+    def test_standard_library_clients_run_one_telnet_and_mqtt_session(
+        self,
+    ) -> None:
+        client_class = deployment_controller.SystemProtocolSmokeClients
+        telnet_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        mqtt_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        for listener in (telnet_listener, mqtt_listener):
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            listener.settimeout(3)
+        telnet_port = telnet_listener.getsockname()[1]
+        mqtt_port = mqtt_listener.getsockname()[1]
+        observed: dict[str, bytes] = {}
+        errors: list[str] = []
+
+        def serve_telnet() -> None:
+            try:
+                connection, _ = telnet_listener.accept()
+                with connection:
+                    connection.settimeout(2)
+                    connection.sendall(b"controlled banner\r\n")
+                    received = bytearray()
+                    while True:
+                        chunk = connection.recv(4096)
+                        if not chunk:
+                            break
+                        received.extend(chunk)
+                    observed["telnet"] = bytes(received)
+            except Exception as error:  # test-server diagnostics only
+                errors.append(type(error).__name__)
+
+        def serve_mqtt() -> None:
+            try:
+                connection, _ = mqtt_listener.accept()
+                with connection:
+                    connection.settimeout(2)
+                    connect_packet = bytearray(connection.recv(4096))
+                    while len(connect_packet) < 2 + connect_packet[1]:
+                        connect_packet.extend(connection.recv(4096))
+                    connection.sendall(b"\x20\x02\x00\x00")
+                    following = bytearray()
+                    while b"\xe0\x00" not in following:
+                        chunk = connection.recv(4096)
+                        if not chunk:
+                            break
+                        following.extend(chunk)
+                    observed["mqtt_connect"] = bytes(connect_packet)
+                    observed["mqtt_following"] = bytes(following)
+            except Exception as error:  # test-server diagnostics only
+                errors.append(type(error).__name__)
+
+        threads = [
+            threading.Thread(target=serve_telnet, daemon=True),
+            threading.Thread(target=serve_mqtt, daemon=True),
+        ]
+        for thread in threads:
+            thread.start()
+        try:
+            results = client_class(
+                telnet_port=telnet_port,
+                mqtt_port=mqtt_port,
+                timeout_seconds=2,
+            ).run("127.0.0.1")
+        finally:
+            for listener in (telnet_listener, mqtt_listener):
+                listener.close()
+            for thread in threads:
+                thread.join(timeout=3)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(observed["telnet"], b"help\r\n")
+        self.assertEqual(observed["mqtt_connect"][0] >> 4, 1)
+        self.assertEqual(observed["mqtt_following"][0] >> 4, 3)
+        self.assertTrue(observed["mqtt_following"].endswith(b"\xe0\x00"))
+        self.assertEqual(
+            [(item["protocol"], item["result"]) for item in results],
+            [("telnet", "PASS"), ("mqtt", "PASS")],
+        )
+        self.assertTrue(all(item["bytes_written"] > 0 for item in results))
 
 
 class LocalGitRepositoryIntegrationTests(unittest.TestCase):

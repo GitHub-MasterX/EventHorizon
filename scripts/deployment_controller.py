@@ -18,6 +18,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -32,6 +33,7 @@ REMOTE_PREFLIGHT_SCHEMA_VERSION = 2
 COMPOSE_CONFIG_SCHEMA_VERSION = 1
 DEPLOYMENT_MANIFEST_SCHEMA_VERSION = 1
 HEALTH_AND_PORTS_SCHEMA_VERSION = 1
+PROTOCOL_SMOKE_SCHEMA_VERSION = 1
 CONTROLLER_CONTRACT_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FULL_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -115,6 +117,15 @@ class RuntimeVerification:
 
 
 @dataclass(frozen=True)
+class DeploymentSmokeVerification:
+    passed: bool
+    outcome: str
+    blocker: str | None
+    field_services_running: bool
+    evidence: dict[str, object]
+
+
+@dataclass(frozen=True)
 class RemoteProbeExecution:
     returncode: int
     stdout: bytes
@@ -130,6 +141,13 @@ class RemoteDeploymentExecution:
 
 @dataclass(frozen=True)
 class RemoteRuntimeExecution:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+
+
+@dataclass(frozen=True)
+class RemoteSmokeExecution:
     returncode: int
     stdout: bytes
     stderr: bytes
@@ -215,6 +233,18 @@ class RuntimeCapabilities(Protocol):
         """Verify runtime health, bindings, and workstation reachability."""
 
 
+class DeploymentSmokeCapabilities(Protocol):
+    def verify(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+        deployment_manifest: dict[str, object],
+        run_id: str,
+    ) -> DeploymentSmokeVerification:
+        """Run the deterministic external-path Telnet and MQTT smoke."""
+
+
 class RemoteProbeCapabilities(Protocol):
     def collect(
         self,
@@ -263,6 +293,40 @@ class WorkstationPortCapabilities(Protocol):
         ports: tuple[int, ...],
     ) -> dict[int, bool]:
         """Observe bounded TCP reachability from the operator workstation."""
+
+
+class SmokeRemoteTransportCapabilities(Protocol):
+    def capture_baseline(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        expected_image_ids: dict[str, str],
+        run_id: str,
+    ) -> RemoteSmokeExecution:
+        """Capture one fresh zero-active baseline on the authorized VPS."""
+
+    def capture_final(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        expected_image_ids: dict[str, str],
+        run_id: str,
+        baseline_scrape_utc: str,
+    ) -> RemoteSmokeExecution:
+        """Capture one fresh settled final snapshot after controlled traffic."""
+
+    def stop(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        run_id: str,
+    ) -> bool:
+        """Stop the exact managed field services after smoke does not pass."""
+
+
+class ProtocolSmokeClientCapabilities(Protocol):
+    def run(self, host: str) -> tuple[dict[str, object], ...]:
+        """Run exactly one bounded Telnet and MQTT session."""
 
 
 class AuthorizationCapabilities(Protocol):
@@ -1191,6 +1255,125 @@ class SystemSshRuntimeTransport:
 
 
 @dataclass(frozen=True)
+class SystemSshSmokeTransport:
+    smoke_program_path: Path
+    cleanup: RuntimeRemoteTransportCapabilities
+    ssh_executable: str | Path = "ssh"
+    timeout_seconds: int = 120
+    settle_timeout_seconds: int = 75
+
+    def _execute(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        expected_image_ids: dict[str, str],
+        run_id: str,
+        action: str,
+        baseline_scrape_utc: str | None,
+    ) -> RemoteSmokeExecution:
+        request = {
+            "schema_version": PROTOCOL_SMOKE_SCHEMA_VERSION,
+            "action": action,
+            "run_id": run_id,
+            "target_alias": configuration.target_alias,
+            "deployment_commit": commit,
+            "deploy_dir": configuration.vps_deploy_dir,
+            "project_name": configuration.vps_project_name,
+            "expected_image_ids": expected_image_ids,
+            "baseline_scrape_utc": baseline_scrape_utc,
+            "prometheus_url": "http://127.0.0.1:9090",
+            "settle_timeout_seconds": self.settle_timeout_seconds,
+        }
+        encoded_request = base64.urlsafe_b64encode(
+            json.dumps(
+                request,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).decode("ascii")
+        program = self.smoke_program_path.read_bytes()
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "GIT_TERMINAL_PROMPT": "0",
+                "LC_ALL": "C",
+            }
+        )
+        completed = subprocess.run(
+            [
+                str(self.ssh_executable),
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "IdentitiesOnly=yes",
+                "-o",
+                "StrictHostKeyChecking=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "-p",
+                str(configuration.vps_ssh_port),
+                "-i",
+                str(configuration.vps_ssh_key),
+                f"{configuration.vps_user}@{configuration.vps_host}",
+                "python3",
+                "-",
+                encoded_request,
+            ],
+            input=program,
+            capture_output=True,
+            check=False,
+            env=environment,
+            timeout=self.timeout_seconds,
+        )
+        return RemoteSmokeExecution(
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+
+    def capture_baseline(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        expected_image_ids: dict[str, str],
+        run_id: str,
+    ) -> RemoteSmokeExecution:
+        return self._execute(
+            configuration,
+            commit,
+            expected_image_ids,
+            run_id,
+            "BASELINE",
+            None,
+        )
+
+    def capture_final(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        expected_image_ids: dict[str, str],
+        run_id: str,
+        baseline_scrape_utc: str,
+    ) -> RemoteSmokeExecution:
+        return self._execute(
+            configuration,
+            commit,
+            expected_image_ids,
+            run_id,
+            "FINAL",
+            baseline_scrape_utc,
+        )
+
+    def stop(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        run_id: str,
+    ) -> bool:
+        return self.cleanup.stop(configuration, commit, run_id)
+
+
+@dataclass(frozen=True)
 class SystemTcpPortProbe:
     timeout_seconds: float = 5.0
 
@@ -1243,6 +1426,109 @@ class SystemTcpPortProbe:
                 port: futures[port].result()
                 for port in ports
             }
+
+
+@dataclass(frozen=True)
+class SystemProtocolSmokeClients:
+    telnet_port: int = 23
+    mqtt_port: int = 1883
+    timeout_seconds: float = 5.0
+
+    @staticmethod
+    def _remaining_length(value: int) -> bytes:
+        encoded = bytearray()
+        while True:
+            byte = value % 128
+            value //= 128
+            if value:
+                byte |= 0x80
+            encoded.append(byte)
+            if not value:
+                return bytes(encoded)
+
+    def _drain(self, connection: socket.socket) -> int:
+        deadline = time.monotonic() + min(self.timeout_seconds, 1.0)
+        received = 0
+        connection.settimeout(min(self.timeout_seconds, 0.2))
+        while time.monotonic() < deadline:
+            try:
+                chunk = connection.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            received += len(chunk)
+        return received
+
+    def _telnet(self, host: str) -> dict[str, object]:
+        payload = b"help\r\n"
+        with socket.create_connection(
+            (host, self.telnet_port),
+            timeout=self.timeout_seconds,
+        ) as connection:
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            connection.sendall(payload)
+            connection.shutdown(socket.SHUT_WR)
+            bytes_read = self._drain(connection)
+        return {
+            "protocol": "telnet",
+            "result": "PASS",
+            "bytes_written": len(payload),
+            "bytes_read": bytes_read,
+        }
+
+    def _mqtt(self, host: str) -> dict[str, object]:
+        client_id = b"eh-deployment-smoke"
+        connect_body = (
+            b"\x00\x04MQTT\x04\x02\x00\x05"
+            + len(client_id).to_bytes(2, "big")
+            + client_id
+        )
+        connect_packet = (
+            b"\x10"
+            + self._remaining_length(len(connect_body))
+            + connect_body
+        )
+        topic = b"validation/depth"
+        publish_body = len(topic).to_bytes(2, "big") + topic + b"x"
+        publish_packet = (
+            b"\x30"
+            + self._remaining_length(len(publish_body))
+            + publish_body
+        )
+        disconnect_packet = b"\xe0\x00"
+        with socket.create_connection(
+            (host, self.mqtt_port),
+            timeout=self.timeout_seconds,
+        ) as connection:
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            connection.settimeout(self.timeout_seconds)
+            connection.sendall(connect_packet)
+            response = bytearray()
+            while len(response) < 4:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    raise OSError("MQTT server closed before CONNACK")
+                response.extend(chunk)
+            if bytes(response[:4]) != b"\x20\x02\x00\x00":
+                raise OSError("MQTT server returned an invalid CONNACK")
+            connection.sendall(publish_packet)
+            connection.sendall(disconnect_packet)
+            connection.shutdown(socket.SHUT_WR)
+            bytes_read = len(response) + self._drain(connection)
+        return {
+            "protocol": "mqtt",
+            "result": "PASS",
+            "bytes_written": (
+                len(connect_packet)
+                + len(publish_packet)
+                + len(disconnect_packet)
+            ),
+            "bytes_read": bytes_read,
+        }
+
+    def run(self, host: str) -> tuple[dict[str, object], ...]:
+        return (self._telnet(host), self._mqtt(host))
 
 
 def _remote_preflight_evidence_is_valid(
@@ -2334,6 +2620,557 @@ class SshRuntimeVerification:
         )
 
 
+SMOKE_PROTOCOLS = ("telnet", "mqtt")
+SMOKE_SNAPSHOT_FIELDS = (
+    "connections",
+    "completed_sessions",
+    "active_sessions",
+    "depth_0",
+    "depth_1",
+    "depth_2",
+    "depth_3",
+    "duration_count",
+    "duration_inf",
+    "application_bytes_received",
+    "application_bytes_sent",
+    "restart_count",
+)
+
+
+def _smoke_datetime(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
+def _smoke_snapshot_is_valid(value: object) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "captured_utc",
+        "scrape_utc",
+        "malformed_messages",
+        "protocols",
+    }:
+        return False
+    if (
+        _smoke_datetime(value["captured_utc"]) is None
+        or _smoke_datetime(value["scrape_utc"]) is None
+        or type(value["malformed_messages"]) is not int
+        or value["malformed_messages"] < 0
+        or not isinstance(value["protocols"], list)
+        or len(value["protocols"]) != len(SMOKE_PROTOCOLS)
+    ):
+        return False
+    for expected_protocol, observed in zip(
+        SMOKE_PROTOCOLS,
+        value["protocols"],
+        strict=True,
+    ):
+        if not isinstance(observed, dict) or set(observed) != {
+            "protocol",
+            *SMOKE_SNAPSHOT_FIELDS,
+            "oom_killed",
+            "image_id_verified",
+        }:
+            return False
+        if observed["protocol"] != expected_protocol:
+            return False
+        if any(
+            type(observed[field_name]) is not int
+            or observed[field_name] < 0
+            for field_name in SMOKE_SNAPSHOT_FIELDS
+        ):
+            return False
+        if (
+            type(observed["oom_killed"]) is not bool
+            or type(observed["image_id_verified"]) is not bool
+        ):
+            return False
+    return True
+
+
+def _smoke_capture_is_valid(
+    value: object,
+    action: str,
+    configuration: TargetConfiguration,
+    commit: str,
+    run_id: str,
+) -> bool:
+    if not (
+        isinstance(value, dict)
+        and set(value)
+        == {
+            "schema_version",
+            "action",
+            "run_id",
+            "target_alias",
+            "deployment_commit",
+            "result",
+            "reason_code",
+            "snapshot",
+        }
+        and value["schema_version"] == PROTOCOL_SMOKE_SCHEMA_VERSION
+        and value["action"] == action
+        and value["run_id"] == run_id
+        and value["target_alias"] == configuration.target_alias
+        and value["deployment_commit"] == commit
+        and value["result"]
+        in {"PASS", "BLOCKED", "INCONCLUSIVE", "ERROR"}
+        and value["reason_code"]
+        in {
+            "SNAPSHOT_CAPTURED",
+            "ACTIVE_SESSIONS_DID_NOT_SETTLE",
+            "FRESH_SCRAPE_UNAVAILABLE",
+            "RUNTIME_STATE_INVALID",
+        }
+        and _smoke_snapshot_is_valid(value["snapshot"])
+    ):
+        return False
+    return (
+        value["result"] == "PASS"
+        and value["reason_code"] == "SNAPSHOT_CAPTURED"
+    ) or (
+        action == "BASELINE"
+        and value["result"] == "BLOCKED"
+        and value["reason_code"] == "ACTIVE_SESSIONS_DID_NOT_SETTLE"
+    ) or (
+        value["result"] in {"INCONCLUSIVE", "ERROR"}
+        and value["reason_code"]
+        in {"FRESH_SCRAPE_UNAVAILABLE", "RUNTIME_STATE_INVALID"}
+    )
+
+
+def _smoke_clients_are_valid(value: object) -> bool:
+    if not isinstance(value, tuple) or len(value) != len(SMOKE_PROTOCOLS):
+        return False
+    for expected_protocol, observed in zip(
+        SMOKE_PROTOCOLS,
+        value,
+        strict=True,
+    ):
+        if (
+            not isinstance(observed, dict)
+            or set(observed)
+            != {"protocol", "result", "bytes_written", "bytes_read"}
+            or observed["protocol"] != expected_protocol
+            or observed["result"] != "PASS"
+            or type(observed["bytes_written"]) is not int
+            or observed["bytes_written"] <= 0
+            or type(observed["bytes_read"]) is not int
+            or observed["bytes_read"] < 0
+        ):
+            return False
+    return True
+
+
+@dataclass(frozen=True)
+class SshDeploymentSmoke:
+    remote: SmokeRemoteTransportCapabilities
+    clients: ProtocolSmokeClientCapabilities
+    clock: Clock
+
+    def _capture(
+        self,
+        execution: RemoteSmokeExecution,
+        action: str,
+        configuration: TargetConfiguration,
+        commit: str,
+        run_id: str,
+    ) -> dict[str, object]:
+        if execution.returncode != 0 or len(execution.stdout) > 2 * 1024 * 1024:
+            raise RuntimeError("smoke transport malfunction")
+        try:
+            capture = json.loads(execution.stdout.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError("malformed smoke evidence") from error
+        if not _smoke_capture_is_valid(
+            capture,
+            action,
+            configuration,
+            commit,
+            run_id,
+        ):
+            raise ValueError("malformed smoke evidence")
+        return capture
+
+    def _failed(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        run_id: str,
+        outcome: str,
+        reason_code: str,
+        blocker: str,
+        baseline: dict[str, object] | None = None,
+        final: dict[str, object] | None = None,
+        clients: tuple[dict[str, object], ...] = (),
+        protocols: list[dict[str, object]] | None = None,
+    ) -> DeploymentSmokeVerification:
+        try:
+            cleanup_succeeded = self.remote.stop(
+                configuration,
+                commit,
+                run_id,
+            )
+        except (OSError, subprocess.SubprocessError, TimeoutError):
+            cleanup_succeeded = False
+        if not cleanup_succeeded:
+            outcome = "ERROR"
+            reason_code = "CLEANUP_UNPROVEN"
+            blocker = (
+                "Deployment smoke did not pass and field-service cleanup "
+                "could not be proven."
+            )
+        timestamp = _utc_text(self.clock.now())
+        evidence = {
+            "schema_version": PROTOCOL_SMOKE_SCHEMA_VERSION,
+            "run_id": run_id,
+            "target_alias": configuration.target_alias,
+            "deployment_commit": commit,
+            "started_utc": (
+                str(baseline["captured_utc"]) if baseline else timestamp
+            ),
+            "finished_utc": (
+                str(final["captured_utc"]) if final else timestamp
+            ),
+            "result": outcome,
+            "reason_code": reason_code,
+            "client_implementation": "PYTHON_STDLIB",
+            "baseline": baseline,
+            "final": final,
+            "clients": list(clients),
+            "protocols": protocols or [],
+            "cleanup": {"attempted": True, "succeeded": cleanup_succeeded},
+        }
+        return DeploymentSmokeVerification(
+            passed=False,
+            outcome=outcome,
+            blocker=blocker,
+            field_services_running=not cleanup_succeeded,
+            evidence=evidence,
+        )
+
+    def verify(
+        self,
+        configuration: TargetConfiguration,
+        commit: str,
+        policy: dict[str, object],
+        deployment_manifest: dict[str, object],
+        run_id: str,
+    ) -> DeploymentSmokeVerification:
+        image_ids = deployment_manifest.get("service_image_ids")
+        if not _image_ids_are_valid(image_ids, require_all=True):
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "ERROR",
+                "REMOTE_EVIDENCE_MALFORMED",
+                "Deployment image evidence is unavailable for smoke validation.",
+            )
+        assert isinstance(image_ids, dict)
+        try:
+            baseline_capture = self._capture(
+                self.remote.capture_baseline(
+                    configuration,
+                    commit,
+                    image_ids,
+                    run_id,
+                ),
+                "BASELINE",
+                configuration,
+                commit,
+                run_id,
+            )
+        except (OSError, subprocess.SubprocessError, TimeoutError, RuntimeError):
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "ERROR",
+                "REMOTE_TRANSPORT_MALFUNCTION",
+                "Remote deployment-smoke transport malfunctioned.",
+            )
+        except ValueError:
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "ERROR",
+                "REMOTE_EVIDENCE_MALFORMED",
+                "Remote deployment-smoke evidence is malformed.",
+            )
+        baseline = baseline_capture["snapshot"]
+        if baseline_capture["result"] != "PASS":
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                str(baseline_capture["result"]),
+                "CLEAN_BASELINE_UNAVAILABLE",
+                "A clean zero-active deployment-smoke baseline is unavailable.",
+                baseline=baseline,
+            )
+        try:
+            clients = self.clients.run(configuration.vps_host)
+        except (OSError, TimeoutError):
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "ERROR",
+                "CLIENT_MALFUNCTION",
+                "A bounded protocol smoke client malfunctioned.",
+                baseline=baseline,
+            )
+        if not _smoke_clients_are_valid(clients):
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "ERROR",
+                "CLIENT_MALFUNCTION",
+                "A bounded protocol smoke client returned malformed evidence.",
+                baseline=baseline,
+            )
+        try:
+            final_capture = self._capture(
+                self.remote.capture_final(
+                    configuration,
+                    commit,
+                    image_ids,
+                    run_id,
+                    str(baseline["scrape_utc"]),
+                ),
+                "FINAL",
+                configuration,
+                commit,
+                run_id,
+            )
+        except (OSError, subprocess.SubprocessError, TimeoutError, RuntimeError):
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "ERROR",
+                "REMOTE_TRANSPORT_MALFUNCTION",
+                "Remote deployment-smoke transport malfunctioned.",
+                baseline=baseline,
+                clients=clients,
+            )
+        except ValueError:
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "ERROR",
+                "REMOTE_EVIDENCE_MALFORMED",
+                "Remote deployment-smoke evidence is malformed.",
+                baseline=baseline,
+                clients=clients,
+            )
+        final = final_capture["snapshot"]
+        if final_capture["result"] != "PASS":
+            final_outcome = str(final_capture["result"])
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                final_outcome,
+                (
+                    "METRIC_EVIDENCE_INSUFFICIENT"
+                    if final_outcome == "INCONCLUSIVE"
+                    else "REMOTE_TRANSPORT_MALFUNCTION"
+                ),
+                (
+                    "A fresh settled final scrape is unavailable."
+                    if final_outcome == "INCONCLUSIVE"
+                    else "Remote deployment-smoke collection malfunctioned."
+                ),
+                baseline=baseline,
+                final=final,
+                clients=clients,
+            )
+        baseline_scrape = _smoke_datetime(baseline["scrape_utc"])
+        final_scrape = _smoke_datetime(final["scrape_utc"])
+        assert baseline_scrape is not None and final_scrape is not None
+        if final_scrape <= baseline_scrape:
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "INCONCLUSIVE",
+                "METRIC_EVIDENCE_INSUFFICIENT",
+                "A fresh settled final scrape is unavailable.",
+                baseline=baseline,
+                final=final,
+                clients=clients,
+            )
+
+        malformed_delta = (
+            final["malformed_messages"] - baseline["malformed_messages"]
+        )
+        protocol_results = []
+        for protocol_name, before, after in zip(
+            SMOKE_PROTOCOLS,
+            baseline["protocols"],
+            final["protocols"],
+            strict=True,
+        ):
+            depth_delta = sum(
+                after[f"depth_{depth}"] - before[f"depth_{depth}"]
+                for depth in range(4)
+            )
+            deltas = {
+                "connections": after["connections"] - before["connections"],
+                "completed_sessions": (
+                    after["completed_sessions"]
+                    - before["completed_sessions"]
+                ),
+                "depth_total": depth_delta,
+                "depth_2": after["depth_2"] - before["depth_2"],
+                "duration_count": (
+                    after["duration_count"] - before["duration_count"]
+                ),
+                "duration_inf": (
+                    after["duration_inf"] - before["duration_inf"]
+                ),
+                "application_bytes_received": (
+                    after["application_bytes_received"]
+                    - before["application_bytes_received"]
+                ),
+                "application_bytes_sent": (
+                    after["application_bytes_sent"]
+                    - before["application_bytes_sent"]
+                ),
+                "malformed_messages": malformed_delta,
+                "restarts": (
+                    after["restart_count"] - before["restart_count"]
+                ),
+            }
+            checks = {
+                "exact_connection": deltas["connections"] == 1,
+                "exact_completion": deltas["completed_sessions"] == 1,
+                "active_settled": after["active_sessions"] == 0,
+                "exact_depth_total": deltas["depth_total"] == 1,
+                "exact_depth_2": deltas["depth_2"] == 1,
+                "exact_duration_count": deltas["duration_count"] == 1,
+                "exact_duration_inf": deltas["duration_inf"] == 1,
+                "positive_bytes_received": (
+                    deltas["application_bytes_received"] > 0
+                ),
+                "positive_bytes_sent": deltas["application_bytes_sent"] > 0,
+                "malformed_unchanged": malformed_delta == 0,
+                "restart_unchanged": deltas["restarts"] == 0,
+                "oom_not_observed": not after["oom_killed"],
+                "lifecycle_reconciled": all(
+                    snapshot["connections"]
+                    == snapshot["completed_sessions"]
+                    + snapshot["active_sessions"]
+                    for snapshot in (before, after)
+                ),
+                "depth_reconciled": all(
+                    sum(snapshot[f"depth_{depth}"] for depth in range(4))
+                    == snapshot["completed_sessions"]
+                    for snapshot in (before, after)
+                ),
+                "duration_reconciled": all(
+                    snapshot["duration_inf"]
+                    == snapshot["duration_count"]
+                    == snapshot["completed_sessions"]
+                    for snapshot in (before, after)
+                ),
+            }
+            protocol_results.append(
+                {
+                    "protocol": protocol_name,
+                    "result": (
+                        "PASS" if all(checks.values()) else "FAIL"
+                    ),
+                    "deltas": deltas,
+                    "checks": checks,
+                }
+            )
+        counter_reset = malformed_delta < 0 or any(
+            any(delta < 0 for delta in item["deltas"].values())
+            for item in protocol_results
+        )
+        if counter_reset:
+            for item in protocol_results:
+                item["result"] = "INCONCLUSIVE"
+            return self._failed(
+                configuration,
+                commit,
+                run_id,
+                "INCONCLUSIVE",
+                "METRIC_EVIDENCE_INSUFFICIENT",
+                "A counter reset prevents exact deployment-smoke reconciliation.",
+                baseline=baseline,
+                final=final,
+                clients=clients,
+                protocols=protocol_results,
+            )
+        passed = all(item["result"] == "PASS" for item in protocol_results)
+        evidence = {
+            "schema_version": PROTOCOL_SMOKE_SCHEMA_VERSION,
+            "run_id": run_id,
+            "target_alias": configuration.target_alias,
+            "deployment_commit": commit,
+            "started_utc": baseline["captured_utc"],
+            "finished_utc": final["captured_utc"],
+            "result": "PASS" if passed else "FAIL",
+            "reason_code": (
+                "SMOKE_PASSED" if passed else "ACCEPTANCE_CHECK_FAILED"
+            ),
+            "client_implementation": "PYTHON_STDLIB",
+            "baseline": baseline,
+            "final": final,
+            "clients": list(clients),
+            "protocols": protocol_results,
+            "cleanup": {"attempted": False, "succeeded": None},
+        }
+        cleanup_succeeded: bool | None = None
+        if not passed:
+            try:
+                cleanup_succeeded = self.remote.stop(
+                    configuration,
+                    commit,
+                    run_id,
+                )
+            except (OSError, subprocess.SubprocessError, TimeoutError):
+                cleanup_succeeded = False
+            evidence["cleanup"] = {
+                "attempted": True,
+                "succeeded": cleanup_succeeded,
+            }
+            if not cleanup_succeeded:
+                evidence["result"] = "ERROR"
+                evidence["reason_code"] = "CLEANUP_UNPROVEN"
+        return DeploymentSmokeVerification(
+            passed=passed,
+            outcome=(
+                "PASS" if passed else "FAIL" if cleanup_succeeded else "ERROR"
+            ),
+            blocker=(
+                None
+                if passed
+                else (
+                    "Deployment smoke violated an acceptance check."
+                    if cleanup_succeeded
+                    else (
+                        "Deployment smoke did not pass and field-service "
+                        "cleanup could not be proven."
+                    )
+                )
+            ),
+            field_services_running=passed or not bool(cleanup_succeeded),
+            evidence=evidence,
+        )
+
+
 @dataclass(frozen=True)
 class ControllerAdapters:
     clock: Clock
@@ -2344,6 +3181,7 @@ class ControllerAdapters:
     authorization: AuthorizationCapabilities | None = None
     deployment: DeploymentCapabilities | None = None
     runtime: RuntimeCapabilities | None = None
+    smoke: DeploymentSmokeCapabilities | None = None
 
 
 @dataclass(frozen=True)
@@ -2505,6 +3343,7 @@ def _load_policy() -> tuple[dict[str, object], str]:
             "compose_config_schema_version",
             "deployment_manifest_schema_version",
             "health_and_ports_schema_version",
+            "protocol_smoke_schema_version",
         },
         "deployment policy",
     )
@@ -2525,6 +3364,7 @@ def _load_policy() -> tuple[dict[str, object], str]:
         "health_and_ports_schema_version": (
             HEALTH_AND_PORTS_SCHEMA_VERSION
         ),
+        "protocol_smoke_schema_version": PROTOCOL_SMOKE_SCHEMA_VERSION,
     }
     for name, expected in expected_constants.items():
         if policy[name] != expected:
@@ -3556,34 +4396,147 @@ def run(
                                                                     ),
                                                                 )
                                                             )
-                                                            next_action = (
-                                                                "Implement the "
-                                                                "deterministic "
-                                                                "Telnet and MQTT "
-                                                                "deployment smoke."
-                                                            )
-                                                            checks.append(
-                                                                CheckResult(
-                                                                    check_id=(
-                                                                        "deployment_"
-                                                                        "smoke_"
-                                                                        "foundation"
-                                                                    ),
-                                                                    phase=8,
-                                                                    status=(
-                                                                        "BLOCKER"
-                                                                    ),
-                                                                    summary=(
-                                                                        "Deterministic "
-                                                                        "deployment "
-                                                                        "smoke remains "
-                                                                        "unimplemented."
-                                                                    ),
-                                                                    next_action=(
-                                                                        next_action
-                                                                    ),
+                                                            if adapters.smoke is None:
+                                                                next_action = (
+                                                                    "Implement the "
+                                                                    "deterministic "
+                                                                    "Telnet and MQTT "
+                                                                    "deployment smoke."
                                                                 )
-                                                            )
+                                                                checks.append(
+                                                                    CheckResult(
+                                                                        check_id=(
+                                                                            "deployment_"
+                                                                            "smoke_"
+                                                                            "foundation"
+                                                                        ),
+                                                                        phase=8,
+                                                                        status=(
+                                                                            "BLOCKER"
+                                                                        ),
+                                                                        summary=(
+                                                                            "Deterministic "
+                                                                            "deployment "
+                                                                            "smoke remains "
+                                                                            "unimplemented."
+                                                                        ),
+                                                                        next_action=(
+                                                                            next_action
+                                                                        ),
+                                                                    )
+                                                                )
+                                                            else:
+                                                                smoke = (
+                                                                    adapters.smoke.verify(
+                                                                        target_configuration,
+                                                                        commit,
+                                                                        policy,
+                                                                        (
+                                                                            deployment
+                                                                            .deployment_manifest
+                                                                        ),
+                                                                        run_id,
+                                                                    )
+                                                                )
+                                                                field_services_running = (
+                                                                    smoke
+                                                                    .field_services_running
+                                                                )
+                                                                if smoke.evidence:
+                                                                    json_artifacts[
+                                                                        "protocol-smoke.json"
+                                                                    ] = smoke.evidence
+                                                                if smoke.passed:
+                                                                    checks.append(
+                                                                        CheckResult(
+                                                                            check_id=(
+                                                                                "deployment_"
+                                                                                "smoke"
+                                                                            ),
+                                                                            phase=8,
+                                                                            status="PASS",
+                                                                            summary=(
+                                                                                "Deterministic "
+                                                                                "Telnet and MQTT "
+                                                                                "deployment smoke "
+                                                                                "passed."
+                                                                            ),
+                                                                        )
+                                                                    )
+                                                                    next_action = (
+                                                                        "Implement final "
+                                                                        "allowlisted evidence "
+                                                                        "retrieval and "
+                                                                        "verification."
+                                                                    )
+                                                                    checks.append(
+                                                                        CheckResult(
+                                                                            check_id=(
+                                                                                "evidence_"
+                                                                                "retrieval_"
+                                                                                "foundation"
+                                                                            ),
+                                                                            phase=9,
+                                                                            status=(
+                                                                                "BLOCKER"
+                                                                            ),
+                                                                            summary=(
+                                                                                "Final evidence "
+                                                                                "retrieval remains "
+                                                                                "unimplemented."
+                                                                            ),
+                                                                            next_action=(
+                                                                                next_action
+                                                                            ),
+                                                                        )
+                                                                    )
+                                                                else:
+                                                                    if smoke.outcome in {
+                                                                        "FAIL",
+                                                                        "ERROR",
+                                                                        "INCONCLUSIVE",
+                                                                    }:
+                                                                        outcome = (
+                                                                            smoke.outcome
+                                                                        )
+                                                                    next_action = (
+                                                                        smoke.blocker
+                                                                        or (
+                                                                            "Resolve the "
+                                                                            "deployment smoke "
+                                                                            "blocker."
+                                                                        )
+                                                                    )
+                                                                    smoke_status = {
+                                                                        "FAIL": "FAIL",
+                                                                        "ERROR": "ERROR",
+                                                                        "INCONCLUSIVE": (
+                                                                            "INCONCLUSIVE"
+                                                                        ),
+                                                                    }.get(
+                                                                        smoke.outcome,
+                                                                        "BLOCKER",
+                                                                    )
+                                                                    checks.append(
+                                                                        CheckResult(
+                                                                            check_id=(
+                                                                                "deployment_"
+                                                                                "smoke"
+                                                                            ),
+                                                                            phase=8,
+                                                                            status=(
+                                                                                smoke_status
+                                                                            ),
+                                                                            summary=(
+                                                                                "Deterministic "
+                                                                                "deployment smoke "
+                                                                                "did not pass."
+                                                                            ),
+                                                                            next_action=(
+                                                                                next_action
+                                                                            ),
+                                                                        )
+                                                                    )
                                                         else:
                                                             if runtime.outcome in {
                                                                 "FAIL",
@@ -3698,6 +4651,8 @@ def run(
         evidence["deployment_manifest"] = "deployment-manifest.json"
     if "health-and-ports.json" in json_artifacts:
         evidence["health_and_ports"] = "health-and-ports.json"
+    if "protocol-smoke.json" in json_artifacts:
+        evidence["protocol_smoke"] = "protocol-smoke.json"
     result = DeploymentResult(
         schema_version=RESULT_SCHEMA_VERSION,
         run_id=run_id,
@@ -3818,6 +4773,11 @@ def production_adapters(
         if authorization_input.isatty() and prompt_output.isatty()
         else None
     )
+    runtime_transport = SystemSshRuntimeTransport(
+        runtime_program_path=(
+            REPO_ROOT / "scripts/vps_field_remote_runtime.py"
+        ),
+    )
     return ControllerAdapters(
         clock=SystemClock(),
         randomness=SystemRandomSource(),
@@ -3837,12 +4797,18 @@ def production_adapters(
             )
         ),
         runtime=SshRuntimeVerification(
-            transport=SystemSshRuntimeTransport(
-                runtime_program_path=(
-                    REPO_ROOT / "scripts/vps_field_remote_runtime.py"
-                ),
-            ),
+            transport=runtime_transport,
             workstation_ports=SystemTcpPortProbe(),
+            clock=SystemClock(),
+        ),
+        smoke=SshDeploymentSmoke(
+            remote=SystemSshSmokeTransport(
+                smoke_program_path=(
+                    REPO_ROOT / "scripts/vps_field_remote_smoke.py"
+                ),
+                cleanup=runtime_transport,
+            ),
+            clients=SystemProtocolSmokeClients(),
             clock=SystemClock(),
         ),
     )
