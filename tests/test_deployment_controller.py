@@ -1252,15 +1252,23 @@ elif tool == "docker":
         print(json.dumps([{"Name": "eventhorizon-field"}]))
     elif arguments[:3] == ["ps", "-a", "--format"]:
         rows = [
-            ("telnet", "0.0.0.0:23->23/tcp"),
-            ("mqtt", "0.0.0.0:1883->1883/tcp"),
-            ("grafana", "127.0.0.1:3000->3000/tcp"),
-            ("cadvisor", "127.0.0.1:8081->8081/tcp"),
-            ("prometheus", "127.0.0.1:9090->9090/tcp"),
-            ("exporter", "127.0.0.1:9101->9101/tcp"),
+            ("telnet", "telnet_pit", "0.0.0.0:23->23/tcp"),
+            ("mqtt", "mqtt_pit", "0.0.0.0:1883->1883/tcp"),
+            ("grafana", "grafana", "127.0.0.1:3000->3000/tcp"),
+            ("cadvisor", "cadvisor", "127.0.0.1:8081->8081/tcp"),
+            ("prometheus", "prometheus", "127.0.0.1:9090->9090/tcp"),
+            (
+                "exporter",
+                "prometheus-exporter",
+                "127.0.0.1:9101->9101/tcp",
+            ),
         ]
-        for name, ports in rows:
-            print(f"{name}\\teventhorizon-field\\t{ports}")
+        missing = os.environ.get("FAKE_MISSING_SERVICE")
+        for name, service, ports in rows:
+            if service != missing:
+                print(
+                    f"{name}\\teventhorizon-field\\t{service}\\t{ports}"
+                )
     elif arguments[:2] == ["volume", "ls"]:
         print("eventhorizon-field_prometheus-data")
         print("eventhorizon-field_grafana-storage")
@@ -1274,7 +1282,16 @@ elif tool == "curl":
 elif tool == "ss":
     if arguments != ["--version"]:
         for port in (23, 1883, 3000, 8081, 9090, 9101):
-            print(f"LISTEN 0 4096 127.0.0.1:{port} 0.0.0.0:*")
+            missing_port = {
+                "telnet_pit": 23,
+                "mqtt_pit": 1883,
+                "grafana": 3000,
+                "cadvisor": 8081,
+                "prometheus": 9090,
+                "prometheus-exporter": 9101,
+            }.get(os.environ.get("FAKE_MISSING_SERVICE"))
+            if port != missing_port:
+                print(f"LISTEN 0 4096 127.0.0.1:{port} 0.0.0.0:*")
 else:
     raise SystemExit(83)
 """,
@@ -1334,6 +1351,40 @@ else:
             )
             self.assertEqual(git("rev-parse", "HEAD"), current_commit)
             self.assertEqual(git("status", "--porcelain"), "")
+
+            environment["FAKE_MISSING_SERVICE"] = "telnet_pit"
+            missing_service = subprocess.run(
+                [
+                    "python3",
+                    str(REPO_ROOT / "scripts/vps_field_remote_probe.py"),
+                    encoded_request,
+                ],
+                cwd=temporary_path,
+                env=environment,
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+            self.assertEqual(
+                missing_service.returncode,
+                0,
+                missing_service.stderr,
+            )
+            missing_service_evidence = json.loads(
+                missing_service.stdout
+            )
+            self.assertEqual(
+                missing_service_evidence["result"],
+                "BLOCKED",
+            )
+            service_check = next(
+                check
+                for check in missing_service_evidence["checks"]
+                if check["id"] == "container_state"
+            )
+            self.assertEqual(service_check["status"], "BLOCKER")
+            del environment["FAKE_MISSING_SERVICE"]
 
             (validation_output / "observation_window.json").write_text(
                 json.dumps(
@@ -1817,7 +1868,14 @@ elif arguments and arguments[0] == "compose" and "up" in arguments:
 elif arguments and arguments[0] == "compose" and "stop" in arguments:
     Path(os.environ["FAKE_STACK_STATE"]).write_text("stopped\\n")
 elif arguments and arguments[0] == "compose" and "ps" in arguments:
-    print("container-" + arguments[-1])
+    state_path = Path(os.environ["FAKE_STACK_STATE"])
+    state = state_path.read_text().strip() if state_path.exists() else "absent"
+    service = arguments[-1]
+    if (
+        service != os.environ.get("FAKE_MISSING_CONTAINER")
+        and (state != "stopped" or "--all" in arguments)
+    ):
+        print("container-" + arguments[-1])
 elif arguments and arguments[0] == "inspect":
     print("sha256:" + hashlib.sha256(arguments[-1].encode()).hexdigest())
 elif arguments[:2] == ["volume", "ls"]:
@@ -2091,6 +2149,77 @@ else:
                     failed_response,
                     indent=2,
                     sort_keys=True,
+                ),
+            )
+
+            recovery_run_id = "deploy-20260730T170200Z-g7h8i9"
+            recovery_request = dict(
+                failed_request,
+                run_id=recovery_run_id,
+            )
+            recovered = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts/vps_field_remote_deploy.py"),
+                    base64.urlsafe_b64encode(
+                        json.dumps(recovery_request).encode("utf-8")
+                    ).decode("ascii"),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=environment,
+                timeout=30,
+            )
+
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+            recovered_response = json.loads(recovered.stdout)
+            self.assertEqual(
+                recovered_response["result"],
+                "PASS",
+                recovered_response,
+            )
+            self.assertTrue(
+                recovered_response["field_services_running"]
+            )
+            self.assertEqual(stack_state.read_text(), "running\n")
+
+            missing_run_id = "deploy-20260730T170300Z-j1k2l3"
+            missing_request = dict(
+                recovery_request,
+                run_id=missing_run_id,
+            )
+            missing_environment = dict(
+                environment,
+                FAKE_MISSING_CONTAINER="cadvisor",
+            )
+            missing = subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts/vps_field_remote_deploy.py"),
+                    base64.urlsafe_b64encode(
+                        json.dumps(missing_request).encode("utf-8")
+                    ).decode("ascii"),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+                env=missing_environment,
+                timeout=30,
+            )
+
+            self.assertEqual(missing.returncode, 0, missing.stderr)
+            missing_response = json.loads(missing.stdout)
+            self.assertEqual(
+                missing_response["result"],
+                "BLOCKED",
+                missing_response,
+            )
+            self.assertEqual(
+                missing_response["blocker"],
+                (
+                    "Managed deployment no longer contains every "
+                    "evidenced field service."
                 ),
             )
 

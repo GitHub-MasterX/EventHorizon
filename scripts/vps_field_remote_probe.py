@@ -16,6 +16,14 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 REQUIRED_PORTS = (23, 1883, 3000, 8081, 9090, 9101)
+EXPECTED_SERVICES = {
+    "cadvisor",
+    "grafana",
+    "mqtt_pit",
+    "prometheus",
+    "prometheus-exporter",
+    "telnet_pit",
+}
 EXPECTED_REQUEST_KEYS = {
     "schema_version",
     "target_alias",
@@ -378,21 +386,24 @@ def _collect(request: dict[str, Any]) -> dict[str, object]:
         "--format",
         (
             '{{.Names}}\t{{.Label "com.docker.compose.project"}}'
+            '\t{{.Label "com.docker.compose.service"}}'
             "\t{{.Ports}}"
         ),
     )
-    container_rows: list[tuple[str, str, str]] | None = []
+    container_rows: list[tuple[str, str, str, str]] | None = []
     if containers.returncode != 0:
         container_rows = None
     else:
         for line in containers.stdout.rstrip("\n").splitlines():
             if not line:
                 continue
-            fields = line.split("\t", 2)
-            if len(fields) != 3:
+            fields = line.split("\t", 3)
+            if len(fields) != 4:
                 container_rows = None
                 break
-            container_rows.append((fields[0], fields[1], fields[2]))
+            container_rows.append(
+                (fields[0], fields[1], fields[2], fields[3])
+            )
 
     projects = _command("docker", "compose", "ls", "--format", "json")
     try:
@@ -551,16 +562,21 @@ def _collect(request: dict[str, Any]) -> dict[str, object]:
 
         matching_containers = (
             container_rows is not None
-            and bool(container_rows)
+            and len(container_rows) == len(EXPECTED_SERVICES)
             and all(row[1] == project_name for row in container_rows)
+            and {row[2] for row in container_rows}
+            == EXPECTED_SERVICES
         )
         record(
             "container_state",
             "PASS" if matching_containers else "BLOCKER",
             (
-                "Only the evidenced EventHorizon containers exist."
+                "The exact evidenced EventHorizon service set exists."
                 if matching_containers
-                else "Managed redeployment permits only the matching EventHorizon containers."
+                else (
+                    "Managed redeployment requires exactly the evidenced "
+                    "EventHorizon service set."
+                )
             ),
         )
 
@@ -607,7 +623,7 @@ def _collect(request: dict[str, Any]) -> dict[str, object]:
 
         project_ports = (
             set().union(
-                *(_published_ports(row[2]) for row in container_rows)
+                *(_published_ports(row[3]) for row in container_rows)
             )
             if container_rows
             else set()

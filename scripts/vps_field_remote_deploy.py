@@ -680,12 +680,25 @@ def _service_image_ids(
     compose: Sequence[str],
     deploy_dir: Path,
     environment: dict[str, str],
+    *,
+    include_stopped: bool = False,
+    missing_service_outcome: str = "FAIL",
+    missing_service_blocker: str = (
+        "Deployment did not create every required field service."
+    ),
 ) -> dict[str, str]:
     image_ids: dict[str, str] = {}
     for service in EXPECTED_SERVICES:
+        service_query = [
+            *compose,
+            "ps",
+            *(("--all",) if include_stopped else ()),
+            "-q",
+            service,
+        ]
         container_id = _require(
             _run(
-                (*compose, "ps", "-q", service),
+                service_query,
                 cwd=deploy_dir,
                 environment=environment,
             ),
@@ -694,8 +707,8 @@ def _service_image_ids(
         ).strip()
         if not container_id:
             raise DeploymentFailure(
-                "FAIL",
-                "Deployment did not create every required field service.",
+                missing_service_outcome,
+                missing_service_blocker,
             )
         image_id = _require(
             _run(
@@ -931,6 +944,12 @@ def _deploy(request: dict[str, Any]) -> dict[str, object]:
                 compose,
                 deploy_dir,
                 environment,
+                include_stopped=True,
+                missing_service_outcome="BLOCKED",
+                missing_service_blocker=(
+                    "Managed deployment no longer contains every "
+                    "evidenced field service."
+                ),
             )
             prior_volumes = _volume_names(
                 request["project_name"],
