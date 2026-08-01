@@ -3841,6 +3841,50 @@ class InitialDeploymentProbe:
         )
 
 
+class BlockedInitialDeploymentProbe:
+    def collect(
+        self,
+        configuration: object,
+        commit: str,
+        policy: dict[str, object],
+    ) -> RemoteProbeExecution:
+        return RemoteProbeExecution(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "schema_version": 2,
+                    "target_alias": "field-host",
+                    "deployment_commit": commit,
+                    "checked_utc": "2026-07-30T01:02:03Z",
+                    "starting_state": "INITIAL_DEPLOYMENT",
+                    "managed_checkout_commit": None,
+                    "prior_evidence_commit": None,
+                    "interrupted_redeployment": False,
+                    "result": "BLOCKED",
+                    "checks": [
+                        {
+                            "id": "container_state",
+                            "status": "BLOCKER",
+                            "summary": (
+                                "Initial deployment requires no existing "
+                                "containers."
+                            ),
+                        },
+                        {
+                            "id": "compose_state",
+                            "status": "BLOCKER",
+                            "summary": (
+                                "Initial deployment requires no existing "
+                                "Compose projects."
+                            ),
+                        },
+                    ],
+                }
+            ).encode("utf-8"),
+            stderr=b"",
+        )
+
+
 class MalfunctioningRemoteProbe:
     def collect(
         self,
@@ -6012,6 +6056,47 @@ class DeploymentControllerApiTests(unittest.TestCase):
                 "test-only-private-key",
             ):
                 self.assertNotIn(sensitive_value, retained)
+
+    def test_initial_preflight_blocker_names_safe_recovery_options(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_path = Path(temporary_directory)
+            target_file, _ = write_strict_target_configuration(
+                temporary_path
+            )
+            output_directory = temporary_path / "evidence"
+
+            result = run(
+                DeploymentRequest(
+                    check_only=False,
+                    commit="1" * 40,
+                    env_file=target_file,
+                    output_dir=output_directory,
+                ),
+                ControllerAdapters(
+                    clock=FixedClock(),
+                    randomness=FixedRandomSource(),
+                    repository=ProvenRepository(),
+                    trusted_ci=ProvenTrustedCi(),
+                    remote=SshRemotePreflight(
+                        BlockedInitialDeploymentProbe()
+                    ),
+                ),
+            )
+
+            self.assertEqual(result.outcome, "BLOCKED")
+            self.assertEqual(result.highest_state, "CI_VALIDATED")
+            self.assertFalse(result.remote_mutation_occurred)
+            self.assertIn(
+                "no existing Docker containers or Compose projects",
+                result.next_action,
+            )
+            self.assertIn(
+                "matching evidenced deployment directory and project",
+                result.next_action,
+            )
+            self.assertIn("remote-preflight.json", result.next_action)
 
     def test_remote_transport_malfunction_is_redacted_error(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

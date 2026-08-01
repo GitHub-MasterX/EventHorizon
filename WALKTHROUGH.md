@@ -52,12 +52,49 @@ initial-deployment state. A later managed-redeployment walkthrough is useful
 workflow regression evidence, but label it accurately and do not silently
 substitute it for the primary initial-deployment walkthrough.
 
+### Preparing a previously used dedicated VPS
+
+A different deployment directory or Compose project name does not create an
+initial-deployment state while stopped containers or an old Compose project
+remain anywhere on the VPS. Prefer a genuinely unused authorized VPS for the
+primary walkthrough.
+
+If only the same **dedicated validation VPS** is available, reset it before the
+walkthrough only after the previous deployment is stopped and its verified
+evidence bundle has been retrieved. From the previous evidenced checkout, run
+the same three-file Compose selection with its previous project name:
+
+```bash
+docker compose \
+  -p <PREVIOUS_VPS_PROJECT_NAME> \
+  -f docker-compose.yml \
+  -f docker-compose.cost.yml \
+  -f docker-compose.field.yml \
+  down
+```
+
+Do not add `--volumes` or `--rmi`. This removes the stopped containers and
+Compose network while preserving named volumes, images, the checkout, and
+deployment evidence. Do not use this reset on a shared or production host.
+Confirm that the dedicated VPS has no remaining containers or Compose projects:
+
+```bash
+docker ps -a
+docker compose ls --all
+```
+
+Both commands must report no entries. Then use an absent or empty deployment
+directory and a non-conflicting project name for the primary initial-deployment
+walkthrough. This reset is evaluator preparation; it is not rollback and does
+not establish any validation state.
+
 ### Starting state
 
 - supported Linux operator workstation;
 - repository access and authenticated read-only `gh`;
 - Git, SSH, Bash-compatible tooling, and Python 3.10+;
 - authorized Linux `x86_64` VPS with Docker Compose and no conflicting workload;
+- no existing Docker containers or Compose projects, including stopped ones;
 - ignored target configuration with mode `0600`;
 - exact trusted-upstream SHA whose push workflow can establish `CI_VALIDATED`;
 - only `README.md` and links discoverable from it as starting guidance;

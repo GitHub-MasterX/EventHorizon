@@ -18,6 +18,12 @@ The primary supported topology is:
 - a dedicated EventHorizon deployment directory and no conflicting production
   workloads, Compose projects, containers, volumes, or ports.
 
+For an initial deployment, an unused directory or new Compose project name is
+not sufficient by itself. The dedicated VPS must currently have **no Docker
+containers and no Compose projects, including stopped ones**. A previously
+evidenced EventHorizon project is supported only as a managed redeployment when
+the target file retains its matching deployment directory and project name.
+
 The supported topology has three trust domains. The workstation proves the
 commit and controls deployment, GitHub supplies trusted source and CI evidence,
 and the VPS fetches and runs that exact commit:
@@ -381,6 +387,13 @@ Use `stop`, not `down --volumes`. Stopped containers, images, named volumes, and
 deployment evidence are intentionally preserved for managed redeployment and
 audit. Do not manually patch the remote checkout or use ordinary Compose
 `start` as a substitute for the supported exact-commit workflow.
+
+Stopping services does not restore an initial-deployment state: the stopped
+containers and Compose project still exist. Do not select a different directory
+or project name to bypass that state. Rerun with the matching evidenced values
+as a managed redeployment, or use a VPS prepared according to the initial-state
+requirements above. The evaluator-only reset procedure for a dedicated test
+VPS is documented in [`WALKTHROUGH.md`](WALKTHROUGH.md).
 
 ## 9. Redeploy or roll back
 

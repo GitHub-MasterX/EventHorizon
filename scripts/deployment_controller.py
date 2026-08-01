@@ -1812,6 +1812,33 @@ def _remote_preflight_evidence_is_valid(
     return "BLOCKER" in statuses
 
 
+def _remote_preflight_blocker(evidence: dict[str, object]) -> str:
+    checks = evidence.get("checks")
+    blocker_ids: set[str] = set()
+    if isinstance(checks, list):
+        blocker_ids = {
+            check["id"]
+            for check in checks
+            if isinstance(check, dict)
+            and isinstance(check.get("id"), str)
+            and check.get("status") == "BLOCKER"
+        }
+    if (
+        evidence.get("starting_state") == "INITIAL_DEPLOYMENT"
+        and blocker_ids.intersection({"container_state", "compose_state"})
+    ):
+        return (
+            "Initial deployment requires no existing Docker containers or "
+            "Compose projects. Use a VPS in that state, or use the matching "
+            "evidenced deployment directory and project for managed "
+            "redeployment. Review every BLOCKER in remote-preflight.json."
+        )
+    return (
+        "Resolve every BLOCKER check recorded in remote-preflight.json before "
+        "deployment."
+    )
+
+
 @dataclass(frozen=True)
 class SshRemotePreflight:
     transport: RemoteProbeCapabilities
@@ -1867,7 +1894,7 @@ class SshRemotePreflight:
             blocker=(
                 None
                 if passed
-                else "Remote preflight reported a policy or prerequisite blocker."
+                else _remote_preflight_blocker(evidence)
             ),
             outcome="PASS" if passed else "BLOCKED",
         )
