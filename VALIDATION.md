@@ -160,16 +160,23 @@ eventhorizon_session_interaction_depth_total{protocol,depth_level}
 
 | Level | Telnet | MQTT |
 | ---: | --- | --- |
-| 0 | no application data, only IAC control sequences, or only whitespace/line terminators | no valid CONNECT |
-| 1 | At least one depth-relevant byte, but the non-empty line has not yet been terminated by CR, LF, or CRLF | valid CONNECT only |
-| 2 | the first line was terminated followed only by non-meaningful whitespace, line terminators, or IAC control sequences | CONNECT plus one PUBLISH, SUBSCRIBE, or UNSUBSCRIBE |
-| 3 | After the first line was terminated, at least one later byte observed | CONNECT plus two or more meaningful operations |
+| 0 | No depth-relevant client application byte was observed | no valid CONNECT |
+| 1 | At least one depth-relevant byte was observed, but no complete non-empty line was terminated | valid CONNECT only |
+| 2 | Exactly one complete non-empty line was observed, with no later depth-relevant byte | CONNECT plus one PUBLISH, SUBSCRIBE, or UNSUBSCRIBE |
+| 3 | After the first non-empty line was terminated, at least one later depth-relevant byte was observed | CONNECT plus two or more meaningful operations |
 
 Telnet CR, LF, and CRLF terminate a line, with CRLF treated as one terminator.
 The classifier consumes one continuous application byte stream across reads and
 does not depend on TCP packet boundaries. Whitespace-only lines do not count;
 whitespace before or after a depth-relevant byte does not prevent that line from
 counting.
+
+“Depth-relevant” is an exact byte rule, not a judgment about whether input is a
+valid or recognizable command. The classifier first removes Telnet IAC command,
+option-negotiation, and subnegotiation bytes. Of the remaining application byte
+stream, ASCII space (`0x20`), horizontal tab (`0x09`), vertical tab (`0x0b`),
+form feed (`0x0c`), CR (`0x0d`), and LF (`0x0a`) are excluded; any remaining
+byte is depth-relevant. The metric does not parse or retain the resulting input.
 
 Examples:
 

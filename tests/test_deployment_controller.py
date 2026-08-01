@@ -830,6 +830,26 @@ class DeploymentContractArtifactTests(unittest.TestCase):
             walkthrough,
         )
 
+    def test_root_validation_uses_exact_telnet_depth_semantics(self) -> None:
+        validation = (REPO_ROOT / "VALIDATION.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "After the first non-empty line was terminated, at least one "
+            "later depth-relevant byte was observed",
+            validation,
+        )
+        self.assertRegex(
+            validation,
+            r"any remaining\s+byte is depth-relevant",
+        )
+        self.assertNotIn(
+            "After the first line was terminated, at least one later byte "
+            "observed",
+            validation,
+        )
+
     def test_ci_workflow_has_the_exact_stable_read_only_job_contract(self) -> None:
         workflow_path = REPO_ROOT / ".github/workflows/ci.yml"
         workflow_text = workflow_path.read_text(encoding="utf-8")
