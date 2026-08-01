@@ -26,11 +26,18 @@ docker compose up
 
 ## Validation
 
-Use [`VALIDATION.md`](VALIDATION.md) as the canonical guide for exact tests, controlled volume validation, persistent monitoring, authorized VPS stages, and historical Grafana experiment windows.
+Use the repository guides according to the task:
+
+- [`DEPLOYMENT.md`](DEPLOYMENT.md) is the canonical supported VPS operator guide,
+  including authorization, stop, recovery, and rollback.
+- [`VALIDATION.md`](VALIDATION.md) defines validation levels, invariants,
+  controlled traffic, evidence interpretation, and later observation stages.
+- [`WALKTHROUGH.md`](WALKTHROUGH.md) contains the Researcher John success and
+  injected-blocker cognitive walkthrough templates.
 
 ### Supported exact-commit VPS workflow
 
-The Week 10 deployment topology is one Linux operator workstation with Git,
+The supported deployment topology is one Linux operator workstation with Git,
 GitHub CLI, SSH, Bash-compatible tooling, Python 3.10+, and repository access,
 plus one authorized Linux VPS with Docker Compose. Raspberry Pi remains a
 validated test environment; it is not required for deployment.
@@ -55,9 +62,7 @@ After reviewing target authorization and firewall policy, deploy the same SHA
 from an interactive terminal:
 
 ```bash
-./scripts/vps_field_deploy.sh \
-  --commit "$DEPLOY_COMMIT" \
-  --env-file deploy/vps-field.env
+./scripts/vps_field_deploy.sh --commit "$DEPLOY_COMMIT" --env-file deploy/vps-field.env
 ```
 
 The command performs the documented preflight, exact-source deployment,

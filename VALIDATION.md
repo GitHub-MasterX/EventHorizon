@@ -32,19 +32,19 @@ safety control working; it is not a successful higher-volume result.
 
 ## 3. Validation Levels
 
-### Level A — Exact correctness
+### Level A: Exact correctness
 
 Purpose: exact byte accounting, deterministic lifecycle and interaction depth,
 and malformed-event atomicity. Use 1–10 sessions per scenario. The canonical
 depth matrix uses four scenarios with 10 sessions each.
 
-### Level B — Local controlled load
+### Level B: Local controlled load
 
 Purpose: hundreds and thousands of completed sessions, counter consistency,
 resource stability, persistence, and reproducibility. Ramp through 10, 100, and
 1,000 total sessions per protocol. The 1,000 sessions are not simultaneous.
 
-### Level C — Remote smoke test
+### Level C: Remote smoke test
 
 Purpose: prove that the exact commit is deployed, public protocol ports work,
 private management ports remain private, and monitoring is connected. It uses
@@ -52,13 +52,13 @@ one Telnet and one MQTT session.
 
 > A smoke test is intentionally small and should not be presented as a load test.
 
-### Level D — Remote controlled load
+### Level D: Remote controlled load
 
 Purpose: validate an authorized field host under bounded deliberate traffic,
 compare it with the local validation host, and run 100 then—only when
 stable—1,000 total sessions per protocol.
 
-### Level E — Unsolicited public observation
+### Level E: Unsolicited public observation
 
 Purpose: observe uncontrolled traffic, long-running stability, real disconnect
 behavior, and practical metric usefulness. For an extended observation, use a
@@ -154,26 +154,41 @@ checks all pass after settlement.
 
 ## 7. Interaction Depth Validation
 
-The final metric is:
-
 ```text
 eventhorizon_session_interaction_depth_total{protocol,depth_level}
 ```
 
-Both labels are bounded: protocol is `telnet` or `mqtt`; depth is `0` through
-`3`. Exactly one classification is emitted for each completed supported session.
-
 | Level | Telnet | MQTT |
 | ---: | --- | --- |
-| 0 | no meaningful client input | no valid CONNECT |
-| 1 | meaningful but incomplete non-empty input | valid CONNECT only |
-| 2 | one completed non-empty line | CONNECT plus one PUBLISH, SUBSCRIBE, or UNSUBSCRIBE |
-| 3 | continued meaningful interaction after the first line | CONNECT plus two or more meaningful operations |
+| 0 | no application data, only IAC control sequences, or only whitespace/line terminators | no valid CONNECT |
+| 1 | At least one depth-relevant byte, but the non-empty line has not yet been terminated by CR, LF, or CRLF | valid CONNECT only |
+| 2 | the first line was terminated followed only by non-meaningful whitespace, line terminators, or IAC control sequences | CONNECT plus one PUBLISH, SUBSCRIBE, or UNSUBSCRIBE |
+| 3 | After the first line was terminated, at least one later byte observed | CONNECT plus two or more meaningful operations |
 
-Telnet CR/LF handling is stream-aware; whitespace-only lines and IAC negotiation
-do not advance depth. MQTT PING, QoS acknowledgements, and DISCONNECT do not
-advance it. No command, credential, client ID, topic, or payload is retained.
-Depth starts at zero, only rises, caps at three, and finalizes once.
+Telnet CR, LF, and CRLF terminate a line, with CRLF treated as one terminator.
+The classifier consumes one continuous application byte stream across reads and
+does not depend on TCP packet boundaries. Whitespace-only lines do not count;
+whitespace before or after a depth-relevant byte does not prevent that line from
+counting.
+
+Examples:
+
+```text
+connect, then close                  → depth 0
+send IAC negotiation only            → depth 0
+send " \t\r\n"                       → depth 0
+send "help"                          → depth 1
+send "help\r\n"                      → depth 2
+send "help\n   "                     → depth 2
+send "help\nw"                       → depth 3
+send "help\nwhoami\n"                → depth 3
+```
+
+Depth 3 means only that depth-relevant data continued after one completed
+non-empty line. It does not claim that two commands or two complete lines were
+received. MQTT PING, QoS acknowledgements, and DISCONNECT do not advance MQTT
+depth. No command, credential, client ID, topic, or payload is retained. Depth
+starts at zero, only rises, caps at three, and finalizes once.
 
 Run the deterministic matrices:
 
@@ -239,6 +254,11 @@ Never store Grafana tokens, passwords, or other authentication material in the
 repository.
 
 ## 9. Remote Validation
+
+Use [`DEPLOYMENT.md`](DEPLOYMENT.md) for the canonical supported operator
+procedure, authorization boundary, target-file rules, evidence layout, stop,
+recovery, and rollback. This section explains how the resulting deployment fits
+the broader validation model.
 
 Keep these windows distinct:
 
