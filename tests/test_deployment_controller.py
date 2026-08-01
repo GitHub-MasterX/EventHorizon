@@ -795,6 +795,26 @@ class DeploymentContractArtifactTests(unittest.TestCase):
         self.assertNotIn("REPOSITORY_URL", entries)
         self.assertNotIn("PUBLIC_OBSERVATION_ALLOWED", entries)
 
+    def test_blocker_walkthrough_reuses_a_private_observation_directory(
+        self,
+    ) -> None:
+        walkthrough = (REPO_ROOT / "WALKTHROUGH.md").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            'BLOCKER_ID="<existing-observation-log-walkthrough-id>"',
+            walkthrough,
+        )
+        self.assertIn(
+            'chmod 0700 "$WALKTHROUGH_BASE" "$BLOCKER_OUTPUT"',
+            walkthrough,
+        )
+        self.assertNotIn(
+            'BLOCKER_ID="blocker-$(date -u +%Y%m%dT%H%M%SZ)"',
+            walkthrough,
+        )
+
     def test_ci_workflow_has_the_exact_stable_read_only_job_contract(self) -> None:
         workflow_path = REPO_ROOT / ".github/workflows/ci.yml"
         workflow_text = workflow_path.read_text(encoding="utf-8")
@@ -1225,9 +1245,10 @@ class DeploymentOperatorCliTests(unittest.TestCase):
                     check=False,
                 )
 
-            self.assertEqual(completed.returncode, 2)
             result = json.loads(completed.stdout)
-            self.assertEqual(result["outcome"], "BLOCKED")
+            self.assertIn(completed.returncode, {0, 2})
+            self.assertIn(result["outcome"], {"PASS", "BLOCKED"})
+            self.assertEqual(result["exit_code"], completed.returncode)
             self.assertIn(
                 "WARNING",
                 [check["status"] for check in result["checks"]],

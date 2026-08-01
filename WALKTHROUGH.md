@@ -35,6 +35,21 @@ ignored directory:
 validation-output/walkthroughs/<walkthrough-id>/observation.md
 ```
 
+The walkthrough base, each run directory, and each observation file contain
+private evaluation evidence. Create or normalize them before starting:
+
+```bash
+WALKTHROUGH_BASE="$PWD/validation-output/walkthroughs"
+install -d -m 0700 "$WALKTHROUGH_BASE"
+install -d -m 0700 "$WALKTHROUGH_BASE/<walkthrough-id>"
+chmod 0600 "$WALKTHROUGH_BASE/<walkthrough-id>/observation.md"
+```
+
+The controller rejects an evidence base or ancestor that is group- or
+world-writable. The `<walkthrough-id>` recorded inside `observation.md` is the
+same identifier every later command for that walkthrough must reuse; do not
+generate a second ID after the observation clock starts.
+
 Never record a hostname, IP address, CIDR, username, key path, credential,
 target-file value, raw traffic, or payload. Use only `operator-workstation` and
 the configured non-sensitive target alias, normally `field-host`.
@@ -183,9 +198,14 @@ working tree stays clean. Start from the repository root:
 
 ```bash
 DEPLOY_COMMIT=<full-40-character-sha>
-BLOCKER_ID="blocker-$(date -u +%Y%m%dT%H%M%SZ)"
+WALKTHROUGH_BASE="$PWD/validation-output/walkthroughs"
+BLOCKER_ID="<existing-observation-log-walkthrough-id>"
 BLOCKER_DIR="/tmp/eventhorizon-$BLOCKER_ID"
-BLOCKER_OUTPUT="$PWD/validation-output/walkthroughs/$BLOCKER_ID"
+BLOCKER_OUTPUT="$WALKTHROUGH_BASE/$BLOCKER_ID"
+
+test -f "$BLOCKER_OUTPUT/observation.md"
+chmod 0700 "$WALKTHROUGH_BASE" "$BLOCKER_OUTPUT"
+chmod 0600 "$BLOCKER_OUTPUT/observation.md"
 
 git worktree add --detach "$BLOCKER_DIR" "$DEPLOY_COMMIT"
 printf '\n# WALKTHROUGH_ONLY_PROTECTED_PATH_MISMATCH\n' \
