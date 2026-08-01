@@ -18,10 +18,45 @@ The primary supported topology is:
 - a dedicated EventHorizon deployment directory and no conflicting production
   workloads, Compose projects, containers, volumes, or ports.
 
-Raspberry Pi is a validated test environment, not a required deployment host.
-Native macOS, Windows/WSL, non-`x86_64` VPSs, multi-VPS deployment, provider
-firewall automation, and VPSs with conflicting production workloads are
-explicitly untested.
+The supported topology has three trust domains. The workstation proves the
+commit and controls deployment, GitHub supplies trusted source and CI evidence,
+and the VPS fetches and runs that exact commit:
+
+```mermaid
+flowchart LR
+    GH["Trusted upstream<br/>Git commit and push CI"]
+
+    subgraph OPERATOR["Operator workstation"]
+        CTRL["Deployment controller<br/>vps_field_deploy.sh"]
+        CFG["Ignored mode-0600<br/>target configuration"]
+    end
+
+    subgraph VPS["Authorized Linux VPS"]
+        FW["Provider and host firewall"]
+        CHECKOUT["Exact commit checkout"]
+        COMPOSE["Docker Compose field stack"]
+        TARPITS["Telnet :23<br/>MQTT :1883"]
+        MONITORING["Loopback monitoring<br/>:3000 :8081 :9090 :9101"]
+
+        FW -->|"SSH"| CHECKOUT
+        FW -->|"protocol traffic"| TARPITS
+        CHECKOUT --> COMPOSE
+        COMPOSE --> TARPITS
+        COMPOSE --> MONITORING
+    end
+
+    CFG -.->|"read only for full deployment"| CTRL
+    CTRL -->|"Git and read-only gh proof"| GH
+    GH -->|"VPS fetches exact commit"| CHECKOUT
+    CTRL -->|"source-restricted SSH"| FW
+    CTRL -->|"source-restricted smoke on 23 and 1883"| FW
+    CTRL -.->|"must be unreachable directly"| MONITORING
+```
+
+Arrow labels define the allowed communication paths. The dashed configuration
+arrow is a local data dependency used only by full deployment. The dashed path
+to monitoring is explicitly forbidden: the workstation must observe those
+loopback-bound services as unreachable directly.
 
 ## 2. Security and exposure boundary
 
@@ -40,11 +75,23 @@ The supported restricted validation posture is:
 | Prometheus | `127.0.0.1:9090/tcp` | unreachable directly |
 | Exporter | `127.0.0.1:9101/tcp` | unreachable directly |
 
+The firewall requirement depends on the operation:
+
+| Operation | VPS firewall requirement |
+| --- | --- |
+| `--help` | none; it is side-effect-free and performs no network access |
+| `--check-only` | none; it does not read the target file, use SSH, or contact the VPS |
+| full deployment | the configured SSH management port, TCP 23, and TCP 1883 are limited to the authorized workstation source; monitoring ports remain non-public |
+
 Before deployment, configure provider and host firewall policy so TCP 23 and
 1883 are limited to the authorized workstation source. Keep the existing
 management SSH path source-restricted. The controller observes reachability
 from one workstation; it cannot prove firewall posture from every network and
 does not change firewall rules.
+
+**Do not change SSH, TCP 23, or TCP 1883 ingress to `Any` for restricted
+validation.** Broad public ingress is outside the deployment workflow and
+requires a separate, explicitly authorized public-observation procedure.
 
 Deployment authorization does not authorize prolonged public exposure.
 Starting public observation is a separate, explicit workflow.
@@ -143,6 +190,11 @@ Do not continue if the outcome is `BLOCKED`, `FAIL`, `INCONCLUSIVE`, or
 `ERROR`. Use the reported next action and retained evidence; do not bypass a
 gate or substitute local checks for trusted CI.
 
+A passing `--check-only` run neither requires nor verifies VPS firewall rules.
+Before proceeding to the full deployment command, confirm the full-deployment
+row in the security and exposure table above: the configured SSH management
+port, TCP 23, and TCP 1883 must be source-restricted, never opened to `Any`.
+
 ## 5. Deploy the same exact commit
 
 Review authorization and firewall policy, then run from an interactive terminal:
@@ -155,6 +207,43 @@ Review authorization and firewall policy, then run from an interactive terminal:
 
 The command repeats commit eligibility before parsing target data or contacting
 the VPS. It then performs the fixed sequence:
+
+```mermaid
+flowchart TD
+    START["Invoke vps_field_deploy.sh"] --> MODE{"Operation?"}
+
+    MODE -->|"--help"| HELP["Print help<br/>no result and no network"]
+    MODE -->|"--check-only"| CHECK["1. Deployment policy<br/>2. Candidate and trusted CI"]
+    MODE -->|"full deployment"| LOCAL["1. Deployment policy<br/>2. Candidate and trusted CI"]
+
+    CHECK -->|"proven"| CI["PASS<br/>CI_VALIDATED<br/>no VPS contact"]
+    CHECK -->|"not proven"| EARLY["Stop<br/>partial evidence<br/>no VPS mutation"]
+
+    LOCAL -->|"proven"| CONFIG["3. Strict target configuration"]
+    LOCAL -->|"not proven"| EARLY
+    CONFIG -->|"valid"| PREFLIGHT["4. Remote preflight"]
+    CONFIG -->|"not valid"| EARLY
+    PREFLIGHT -->|"proven"| AUTH["5. Interactive exact-phrase authorization"]
+    PREFLIGHT -->|"not proven"| EARLY
+    AUTH -->|"declined or interrupted"| EARLY
+    AUTH -->|"accepted"| BOUNDARY["REMOTE MUTATION BEGINS"]
+
+    BOUNDARY --> DEPLOY["6. Exact-source deployment"]
+    DEPLOY --> VERIFY["7. Runtime, bindings, and port verification"]
+    VERIFY --> SMOKE["8. Deterministic Telnet and MQTT smoke"]
+    SMOKE --> RETRIEVE["9. Retrieve and verify allowlisted evidence"]
+    RETRIEVE --> ENV["PASS<br/>ENVIRONMENT_VALIDATED<br/>services remain running"]
+
+    DEPLOY -.->|"not proven"| LATE["Stop<br/>partial evidence<br/>attempt exact-service stop"]
+    VERIFY -.->|"not proven"| LATE
+    SMOKE -.->|"not proven"| LATE
+    RETRIEVE -.->|"not proven"| LATE
+```
+
+The upper branches are non-mutating. Remote contact starts at preflight, but
+remote mutation starts only after the exact authorization phrase is accepted.
+Every real invocation writes evidence even when it stops early; `--help` is the
+only exception.
 
 ```text
 1. deployment policy
