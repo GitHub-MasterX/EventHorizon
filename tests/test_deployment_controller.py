@@ -810,6 +810,21 @@ class DeploymentContractArtifactTests(unittest.TestCase):
             'chmod 0700 "$WALKTHROUGH_BASE" "$BLOCKER_OUTPUT"',
             walkthrough,
         )
+        self.assertIn("set -euo pipefail", walkthrough)
+        self.assertIn(
+            'grep -Fqx -- "- Walkthrough ID: $BLOCKER_ID"',
+            walkthrough,
+        )
+        self.assertIn(
+            'grep -Fqx -- "- System-under-test commit: $DEPLOY_COMMIT"',
+            walkthrough,
+        )
+        self.assertIn('trap cleanup EXIT', walkthrough)
+        self.assertIn(
+            'git -C "$REPOSITORY_ROOT" worktree remove --force '
+            '"$BLOCKER_DIR"',
+            walkthrough,
+        )
         self.assertNotIn(
             'BLOCKER_ID="blocker-$(date -u +%Y%m%dT%H%M%SZ)"',
             walkthrough,

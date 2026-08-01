@@ -194,31 +194,70 @@ use a real secret failure, dirty the authorized VPS, or create uncontrolled
 remote activity.
 
 The recommended injection uses a disposable detached Git worktree, so the main
-working tree stays clean. Start from the repository root:
+working tree stays clean. Start from the repository root and run the entire
+block as one command. Replace both placeholders; do not reuse shell variables
+from an earlier walkthrough:
 
 ```bash
-DEPLOY_COMMIT=<full-40-character-sha>
-WALKTHROUGH_BASE="$PWD/validation-output/walkthroughs"
-BLOCKER_ID="<existing-observation-log-walkthrough-id>"
-BLOCKER_DIR="/tmp/eventhorizon-$BLOCKER_ID"
-BLOCKER_OUTPUT="$WALKTHROUGH_BASE/$BLOCKER_ID"
-
-test -f "$BLOCKER_OUTPUT/observation.md"
-chmod 0700 "$WALKTHROUGH_BASE" "$BLOCKER_OUTPUT"
-chmod 0600 "$BLOCKER_OUTPUT/observation.md"
-
-git worktree add --detach "$BLOCKER_DIR" "$DEPLOY_COMMIT"
-printf '\n# WALKTHROUGH_ONLY_PROTECTED_PATH_MISMATCH\n' \
-  >> "$BLOCKER_DIR/docker-compose.field.yml"
-
 (
+  set -euo pipefail
+
+  REPOSITORY_ROOT="$(git rev-parse --show-toplevel)"
+  DEPLOY_COMMIT="<full-40-character-sha>"
+  WALKTHROUGH_BASE="$REPOSITORY_ROOT/validation-output/walkthroughs"
+  BLOCKER_ID="<existing-observation-log-walkthrough-id>"
+  BLOCKER_DIR="/tmp/eventhorizon-$BLOCKER_ID"
+  BLOCKER_OUTPUT="$WALKTHROUGH_BASE/$BLOCKER_ID"
+  WORKTREE_ADDED=false
+
+  cleanup() {
+    if [[ "$WORKTREE_ADDED" == true ]]; then
+      git -C "$REPOSITORY_ROOT" worktree remove --force "$BLOCKER_DIR"
+      WORKTREE_ADDED=false
+    fi
+  }
+  trap cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+
+  [[ "$DEPLOY_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+  [[ "$BLOCKER_ID" =~ ^blocker-[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}$ ]]
+  [[ ! -e "$BLOCKER_DIR" && ! -L "$BLOCKER_DIR" ]]
+  test -f "$BLOCKER_OUTPUT/observation.md"
+  grep -Fqx -- "- Walkthrough ID: $BLOCKER_ID" \
+    "$BLOCKER_OUTPUT/observation.md"
+  grep -Fqx -- "- System-under-test commit: $DEPLOY_COMMIT" \
+    "$BLOCKER_OUTPUT/observation.md"
+  chmod 0700 "$WALKTHROUGH_BASE" "$BLOCKER_OUTPUT"
+  chmod 0600 "$BLOCKER_OUTPUT/observation.md"
+
+  git -C "$REPOSITORY_ROOT" worktree add --detach \
+    "$BLOCKER_DIR" "$DEPLOY_COMMIT"
+  WORKTREE_ADDED=true
+  printf '\n# WALKTHROUGH_ONLY_PROTECTED_PATH_MISMATCH\n' \
+    >> "$BLOCKER_DIR/docker-compose.field.yml"
+
+  set +e
   cd "$BLOCKER_DIR"
   ./scripts/vps_field_deploy.sh \
     --check-only \
     --commit "$DEPLOY_COMMIT" \
     --output-dir "$BLOCKER_OUTPUT"
+  CONTROLLER_STATUS=$?
+  set -e
+
+  if [[ "$CONTROLLER_STATUS" -ne 2 ]]; then
+    printf 'Expected blocker exit 2; received %s.\n' \
+      "$CONTROLLER_STATUS" >&2
+  fi
+  exit "$CONTROLLER_STATUS"
 )
 ```
+
+The subshell stops immediately if the ID, commit, observation log, permissions,
+or disposable path is inconsistent. Its exit trap removes only a worktree that
+this invocation successfully created, including after the expected exit `2`.
+The ignored observation directory and generated evidence remain intact.
 
 This invocation must stop during local candidate/controller verification. It
 must not load `deploy/vps-field.env`, request authorization, initiate SSH to the
@@ -234,16 +273,17 @@ Field services remain running: no
 The highest proven state may be `NONE` because the protected-path compatibility
 gate is part of proving `DEPLOYMENT_CANDIDATE`.
 
-After recording and preserving the generated blocker evidence outside the
-worktree, remove only the explicitly disposable worktree:
+After recording and preserving the generated blocker evidence, confirm that
+the exit trap removed the disposable worktree and that the main tree is clean:
 
 ```bash
-git worktree remove --force "$BLOCKER_DIR"
+git worktree list
 git status --short
 ```
 
-`--force` is required only because this disposable worktree contains the one
-intentional protected-file change. Verify that the main worktree remains clean.
+The output must not list the blocker worktree. The main worktree must remain
+clean. Do not manually remove an arbitrary path based on a leftover shell
+variable.
 
 ### Blocker observation-log template
 
