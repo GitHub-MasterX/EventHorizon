@@ -250,18 +250,13 @@ func main() {
 		defer db.Close()
 	}
 
-	// Register metrics
-	m := NewMetrics()
-
-	// test values
-	// m.totalTrappedTime.WithLabelValues("Telnet").Add(10)
-	// m.totalTrappedTime.WithLabelValues("UPnP").Add(20)
-	// m.totalTrappedTime.WithLabelValues("MQTT").Add(30)
-	// m.totalTrappedTime.WithLabelValues("CoAP").Add(40)
-	// m.totalTrappedTime.WithLabelValues("SSH").Add(50)
-
-	// Start socket listener
-	go listenForMetrics("/tmp/tarpit_exporter.sock", m)
+	// The supported runtime uses the bounded JSON event contract. Legacy text
+	// parsing remains available only to the existing unit tests during the
+	// coordinated cutover cleanup and is not started here.
+	metricState := newMetricEventMetrics(prometheus.DefaultRegisterer)
+	if _, err := startMetricEventServer("/tmp/tarpit_exporter.sock", metricState); err != nil {
+		log.Fatal("Metric event socket error: ", err)
+	}
 
 	// HTTP handler
 	http.Handle("/metrics", promhttp.Handler())

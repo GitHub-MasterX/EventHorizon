@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -g -pthread
+CFLAGS = -Wall -Wextra -g -pthread -DEVENTHORIZON_JSON_METRIC_EVENTS
 
 STRUCTS = shared/structs.c shared/session_events.c shared/interaction_depth.c shared/metric_events.c
 
