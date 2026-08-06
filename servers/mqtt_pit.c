@@ -90,6 +90,7 @@ static const char *mqttFinalizationName(
     return "protocol_error";
 }
 
+#ifndef EVENTHORIZON_JSON_METRIC_EVENTS
 static const char *legacyMqttFinalizationName(
     enum metric_mqtt_finalization_reason reason) {
     switch (reason) {
@@ -104,6 +105,7 @@ static const char *legacyMqttFinalizationName(
             return mqttFinalizationName(reason);
     }
 }
+#endif
 
 struct mqttClient* lookupClient(int fd) {
     struct mqttClient* client;
@@ -600,8 +602,41 @@ enum mqttSendResult sendConnack(
     return MQTT_SEND_COMPLETE;
 }
 
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+static enum mqttSendResult sendMqttActionPacket(
+    struct mqttClient *client,
+    const uint8_t *packet,
+    size_t packetLength,
+    enum metric_mqtt_action action,
+    enum metric_io_reason *failureReason) {
+    *failureReason = METRIC_IO_NONE;
+    ssize_t written = write(client->fd, packet, packetLength);
+    int writeError = errno;
+    if (written > 0 && mqttMetricEmitterReady) {
+        (void)metric_event_mqtt_positive_write((uint64_t)written);
+    }
+    if (written < 0) {
+        if (writeError == EAGAIN || writeError == EWOULDBLOCK ||
+            writeError == EINTR) {
+            return MQTT_SEND_PENDING;
+        }
+        *failureReason = metric_io_reason_from_unrecoverable_errno(
+            writeError, false);
+        return MQTT_SEND_FATAL;
+    }
+    if ((size_t)written != packetLength) {
+        return MQTT_SEND_PENDING;
+    }
+    if (mqttMetricEmitterReady) {
+        (void)metric_event_mqtt_protocol_action(action);
+    }
+    return MQTT_SEND_COMPLETE;
+}
+#endif
+
 bool readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset,
-                 uint8_t firstByte, struct mqttClient* client) {
+                 uint8_t firstByte, struct mqttClient* client,
+                 uint8_t *parsedQos, uint16_t *parsedPacketId) {
     if (offset + 2 > packetEnd) {
         fprintf(stderr, "PUBLISH packet too short for topic length");
         return false;
@@ -624,12 +659,25 @@ bool readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset,
     }
 
     uint8_t qos = (firstByte & 0b00000110) >> 1;
+    if (parsedQos) {
+        *parsedQos = qos;
+    }
+    if (parsedPacketId) {
+        *parsedPacketId = 0;
+    }
     if (qos == 3) {
         return false;
     }
     if (qos > 0) {
         if (offset + 2 > packetEnd) return false;
-        offset += 2; // packet id (don't care)
+        uint16_t packetId = (buffer[offset] << 8) | buffer[offset + 1];
+        if (packetId == 0) {
+            return false;
+        }
+        if (parsedPacketId) {
+            *parsedPacketId = packetId;
+        }
+        offset += 2;
     }
 
     if(client->version == V5) {        
@@ -660,7 +708,6 @@ bool readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset,
         SERVER_ID, topic, qos);
 #ifndef EVENTHORIZON_JSON_METRIC_EVENTS
     sendMetric(msg);
-#endif
     char fields[192];
     interactionDepthObserveMqttOperation(&client->interactionDepth);
     snprintf(fields, sizeof(fields),
@@ -668,6 +715,7 @@ bool readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset,
         qos, boolString(topicLen > 0), boolString(payloadLen > 0),
         interactionDepthLevel(&client->interactionDepth));
     emitMqttAction(client, "PUBLISH", fields);
+#endif
     printf("PUBLISH received. Topic: %s, Payload: %s, QoS: %d\n", topic, payload, qos);
     return true;
 }
@@ -1036,6 +1084,8 @@ enum Request determineRequest(uint8_t firstByte) {
         return CONNECT;
     case 0b0101:
         return PUBREC;
+    case 0b0110:
+        return PUBREL;
     case 0b1000:
         return SUBSCRIBE;
     case 0b1100:
@@ -1240,6 +1290,10 @@ int main(int argc, char* argv[]) {
                 newClient->connectRefused = false;
                 newClient->connackSent = false;
                 newClient->connectAcceptedMs = 0;
+                newClient->qos2Active = false;
+                newClient->qos2PubrelReceived = false;
+                newClient->qos2PacketId = 0;
+                newClient->qos2PacketLength = 0;
                 session_events_make_id(newClient->sessionId, sizeof(newClient->sessionId), "mqtt", newClient->timeOfConnection, newClient->fd);
                 memset(newClient->buffer, 0, sizeof(newClient->buffer)); // Maybe not necessary
                 // ev.events = EPOLLIN | EPOLLET;
@@ -1367,7 +1421,9 @@ int main(int argc, char* argv[]) {
                         break;
                     }
 #endif
+#ifndef EVENTHORIZON_JSON_METRIC_EVENTS
                     bool pubSuccess = false;
+#endif
                     switch (request) {
                         case CONNECT:
                             if (client->connectAccepted ||
@@ -1486,9 +1542,100 @@ int main(int argc, char* argv[]) {
                             readPubrec(client->buffer, packetEnd, packetStart, client);
 #endif
                             break;
+                        case PUBREL:
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                            if (client->buffer[processedPackets] != 0x62 ||
+                                packetLength != 4 ||
+                                packetStart + 2 != packetEnd) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
+                            }
+                            uint16_t pubrelPacketId =
+                                (client->buffer[packetStart] << 8) |
+                                client->buffer[packetStart + 1];
+                            if (pubrelPacketId == 0) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
+                            }
+                            bool matchingPubrel =
+                                client->qos2Active &&
+                                pubrelPacketId == client->qos2PacketId;
+                            if (matchingPubrel &&
+                                !client->qos2PubrelReceived) {
+                                client->qos2PubrelReceived = true;
+                                if (mqttMetricEmitterReady) {
+                                    (void)metric_event_mqtt_protocol_action(
+                                        METRIC_MQTT_ACTION_PUBREL_RECEIVED);
+                                }
+                            }
+                            uint8_t pubcomp[4] = {
+                                0x70, 0x02,
+                                (uint8_t)(pubrelPacketId >> 8),
+                                (uint8_t)(pubrelPacketId & 0xff),
+                            };
+                            enum metric_io_reason pubcompFailureReason;
+                            enum mqttSendResult pubcompResult =
+                                sendMqttActionPacket(
+                                    client, pubcomp, sizeof(pubcomp),
+                                    METRIC_MQTT_ACTION_PUBCOMP_SENT,
+                                    &pubcompFailureReason);
+                            if (pubcompResult == MQTT_SEND_FATAL) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_WRITE_ERROR,
+                                    pubcompFailureReason);
+                                clientDisconnected = true;
+                            } else if (pubcompResult == MQTT_SEND_COMPLETE &&
+                                       matchingPubrel) {
+                                client->qos2Active = false;
+                                client->qos2PubrelReceived = false;
+                                client->qos2PacketId = 0;
+                                client->qos2PacketLength = 0;
+                            }
+#endif
+                            break;
                         case PUBLISH:
 #ifdef EVENTHORIZON_JSON_METRIC_EVENTS
                             if (!client->connackSent) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
+                            }
+                            uint8_t publishQos =
+                                (client->buffer[processedPackets] & 0x06) >> 1;
+                            if (publishQos == 3) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
+                            }
+                            uint16_t publishPacketId = 0;
+                            if (!readPublish(
+                                    client->buffer, packetEnd, packetStart,
+                                    client->buffer[processedPackets], client,
+                                    &publishQos, &publishPacketId)) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
+                            }
+                            if (publishQos == 0 &&
+                                (client->buffer[processedPackets] & 0x08) != 0) {
                                 disconnectClient(
                                     client, epollfd, mqttNowMs(),
                                     METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
@@ -1504,42 +1651,99 @@ int main(int argc, char* argv[]) {
                                 clientDisconnected = true;
                                 break;
                             }
-                            uint8_t publishQos =
-                                (client->buffer[processedPackets] & 0x06) >> 1;
-                            if (publishQos == 3) {
-                                disconnectClient(
-                                    client, epollfd, mqttNowMs(),
-                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
-                                    METRIC_IO_NONE);
-                                clientDisconnected = true;
-                                break;
+                            bool newPublishOperation = true;
+                            if (publishQos == 2 && client->qos2Active) {
+                                bool exactDuplicate =
+                                    (client->buffer[processedPackets] & 0x08) != 0 &&
+                                    publishPacketId == client->qos2PacketId &&
+                                    packetLength == client->qos2PacketLength &&
+                                    (client->buffer[processedPackets] &
+                                     (uint8_t)~0x08) == client->qos2Packet[0] &&
+                                    memcmp(
+                                        client->buffer + processedPackets + 1,
+                                        client->qos2Packet + 1,
+                                        packetLength - 1) == 0;
+                                if (!exactDuplicate) {
+                                    disconnectClient(
+                                        client, epollfd, mqttNowMs(),
+                                        METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                        METRIC_IO_NONE);
+                                    clientDisconnected = true;
+                                    break;
+                                }
+                                newPublishOperation = false;
                             }
-                            if (publishQos > 0) {
-                                disconnectClient(
-                                    client, epollfd, mqttNowMs(),
-                                    METRIC_MQTT_FINALIZATION_OPERATION_REFUSED,
-                                    METRIC_IO_NONE);
-                                clientDisconnected = true;
-                                break;
+                            if (publishQos == 2 && !client->qos2Active) {
+                                client->qos2Active = true;
+                                client->qos2PubrelReceived = false;
+                                client->qos2PacketId = publishPacketId;
+                                client->qos2PacketLength = (uint16_t)packetLength;
+                                memcpy(
+                                    client->qos2Packet,
+                                    client->buffer + processedPackets,
+                                    packetLength);
+                                client->qos2Packet[0] &= (uint8_t)~0x08;
                             }
-                            if (!readPublish(
-                                    client->buffer, packetEnd, packetStart,
-                                    client->buffer[processedPackets], client)) {
-                                disconnectClient(
-                                    client, epollfd, mqttNowMs(),
-                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
-                                    METRIC_IO_NONE);
-                                clientDisconnected = true;
-                                break;
+                            if (newPublishOperation) {
+                                interactionDepthObserveMqttOperation(
+                                    &client->interactionDepth);
+                                char fields[64];
+                                snprintf(
+                                    fields, sizeof(fields),
+                                    "\"qos\":%u,\"interaction_depth\":%u",
+                                    publishQos,
+                                    interactionDepthLevel(
+                                        &client->interactionDepth));
+                                emitMqttAction(client, "PUBLISH", fields);
+                                if (mqttMetricEmitterReady) {
+                                    (void)metric_event_mqtt_protocol_action(
+                                        METRIC_MQTT_ACTION_PUBLISH_RECEIVED);
+                                }
                             }
-                            if (mqttMetricEmitterReady) {
-                                (void)metric_event_mqtt_protocol_action(
-                                    METRIC_MQTT_ACTION_PUBLISH_RECEIVED);
+                            if (publishQos == 1) {
+                                uint8_t puback[4] = {
+                                    0x40, 0x02,
+                                    (uint8_t)(publishPacketId >> 8),
+                                    (uint8_t)(publishPacketId & 0xff),
+                                };
+                                enum metric_io_reason pubackFailureReason;
+                                enum mqttSendResult pubackResult =
+                                    sendMqttActionPacket(
+                                        client, puback, sizeof(puback),
+                                        METRIC_MQTT_ACTION_PUBACK_SENT,
+                                        &pubackFailureReason);
+                                if (pubackResult == MQTT_SEND_FATAL) {
+                                    disconnectClient(
+                                        client, epollfd, mqttNowMs(),
+                                        METRIC_MQTT_FINALIZATION_WRITE_ERROR,
+                                        pubackFailureReason);
+                                    clientDisconnected = true;
+                                }
+                            } else if (publishQos == 2) {
+                                uint8_t pubrec[4] = {
+                                    0x50, 0x02,
+                                    (uint8_t)(publishPacketId >> 8),
+                                    (uint8_t)(publishPacketId & 0xff),
+                                };
+                                enum metric_io_reason pubrecFailureReason;
+                                enum mqttSendResult pubrecResult =
+                                    sendMqttActionPacket(
+                                        client, pubrec, sizeof(pubrec),
+                                        METRIC_MQTT_ACTION_PUBREC_SENT,
+                                        &pubrecFailureReason);
+                                if (pubrecResult == MQTT_SEND_FATAL) {
+                                    disconnectClient(
+                                        client, epollfd, mqttNowMs(),
+                                        METRIC_MQTT_FINALIZATION_WRITE_ERROR,
+                                        pubrecFailureReason);
+                                    clientDisconnected = true;
+                                }
                             }
 #else
                             (void)readPublish(
                                 client->buffer, packetEnd, packetStart,
-                                client->buffer[processedPackets], client);
+                                client->buffer[processedPackets], client,
+                                NULL, NULL);
 #endif
                             break;
                         case PUBCOMP:

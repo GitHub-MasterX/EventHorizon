@@ -9,7 +9,7 @@
 #include "session_events.h"
 #include "interaction_depth.h"
 
-enum Request { CONNECT, PING, SUBSCRIBE, PUBREC, DISCONNECT, PUBLISH, UNSUBSCRIBE, PUBCOMP, UNSUPPORTED_REQUEST };
+enum Request { CONNECT, PING, SUBSCRIBE, PUBREC, PUBREL, DISCONNECT, PUBLISH, UNSUBSCRIBE, PUBCOMP, UNSUPPORTED_REQUEST };
 enum MqttVersion { V5, V311, V31 };
 enum ClientType { TELNET_CLIENT, COAP_CLIENT };
 
@@ -66,6 +66,11 @@ struct mqttClient {
     bool connectRefused;
     bool connackSent;
     uint64_t connectAcceptedMs;
+    bool qos2Active;
+    bool qos2PubrelReceived;
+    uint16_t qos2PacketId;
+    uint16_t qos2PacketLength;
+    uint8_t qos2Packet[1024];
     enum MqttVersion version;
     UT_hash_handle hh;
 };

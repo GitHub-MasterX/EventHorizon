@@ -740,3 +740,171 @@ func TestMQTTJSONProducerRejectsSecondCONNECTWithoutDoubleCounting(t *testing.T)
 		"depth_level": "1",
 	}, 1)
 }
+
+func TestMQTTJSONProducerAcknowledgesAcceptedQoS1PUBLISH(t *testing.T) {
+	fixture := startMQTTJSONProducerFixture(t)
+	connection := fixture.connect(t)
+	t.Cleanup(func() { _ = connection.Close() })
+
+	connectPacket := []byte{
+		0x10, 0x10,
+		0x00, 0x04, 'M', 'Q', 'T', 'T',
+		0x04, 0x02, 0x00, 0x0a,
+		0x00, 0x04, 'g', 's', 'o', 'c',
+	}
+	if _, err := connection.Write(connectPacket); err != nil {
+		t.Fatalf("write MQTT CONNECT: %v", err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set MQTT QoS 1 response deadline: %v", err)
+	}
+	connack := make([]byte, 4)
+	if _, err := io.ReadFull(connection, connack); err != nil {
+		t.Fatalf("read MQTT CONNACK: %v", err)
+	}
+
+	publishPacket := []byte{
+		0x32, 0x06,
+		0x00, 0x01, 'a',
+		0x00, 0x07,
+		'x',
+	}
+	if _, err := connection.Write(publishPacket); err != nil {
+		t.Fatalf("write QoS 1 PUBLISH: %v", err)
+	}
+	puback := make([]byte, 4)
+	if _, err := io.ReadFull(connection, puback); err != nil {
+		t.Fatalf("read matching PUBACK: %v", err)
+	}
+	wantPuback := []byte{0x40, 0x02, 0x00, 0x07}
+	if !bytes.Equal(puback, wantPuback) {
+		t.Fatalf("PUBACK = %x, want %x", puback, wantPuback)
+	}
+
+	disconnectPacket := []byte{0xe0, 0x00}
+	if _, err := connection.Write(disconnectPacket); err != nil {
+		t.Fatalf("write MQTT DISCONNECT: %v", err)
+	}
+	if _, err := io.ReadAll(connection); err != nil {
+		t.Fatalf("read QoS 1 fixture finalization: %v", err)
+	}
+
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_protocol_actions_total", map[string]string{
+		"protocol": "mqtt",
+		"action":   "publish_received",
+	}, 1)
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_protocol_actions_total", map[string]string{
+		"protocol": "mqtt",
+		"action":   "puback_sent",
+	}, 1)
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_bytes_received_total", map[string]string{
+		"protocol": "mqtt",
+	}, float64(len(connectPacket)+len(publishPacket)+len(disconnectPacket)))
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_bytes_sent_total", map[string]string{
+		"protocol": "mqtt",
+	}, float64(len(connack)+len(puback)))
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_mqtt_network_connection_finalizations_total", map[string]string{
+		"finalization_reason": "disconnect_received",
+	}, 1)
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_mqtt_network_connection_interaction_depth_total", map[string]string{
+		"depth_level": "2",
+	}, 1)
+}
+
+func TestMQTTJSONProducerCompletesAcceptedQoS2PUBLISHFlow(t *testing.T) {
+	fixture := startMQTTJSONProducerFixture(t)
+	connection := fixture.connect(t)
+	t.Cleanup(func() { _ = connection.Close() })
+
+	connectPacket := []byte{
+		0x10, 0x10,
+		0x00, 0x04, 'M', 'Q', 'T', 'T',
+		0x04, 0x02, 0x00, 0x0a,
+		0x00, 0x04, 'g', 's', 'o', 'c',
+	}
+	if _, err := connection.Write(connectPacket); err != nil {
+		t.Fatalf("write MQTT CONNECT: %v", err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set MQTT QoS 2 response deadline: %v", err)
+	}
+	connack := make([]byte, 4)
+	if _, err := io.ReadFull(connection, connack); err != nil {
+		t.Fatalf("read MQTT CONNACK: %v", err)
+	}
+
+	publishPacket := []byte{
+		0x34, 0x06,
+		0x00, 0x01, 'a',
+		0x00, 0x07,
+		'x',
+	}
+	if _, err := connection.Write(publishPacket); err != nil {
+		t.Fatalf("write QoS 2 PUBLISH: %v", err)
+	}
+	pubrec := make([]byte, 4)
+	if _, err := io.ReadFull(connection, pubrec); err != nil {
+		t.Fatalf("read matching PUBREC: %v", err)
+	}
+	wantPubrec := []byte{0x50, 0x02, 0x00, 0x07}
+	if !bytes.Equal(pubrec, wantPubrec) {
+		t.Fatalf("PUBREC = %x, want %x", pubrec, wantPubrec)
+	}
+	duplicatePublish := append([]byte{}, publishPacket...)
+	duplicatePublish[0] |= 0x08
+	if _, err := connection.Write(duplicatePublish); err != nil {
+		t.Fatalf("write active duplicate QoS 2 PUBLISH: %v", err)
+	}
+	duplicatePubrec := make([]byte, 4)
+	if _, err := io.ReadFull(connection, duplicatePubrec); err != nil {
+		t.Fatalf("read duplicate-flow PUBREC: %v", err)
+	}
+	if !bytes.Equal(duplicatePubrec, wantPubrec) {
+		t.Fatalf("duplicate-flow PUBREC = %x, want %x", duplicatePubrec, wantPubrec)
+	}
+
+	pubrelPacket := []byte{0x62, 0x02, 0x00, 0x07}
+	if _, err := connection.Write(pubrelPacket); err != nil {
+		t.Fatalf("write matching PUBREL: %v", err)
+	}
+	pubcomp := make([]byte, 4)
+	if _, err := io.ReadFull(connection, pubcomp); err != nil {
+		t.Fatalf("read matching PUBCOMP: %v", err)
+	}
+	wantPubcomp := []byte{0x70, 0x02, 0x00, 0x07}
+	if !bytes.Equal(pubcomp, wantPubcomp) {
+		t.Fatalf("PUBCOMP = %x, want %x", pubcomp, wantPubcomp)
+	}
+
+	disconnectPacket := []byte{0xe0, 0x00}
+	if _, err := connection.Write(disconnectPacket); err != nil {
+		t.Fatalf("write MQTT DISCONNECT: %v", err)
+	}
+	if _, err := io.ReadAll(connection); err != nil {
+		t.Fatalf("read QoS 2 fixture finalization: %v", err)
+	}
+
+	for action, want := range map[string]float64{
+		"publish_received": 1,
+		"pubrec_sent":      2,
+		"pubrel_received":  1,
+		"pubcomp_sent":     1,
+	} {
+		assertGatheredValueEventually(t, fixture.registry, "eventhorizon_protocol_actions_total", map[string]string{
+			"protocol": "mqtt",
+			"action":   action,
+		}, want)
+	}
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_bytes_received_total", map[string]string{
+		"protocol": "mqtt",
+	}, float64(len(connectPacket)+len(publishPacket)+len(duplicatePublish)+len(pubrelPacket)+len(disconnectPacket)))
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_bytes_sent_total", map[string]string{
+		"protocol": "mqtt",
+	}, float64(len(connack)+len(pubrec)+len(duplicatePubrec)+len(pubcomp)))
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_mqtt_network_connection_finalizations_total", map[string]string{
+		"finalization_reason": "disconnect_received",
+	}, 1)
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_mqtt_network_connection_interaction_depth_total", map[string]string{
+		"depth_level": "2",
+	}, 1)
+}
