@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -g -pthread
 
-STRUCTS = shared/structs.c shared/session_events.c shared/interaction_depth.c
+STRUCTS = shared/structs.c shared/session_events.c shared/interaction_depth.c shared/metric_events.c
 
 TELNET_TARGET = bin/telnet_pit
 UPNP_TARGET = bin/upnp_pit
@@ -9,6 +9,7 @@ MQTT_TARGET = bin/mqtt_pit
 COAP_TARGET = bin/coap_pit
 BYTE_METRIC_TEST_TARGET = bin/byte_metric_test
 INTERACTION_DEPTH_TEST_TARGET = bin/interaction_depth_test
+METRIC_EVENT_EMITTER_TEST_TARGET = bin/metric_event_emitter_test
 
 TELNET_SRC = servers/telnet_pit.c
 UPNP_SRC = servers/upnp_pit.c
@@ -42,6 +43,9 @@ $(BYTE_METRIC_TEST_TARGET): tests/byte_metric_test.c $(STRUCTS) | $(BIN_DIR)
 $(INTERACTION_DEPTH_TEST_TARGET): tests/interaction_depth_test.c shared/interaction_depth.c | $(BIN_DIR)
 	$(CC) $(CFLAGS) -o $@ $^
 
+$(METRIC_EVENT_EMITTER_TEST_TARGET): tests/metric_event_emitter_test.c shared/metric_events.c | $(BIN_DIR)
+	$(CC) $(CFLAGS) -o $@ $^
+
 $(GO_TARGET): $(GO_SRCS) | $(BIN_DIR)
 	cd $(GO_DIR) && go build -o ../$(GO_TARGET)
 
@@ -58,9 +62,11 @@ test-byte-metrics: $(BYTE_METRIC_TEST_TARGET)
 	./$(BYTE_METRIC_TEST_TARGET)
 test-interaction-depth: $(INTERACTION_DEPTH_TEST_TARGET)
 	./$(INTERACTION_DEPTH_TEST_TARGET)
+test-metric-event-emitter: $(METRIC_EVENT_EMITTER_TEST_TARGET)
+	./$(METRIC_EVENT_EMITTER_TEST_TARGET)
 test-deployment-controller:
 	python3 -m unittest tests/test_deployment_controller.py -v
-test: test-byte-metrics test-interaction-depth test-deployment-controller
+test: test-byte-metrics test-interaction-depth test-metric-event-emitter test-deployment-controller
 
 PROTOCOL ?= telnet
 SESSIONS ?= 100
@@ -74,6 +80,6 @@ validation-load:
 	./scripts/run_controlled_validation.sh --protocol $(PROTOCOL) --profile load --sessions $(SESSIONS) --concurrency $(CONCURRENCY)
 
 clean:
-	rm -f $(TELNET_TARGET) $(UPNP_TARGET) $(MQTT_TARGET) $(GO_TARGET) $(BYTE_METRIC_TEST_TARGET) $(INTERACTION_DEPTH_TEST_TARGET)
+	rm -f $(TELNET_TARGET) $(UPNP_TARGET) $(MQTT_TARGET) $(GO_TARGET) $(BYTE_METRIC_TEST_TARGET) $(INTERACTION_DEPTH_TEST_TARGET) $(METRIC_EVENT_EMITTER_TEST_TARGET)
 
-.PHONY: all clean test test-byte-metrics test-interaction-depth test-deployment-controller validation-exact validation-load
+.PHONY: all clean test test-byte-metrics test-interaction-depth test-metric-event-emitter test-deployment-controller validation-exact validation-load
