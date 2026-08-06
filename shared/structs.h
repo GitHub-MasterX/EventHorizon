@@ -28,6 +28,7 @@ struct telnetAndUpnpClient {
     unsigned int interactionDepth;
     struct interactionDepthState boundedInteractionDepth;
     bool firstResponseSent;
+    uint64_t lastPositiveWriteMs;
     char sessionId[SESSION_EVENT_ID_LEN];
 };
 
@@ -143,6 +144,11 @@ int createServer(int port);
  * @return Returns the current time in milliseconds
  */
 long long currentTimeMs();
+
+/**
+ * @return Monotonic elapsed time in milliseconds for duration measurement.
+ */
+long long currentMonotonicTimeMs(void);
 
 /**
  * @return Sets the maximum number of fd's

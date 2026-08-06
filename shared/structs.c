@@ -166,6 +166,14 @@ long long currentTimeMs() {
     return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
 }
 
+long long currentMonotonicTimeMs(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+}
+
 void setFdLimit(int limit) {
     struct rlimit rl;
     rl.rlim_cur = limit;
