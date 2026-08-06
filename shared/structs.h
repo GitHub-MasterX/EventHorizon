@@ -62,6 +62,10 @@ struct mqttClient {
     long long timeOfConnection;
     bool firstResponseSent;
     unsigned int interactionDepthAtFirstResponse;
+    bool connectAccepted;
+    bool connectRefused;
+    bool connackSent;
+    uint64_t connectAcceptedMs;
     enum MqttVersion version;
     UT_hash_handle hh;
 };

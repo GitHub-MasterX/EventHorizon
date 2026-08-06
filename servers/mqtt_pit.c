@@ -14,6 +14,10 @@
 #include <time.h>
 #include <sys/socket.h>
 #include "../shared/structs.h"
+#include "../shared/metric_events.h"
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+#include <pthread.h>
+#endif
 
 // #define PORT 1883
 // #define MAX_EVENTS 4096
@@ -32,6 +36,74 @@ uint32_t maxPacketsPerClient;
 int maxNoClients;
 
 struct mqttClient* clients = NULL;
+
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+static pthread_mutex_t mqttMetricStateLock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t mqttActiveConnections = 0;
+static bool mqttMetricEmitterReady = false;
+static volatile sig_atomic_t mqttStopRequested = 0;
+
+static void requestMqttStop(int signalNumber) {
+    (void)signalNumber;
+    mqttStopRequested = 1;
+}
+#endif
+
+enum mqttSendResult {
+    MQTT_SEND_COMPLETE,
+    MQTT_SEND_PENDING,
+    MQTT_SEND_FATAL,
+};
+
+static long long mqttNowMs(void) {
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+    return currentMonotonicTimeMs();
+#else
+    return currentTimeMs();
+#endif
+}
+
+static const char *mqttFinalizationName(
+    enum metric_mqtt_finalization_reason reason) {
+    switch (reason) {
+        case METRIC_MQTT_FINALIZATION_PEER_CLOSED:
+            return "peer_closed";
+        case METRIC_MQTT_FINALIZATION_DISCONNECT_RECEIVED:
+            return "disconnect_received";
+        case METRIC_MQTT_FINALIZATION_CONNECT_REFUSED:
+            return "connect_refused";
+        case METRIC_MQTT_FINALIZATION_OPERATION_REFUSED:
+            return "operation_refused";
+        case METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR:
+            return "protocol_error";
+        case METRIC_MQTT_FINALIZATION_KEEP_ALIVE_TIMEOUT:
+            return "keep_alive_timeout";
+        case METRIC_MQTT_FINALIZATION_READ_ERROR:
+            return "read_error";
+        case METRIC_MQTT_FINALIZATION_WRITE_ERROR:
+            return "write_error";
+        case METRIC_MQTT_FINALIZATION_SERVER_SHUTDOWN:
+            return "server_shutdown";
+        case METRIC_MQTT_FINALIZATION_BOUNDED_POLICY:
+            return "bounded_policy";
+    }
+    return "protocol_error";
+}
+
+static const char *legacyMqttFinalizationName(
+    enum metric_mqtt_finalization_reason reason) {
+    switch (reason) {
+        case METRIC_MQTT_FINALIZATION_PEER_CLOSED:
+        case METRIC_MQTT_FINALIZATION_DISCONNECT_RECEIVED:
+            return "client_disconnect";
+        case METRIC_MQTT_FINALIZATION_KEEP_ALIVE_TIMEOUT:
+            return "inactivity";
+        case METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR:
+            return "read_error";
+        default:
+            return mqttFinalizationName(reason);
+    }
+}
 
 struct mqttClient* lookupClient(int fd) {
     struct mqttClient* client;
@@ -155,8 +227,16 @@ uint8_t readConnreq(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct
         fprintf(stderr, "Unsupported MQTT version: %d", proto_level);
         return 0x01; // Unacceptable protocol version
     }
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+    if ((isV31 && proto_level != 0x03) ||
+        (!isV31 && proto_level == 0x03)) {
+        return 0x01;
+    }
+#endif
     printf("%s", msg);
+#ifndef EVENTHORIZON_JSON_METRIC_EVENTS
     sendMetric(msg);
+#endif
 
     // Connect Flags
     if (offset >= packetEnd) {
@@ -168,6 +248,19 @@ uint8_t readConnreq(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct
         fprintf(stderr, "CONNECT reserved flag bit is set");
         return 0x80;
     }
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+    bool cleanSession = (connect_flags & 0x02) != 0;
+    bool willFlag = (connect_flags & 0x04) != 0;
+    uint8_t willQos = (connect_flags >> 3) & 0x03;
+    bool willRetain = (connect_flags & 0x20) != 0;
+    bool usernameFlag = (connect_flags & 0x80) != 0;
+    bool passwordFlag = (connect_flags & 0x40) != 0;
+    if (willQos == 3 || (!willFlag && (willQos != 0 || willRetain)) ||
+        (passwordFlag && !usernameFlag)) {
+        return 0x80;
+    }
+    bool unsupportedProfile = !cleanSession || willFlag;
+#endif
     // printf("Connect Flags: 0x%02X\n", connect_flags);
 
     // Keep Alive
@@ -211,6 +304,42 @@ uint8_t readConnreq(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct
         return 0x02;
     }
     offset += clientIdLength;
+
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+    if (willFlag) {
+        if (client->version == V5) {
+            uint32_t willPropertiesLength;
+            if (!decodeVarint(
+                    buffer, packetEnd, &offset,
+                    &willPropertiesLength) ||
+                offset + willPropertiesLength > packetEnd) {
+                return 0x80;
+            }
+            offset += willPropertiesLength;
+        }
+        if (offset + 2 > packetEnd) {
+            return 0x80;
+        }
+        uint16_t willTopicLength =
+            (buffer[offset] << 8) | buffer[offset + 1];
+        offset += 2;
+        if (willTopicLength == 0 || offset + willTopicLength > packetEnd) {
+            return 0x80;
+        }
+        offset += willTopicLength;
+
+        if (offset + 2 > packetEnd) {
+            return 0x80;
+        }
+        uint16_t willPayloadLength =
+            (buffer[offset] << 8) | buffer[offset + 1];
+        offset += 2;
+        if (offset + willPayloadLength > packetEnd) {
+            return 0x80;
+        }
+        offset += willPayloadLength;
+    }
+#endif
 
     // Username
     char username[256] = {0};
@@ -263,9 +392,11 @@ uint8_t readConnreq(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct
     snprintf(msg, sizeof(msg), "%s credentials %.100s %.100s\n",
         SERVER_ID, username, password);
     printf("%s", msg);
+#ifndef EVENTHORIZON_JSON_METRIC_EVENTS
     sendMetric(msg);
 
     interactionDepthObserveMqttConnect(&client->interactionDepth);
+#endif
     char fields[256];
     snprintf(fields, sizeof(fields),
         "\"mqtt_version\":\"%s\",\"client_id_present\":%s,\"username_present\":%s,\"password_present\":%s,\"keep_alive_seconds\":%d,\"interaction_depth\":%u",
@@ -276,6 +407,19 @@ uint8_t readConnreq(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct
         keepAlive,
         interactionDepthLevel(&client->interactionDepth));
     emitMqttAction(client, "CONNECT", fields);
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+    if (offset != packetEnd) {
+        return 0x80;
+    }
+    if (client->version != V311) {
+        client->connectRefused = true;
+        return client->version == V5 ? 0x84 : 0x01;
+    }
+    if (unsupportedProfile) {
+        client->connectRefused = true;
+        return 0x03;
+    }
+#endif
     return 0x00; // Success
 }
 
@@ -332,6 +476,7 @@ bool readSubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct 
     snprintf(msg, sizeof(msg), "%s SUBSCRIBE %.100s %d\n",
         SERVER_ID, topic, qos);
     printf("%s", msg);
+#ifndef EVENTHORIZON_JSON_METRIC_EVENTS
     sendMetric(msg);
 
     char fields[160];
@@ -340,6 +485,7 @@ bool readSubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset, struct 
         "\"qos\":%d,\"topic_present\":%s,\"interaction_depth\":%u",
         qos, boolString(topicLength > 0), interactionDepthLevel(&client->interactionDepth));
     emitMqttAction(client, "SUBSCRIBE", fields);
+#endif
 
     // syslog(LOG_INFO, "Successfully read SUBSCRIBE request with topic: %s and QoS %d", topic, qos);
     return true;
@@ -369,23 +515,29 @@ void generateFakeMatchingTopic(char* sub, size_t length) {
     strncpy(sub, buffer, length);
 }
 
-bool sendConnack(struct mqttClient* client, uint8_t reasonCode) {
-    int size = client->version == V5 ? 8 : 4;
-    uint8_t* arr = malloc(size);
-    if (!arr) {
-        fprintf(stderr, "malloc failed for connack packet");
-        return false;
-    } 
+enum mqttSendResult sendConnack(
+    struct mqttClient* client,
+    uint8_t reasonCode,
+    enum metric_io_reason *failureReason) {
+    *failureReason = METRIC_IO_NONE;
+    int size = client->version == V5
+        ? (reasonCode == 0x00 ? 8 : 5)
+        : 4;
+    uint8_t arr[8] = {0};
 
     if (client->version == V5) {
         arr[0] = 0x20;       // CONNACK fixed header
-        arr[1] = 0x06;       // Remaining Length
+        arr[1] = reasonCode == 0x00 ? 0x06 : 0x03;
         arr[2] = 0x00;       // Connect Acknowledge Flags (Session Present = 0)
         arr[3] = reasonCode; // Reason Code
-        arr[4] = 0x03;       // Properties Length
-        arr[5] = 0x21;       // Property ID: Receive Maximum
-        arr[6] = 0x00;       // MSB
-        arr[7] = 0x01;       // LSB (Receive Maximum = 1)
+        if (reasonCode == 0x00) {
+            arr[4] = 0x03;       // Properties Length
+            arr[5] = 0x21;       // Property ID: Receive Maximum
+            arr[6] = 0x00;       // MSB
+            arr[7] = 0x01;       // LSB (Receive Maximum = 1)
+        } else {
+            arr[4] = 0x00;       // No properties in refusal response
+        }
     } else {
         arr[0] = 0x20;       // CONNACK fixed header
         arr[1] = 0x02;       // Remaining Length
@@ -393,29 +545,59 @@ bool sendConnack(struct mqttClient* client, uint8_t reasonCode) {
         arr[3] = reasonCode; // Return Code
     }
 
-    ssize_t w = write(client->fd, arr, size);
+    ssize_t w = write(client->fd, arr, (size_t)size);
+    int writeError = errno;
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+    if (w > 0 && mqttMetricEmitterReady) {
+        (void)metric_event_mqtt_positive_write((uint64_t)w);
+    }
+#else
     sendByteMetric(SERVER_ID, "sent", w);
-    free(arr);
-    if (w == -1) {
+#endif
+    if (w < 0) {
         fprintf(stderr, "sendConnack: write failed. May retry.");
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        if (writeError != EAGAIN && writeError != EWOULDBLOCK &&
+            writeError != EINTR) {
+#ifndef EVENTHORIZON_JSON_METRIC_EVENTS
             sendReliabilityMetric(SERVER_ID, "write_error", metricReasonFromErrno(errno));
-            return false;
+#endif
+            *failureReason = metric_io_reason_from_unrecoverable_errno(
+                writeError, false);
+            return MQTT_SEND_FATAL;
         }
-    } else {
+        return MQTT_SEND_PENDING;
+    }
+    if (w != size) {
+        return MQTT_SEND_PENDING;
+    }
+
+    {
         char msg[256];
         snprintf(msg, sizeof(msg), "%s CONNACK\n",
             SERVER_ID);
         printf("%s", msg);
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+        if (reasonCode == 0x00 && client->connectAccepted &&
+            !client->connackSent) {
+            long long now = mqttNowMs();
+            long long durationMs = now - (long long)client->connectAcceptedMs;
+            client->connackSent = true;
+            if (mqttMetricEmitterReady) {
+                (void)metric_event_mqtt_connack_sent(
+                    durationMs >= 0 ? (uint64_t)durationMs : 0);
+            }
+        }
+#else
         sendMetric(msg);
         if (w > 0 && !client->firstResponseSent) {
             client->firstResponseSent = true;
             client->interactionDepthAtFirstResponse = interactionDepthLevel(&client->interactionDepth);
         }
+#endif
         // syslog(LOG_INFO, "Sent CONNACK to client fd=%d\n", client->fd);
     }
 
-    return true;
+    return MQTT_SEND_COMPLETE;
 }
 
 bool readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset,
@@ -476,7 +658,9 @@ bool readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset,
     char msg[256];
     snprintf(msg, sizeof(msg), "%s PUBLISH %.100s %d\n",
         SERVER_ID, topic, qos);
+#ifndef EVENTHORIZON_JSON_METRIC_EVENTS
     sendMetric(msg);
+#endif
     char fields[192];
     interactionDepthObserveMqttOperation(&client->interactionDepth);
     snprintf(fields, sizeof(fields),
@@ -526,7 +710,9 @@ bool readUnsubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset,
         char msg[256];
         snprintf(msg, sizeof(msg), "%s UNSUBSCRIBE %.200s\n",
             SERVER_ID, topic);
+#ifndef EVENTHORIZON_JSON_METRIC_EVENTS
         sendMetric(msg);
+#endif
         observedTopic = true;
 
         printf("UNSUBSCRIBE received for topic: %s (Packet ID: %u)\n", topic, packetId);
@@ -534,7 +720,9 @@ bool readUnsubscribe(uint8_t* buffer, uint32_t packetEnd, uint32_t offset,
     if (!observedTopic || offset != packetEnd) {
         return false;
     }
+#ifndef EVENTHORIZON_JSON_METRIC_EVENTS
     interactionDepthObserveMqttOperation(&client->interactionDepth);
+#endif
     return true;
 }
 
@@ -748,29 +936,75 @@ void readPubcomp(uint32_t packetEnd, uint32_t offset) {
     // syslog(LOG_INFO, "PUBCOMP Packet ID: %u from client fd=%d", packetId, client->fd);
 }
 
-bool sendPingresp(struct mqttClient* client) {
+enum mqttSendResult sendPingresp(
+    struct mqttClient* client,
+    enum metric_io_reason *failureReason) {
+    *failureReason = METRIC_IO_NONE;
     uint8_t packet[2] = { 0xD0, 0x00 };
     ssize_t w = write(client->fd, packet, sizeof(packet));
-    sendByteMetric(SERVER_ID, "sent", w);
-
-    if (w == -1) {
-        fprintf(stderr, "sendPingresp: write failed. May retry.");
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            sendReliabilityMetric(SERVER_ID, "write_error", metricReasonFromErrno(errno));
-            return false;
-        }
-    } else {
-        fprintf(stderr, "Sent PINGRESP to client (fd=%d)\n", client->fd);
+    int writeError = errno;
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+    if (w > 0 && mqttMetricEmitterReady) {
+        (void)metric_event_mqtt_positive_write((uint64_t)w);
     }
-    return true;
+#else
+    sendByteMetric(SERVER_ID, "sent", w);
+#endif
+
+    if (w < 0) {
+        fprintf(stderr, "sendPingresp: write failed. May retry.");
+        if (writeError != EAGAIN && writeError != EWOULDBLOCK &&
+            writeError != EINTR) {
+#ifndef EVENTHORIZON_JSON_METRIC_EVENTS
+            sendReliabilityMetric(SERVER_ID, "write_error", metricReasonFromErrno(errno));
+#endif
+            *failureReason = metric_io_reason_from_unrecoverable_errno(
+                writeError, false);
+            return MQTT_SEND_FATAL;
+        }
+        return MQTT_SEND_PENDING;
+    }
+    if (w != (ssize_t)sizeof(packet)) {
+        return MQTT_SEND_PENDING;
+    }
+    fprintf(stderr, "Sent PINGRESP to client (fd=%d)\n", client->fd);
+    return MQTT_SEND_COMPLETE;
 }
 
-void disconnectClient(struct mqttClient* client, int epollFd, long long now, const char *reason){
+void disconnectClient(
+    struct mqttClient* client,
+    int epollFd,
+    long long now,
+    enum metric_mqtt_finalization_reason finalizationReason,
+    enum metric_io_reason ioReason) {
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+    pthread_mutex_lock(&mqttMetricStateLock);
+#endif
     unsigned int depthLevel;
     if (!interactionDepthFinalize(&client->interactionDepth, &depthLevel)) {
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+        pthread_mutex_unlock(&mqttMetricStateLock);
+#endif
         return;
     }
     long long wastedTime = now - client->timeOfConnection;
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+    if (mqttActiveConnections > 0) {
+        mqttActiveConnections -= 1;
+    }
+    if (mqttMetricEmitterReady) {
+        (void)metric_event_mqtt_connection_finalized(
+            finalizationReason,
+            wastedTime >= 0 ? (uint64_t)wastedTime : 0,
+            (uint8_t)depthLevel,
+            mqttActiveConnections,
+            ioReason);
+    }
+    pthread_mutex_unlock(&mqttMetricStateLock);
+    const char *reason = mqttFinalizationName(finalizationReason);
+#else
+    (void)ioReason;
+    const char *reason = legacyMqttFinalizationName(finalizationReason);
     bool firstResponseExit = client->firstResponseSent &&
         depthLevel <= client->interactionDepthAtFirstResponse;
 
@@ -786,6 +1020,7 @@ void disconnectClient(struct mqttClient* client, int epollFd, long long now, con
 
     printf("%s", msg);
     sendMetric(msg);
+#endif
     session_events_write_disconnect("mqtt", client->sessionId, wastedTime, reason, depthLevel);
 
     epoll_ctl(epollFd, EPOLL_CTL_DEL, client->fd, NULL);
@@ -899,9 +1134,21 @@ int main(int argc, char* argv[]) {
     maxNoClients = atoi(argv[6]);
     // openlog("mqtt_tarpit", LOG_PID | LOG_CONS, LOG_USER);
     initializeStats();
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+    mqttMetricEmitterReady = metric_event_emitter_init(
+        getenv("EVENTHORIZON_METRIC_SOCKET"));
+#endif
     session_events_init(NULL);
     setFdLimit(maxNoClients);
     signal(SIGPIPE, SIG_IGN);
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+    struct sigaction stopAction;
+    memset(&stopAction, 0, sizeof(stopAction));
+    stopAction.sa_handler = requestMqttStop;
+    sigemptyset(&stopAction.sa_mask);
+    sigaction(SIGTERM, &stopAction, NULL);
+    sigaction(SIGINT, &stopAction, NULL);
+#endif
     
     int serverSock = createServer(port);
     if (serverSock < 0) {
@@ -927,8 +1174,14 @@ int main(int argc, char* argv[]) {
     }
 
     // long long lastHeartbeat = currentTimeMs();
-    while(true) {
-        long long now = currentTimeMs();
+    while(
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+        mqttStopRequested == 0
+#else
+        true
+#endif
+    ) {
+        long long now = mqttNowMs();
 
         // if (now - lastHeartbeat >= HEARTBEAT_INTERVAL_MS) {
         //     heartbeatLog();
@@ -937,13 +1190,22 @@ int main(int argc, char* argv[]) {
 
         int nfds = epoll_wait(epollfd, eventsQueue, maxEvents, epollTimeoutInterval);
         if (nfds == -1) {
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+            if (errno == EINTR && mqttStopRequested != 0) {
+                break;
+            }
+#endif
             fprintf(stderr, "epoll_wait");
             exit(EXIT_FAILURE);
         }
 
         // Update now, since epoll_wait made the value outdated. 
-        now = currentTimeMs();
-        for (int n = 0; n < nfds; ++n) {
+        now = mqttNowMs();
+        for (int n = 0; n < nfds
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+             && mqttStopRequested == 0
+#endif
+             ; ++n) {
             int currentFd = eventsQueue[n].data.fd;
             if (currentFd == serverSock) {
                 int clientFd = accept(serverSock, (struct sockaddr *) &clientAddr, &addrLen);
@@ -974,6 +1236,10 @@ int main(int argc, char* argv[]) {
                 interactionDepthInit(&newClient->interactionDepth);
                 newClient->firstResponseSent = false;
                 newClient->interactionDepthAtFirstResponse = 0;
+                newClient->connectAccepted = false;
+                newClient->connectRefused = false;
+                newClient->connackSent = false;
+                newClient->connectAcceptedMs = 0;
                 session_events_make_id(newClient->sessionId, sizeof(newClient->sessionId), "mqtt", newClient->timeOfConnection, newClient->fd);
                 memset(newClient->buffer, 0, sizeof(newClient->buffer)); // Maybe not necessary
                 // ev.events = EPOLLIN | EPOLLET;
@@ -994,7 +1260,19 @@ int main(int argc, char* argv[]) {
                 snprintf(msg, sizeof(msg), "%s connect %s\n",
                     SERVER_ID, newClient->ipaddr);
                 printf("%s", msg);
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                pthread_mutex_lock(&mqttMetricStateLock);
+                if (mqttActiveConnections < UINT32_MAX) {
+                    mqttActiveConnections += 1;
+                    if (mqttMetricEmitterReady) {
+                        (void)metric_event_mqtt_connection_accepted(
+                            mqttActiveConnections);
+                    }
+                }
+                pthread_mutex_unlock(&mqttMetricStateLock);
+#else
                 sendMetric(msg);
+#endif
                 session_events_write_connect("mqtt", newClient->sessionId);
                 // if(statsMqtt.mostConcurrentConnections < HASH_COUNT(clients)) {
                 //     statsMqtt.mostConcurrentConnections = HASH_COUNT(clients);
@@ -1009,21 +1287,38 @@ int main(int argc, char* argv[]) {
                 ssize_t bytesRead = read(currentFd,
                           client->buffer + client->bytesWrittenToBuffer, // Avoid overwriting existing data
                           sizeof(client->buffer) - client->bytesWrittenToBuffer);
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                if (bytesRead > 0 && mqttMetricEmitterReady) {
+                    (void)metric_event_mqtt_positive_read((uint64_t)bytesRead);
+                }
+#else
                 sendByteMetric(SERVER_ID, "received", bytesRead);
+#endif
 
                 if(bytesRead == -1) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK ||
+                        errno == EINTR) {
                         continue;
                     }
+                    int readError = errno;
                     fprintf(stderr, "Failed reading. Disconnecting client. error: %s", strerror(errno));
+#ifndef EVENTHORIZON_JSON_METRIC_EVENTS
                     sendReliabilityMetric(SERVER_ID, "read_error", metricReasonFromErrno(errno));
-                    disconnectClient(client, epollfd, now, "read_error");
+#endif
+                    disconnectClient(
+                        client, epollfd, mqttNowMs(),
+                        METRIC_MQTT_FINALIZATION_READ_ERROR,
+                        metric_io_reason_from_unrecoverable_errno(
+                            readError, false));
                     continue;
                 }
 
                 if(bytesRead == 0) {
                     fprintf(stderr, "Client closed connection. Disconnecting client.");
-                    disconnectClient(client, epollfd, now, "client_disconnect");
+                    disconnectClient(
+                        client, epollfd, mqttNowMs(),
+                        METRIC_MQTT_FINALIZATION_PEER_CLOSED,
+                        METRIC_IO_NONE);
                     continue;
                 }
 
@@ -1031,8 +1326,13 @@ int main(int argc, char* argv[]) {
 
                 if (client->bytesWrittenToBuffer >= sizeof(client->buffer)) {
                     fprintf(stderr, "Buffer full. Disconnecting client.");
+#ifndef EVENTHORIZON_JSON_METRIC_EVENTS
                     sendReliabilityMetric(SERVER_ID, "read_error", "invalid_packet");
-                    disconnectClient(client, epollfd, now, "read_error");
+#endif
+                    disconnectClient(
+                        client, epollfd, mqttNowMs(),
+                        METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                        METRIC_IO_NONE);
                     continue;
                 }
 
@@ -1057,71 +1357,293 @@ int main(int argc, char* argv[]) {
 
                     client->lastActivityMs = now;
                     enum Request request = determineRequest(client->buffer[processedPackets]);
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                    if (request != CONNECT && !client->connackSent) {
+                        disconnectClient(
+                            client, epollfd, mqttNowMs(),
+                            METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                            METRIC_IO_NONE);
+                        clientDisconnected = true;
+                        break;
+                    }
+#endif
                     bool pubSuccess = false;
                     switch (request) {
                         case CONNECT:
+                            if (client->connectAccepted ||
+                                client->buffer[processedPackets] != 0x10) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
+                            }
                             uint8_t reasonCodeConn = readConnreq(client->buffer, packetEnd, packetStart, client);
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                            enum metric_mqtt_finalization_reason refusalReason =
+                                client->connectRefused
+                                    ? METRIC_MQTT_FINALIZATION_CONNECT_REFUSED
+                                    : METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR;
+                            if (reasonCodeConn == 0x00) {
+                                client->connectAccepted = true;
+                                client->connectAcceptedMs = (uint64_t)mqttNowMs();
+                                client->lastActivityMs = client->connectAcceptedMs;
+                                interactionDepthObserveMqttConnect(
+                                    &client->interactionDepth);
+                                if (mqttMetricEmitterReady) {
+                                    (void)metric_event_mqtt_protocol_action(
+                                        METRIC_MQTT_ACTION_CONNECT_ACCEPTED);
+                                }
+                            }
+#endif
                             if(reasonCodeConn != 0x00) {
+#ifndef EVENTHORIZON_JSON_METRIC_EVENTS
                                 char msg[256];
                                 snprintf(msg, sizeof(msg), "%s malformedConnect",
                                     SERVER_ID);
                                 sendMetric(msg);
+#endif
                             }
-                            bool ackSuccess = sendConnack(client, reasonCodeConn);
-                            if(!ackSuccess) {
-                                fprintf(stderr, "Disconnecting client due to CONNACK failure");
-                                disconnectClient(client, epollfd, now, "write_error");
+                            enum metric_io_reason connackFailureReason;
+                            enum mqttSendResult ackResult = MQTT_SEND_PENDING;
+                            if (reasonCodeConn <= 0x05 ||
+                                (client->version == V5 &&
+                                 reasonCodeConn == 0x84)) {
+                                ackResult = sendConnack(
+                                    client, reasonCodeConn,
+                                    &connackFailureReason);
+                            }
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                            if (reasonCodeConn != 0x00) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    refusalReason,
+                                    METRIC_IO_NONE);
+                                if (ackResult == MQTT_SEND_FATAL &&
+                                    mqttMetricEmitterReady) {
+                                    (void)metric_event_mqtt_secondary_write_error(
+                                        connackFailureReason);
+                                }
                                 clientDisconnected = true;
                                 break;
                             }
+#endif
+                            if(ackResult == MQTT_SEND_FATAL) {
+                                fprintf(stderr, "Disconnecting client due to CONNACK failure");
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_WRITE_ERROR,
+                                    connackFailureReason);
+                                clientDisconnected = true;
+                                break;
+                            }
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                            if (ackResult != MQTT_SEND_COMPLETE) {
+                                break;
+                            }
+#else
                             pubSuccess = sendPublish(client, "$SYS/credentials", "username=admin password=admin");
                             if(!pubSuccess) {
                                 fprintf(stderr, "Disconnecting client due to publish failure");
-                                disconnectClient(client, epollfd, now, "write_error");
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_WRITE_ERROR,
+                                    METRIC_IO_OTHER);
                                 clientDisconnected = true;
                             }
+#endif
                             break;
                         case SUBSCRIBE:
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                            if (client->buffer[processedPackets] != 0x82 ||
+                                !readSubscribe(
+                                    client->buffer, packetEnd, packetStart,
+                                    client)) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                            } else {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_OPERATION_REFUSED,
+                                    METRIC_IO_NONE);
+                            }
+                            clientDisconnected = true;
+#else
                             readSubscribe(client->buffer, packetEnd, packetStart, client);
+#endif
                             break;
                         case PUBREC:
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                            disconnectClient(
+                                client, epollfd, mqttNowMs(),
+                                METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                METRIC_IO_NONE);
+                            clientDisconnected = true;
+#else
                             readPubrec(client->buffer, packetEnd, packetStart, client);
+#endif
                             break;
                         case PUBLISH:
-                            readPublish(client->buffer, packetEnd, packetStart,
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                            if (!client->connackSent) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
+                            }
+                            if ((client->buffer[processedPackets] & 0x01) != 0) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_OPERATION_REFUSED,
+                                    METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
+                            }
+                            uint8_t publishQos =
+                                (client->buffer[processedPackets] & 0x06) >> 1;
+                            if (publishQos == 3) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
+                            }
+                            if (publishQos > 0) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_OPERATION_REFUSED,
+                                    METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
+                            }
+                            if (!readPublish(
+                                    client->buffer, packetEnd, packetStart,
+                                    client->buffer[processedPackets], client)) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
+                            }
+                            if (mqttMetricEmitterReady) {
+                                (void)metric_event_mqtt_protocol_action(
+                                    METRIC_MQTT_ACTION_PUBLISH_RECEIVED);
+                            }
+#else
+                            (void)readPublish(
+                                client->buffer, packetEnd, packetStart,
                                 client->buffer[processedPackets], client);
+#endif
                             break;
                         case PUBCOMP:
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                            disconnectClient(
+                                client, epollfd, mqttNowMs(),
+                                METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                METRIC_IO_NONE);
+                            clientDisconnected = true;
+#else
                             readPubcomp(packetEnd, packetStart);
                             pubSuccess = sendPublish(client, "$SYS/confidential", "username=admin123 password=admin321");
                             if(!pubSuccess) {
                                 fprintf(stderr, "Disconnecting client due to publish failure");
-                                disconnectClient(client, epollfd, now, "write_error");
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_WRITE_ERROR,
+                                    METRIC_IO_OTHER);
                                 clientDisconnected = true;
                             }
+#endif
                             break;
                         case UNSUBSCRIBE:
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                            if (client->buffer[processedPackets] != 0xa2 ||
+                                !readUnsubscribe(
+                                    client->buffer, packetEnd, packetStart,
+                                    client)) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                            } else {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_OPERATION_REFUSED,
+                                    METRIC_IO_NONE);
+                            }
+                            clientDisconnected = true;
+#else
                             readUnsubscribe(client->buffer, packetEnd, packetStart, client);
+#endif
                             break;
                         case PING:
-                            bool pingSuccess = sendPingresp(client);
-                            if(!pingSuccess){
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                            if (client->buffer[processedPackets] != 0xc0 ||
+                                packetLength != 2) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
+                            }
+#endif
+                            enum metric_io_reason pingFailureReason;
+                            enum mqttSendResult pingResult = sendPingresp(
+                                client, &pingFailureReason);
+                            if(pingResult == MQTT_SEND_FATAL){
                                 fprintf(stderr, "Disconnecting client due to ping failure");
-                                disconnectClient(client, epollfd, now, "write_error");
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_WRITE_ERROR,
+                                    pingFailureReason);
                                 clientDisconnected = true;
                                 break;
                             }
                             break;
                         case DISCONNECT:
                             fprintf(stderr, "Disconnecting client due to receiving DISCONNECT");
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                            if (!client->connackSent ||
+                                client->buffer[processedPackets] != 0xe0 ||
+                                packetLength != 2) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                            } else {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_DISCONNECT_RECEIVED,
+                                    METRIC_IO_NONE);
+                            }
+#else
                             char disconnectMsg[64];
                             snprintf(disconnectMsg, sizeof(disconnectMsg),
                                 "%s protocol_action mqtt_disconnect\n", SERVER_ID);
                             sendMetric(disconnectMsg);
-                            disconnectClient(client, epollfd, now, "client_disconnect");
+                            disconnectClient(
+                                client, epollfd, mqttNowMs(),
+                                METRIC_MQTT_FINALIZATION_DISCONNECT_RECEIVED,
+                                METRIC_IO_NONE);
+#endif
                             clientDisconnected = true;
                             break;
                         default:
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+                            disconnectClient(
+                                client, epollfd, mqttNowMs(),
+                                METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                METRIC_IO_NONE);
+                            clientDisconnected = true;
+#endif
                             break;
                     }
                     if (clientDisconnected) break;
@@ -1139,9 +1661,23 @@ int main(int argc, char* argv[]) {
         }
         
         // Detect dead clients and disconnect them
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+        if (mqttStopRequested != 0) {
+            break;
+        }
+#endif
         for (struct mqttClient *c = clients, *tmp = NULL; c != NULL; c = tmp) {
             long long timeSinceLastActivityMs = now - c->lastActivityMs;
             tmp = c->hh.next;
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+            if (c->connectAccepted && c->keepAlive > 0 &&
+                timeSinceLastActivityMs >= (long long)c->keepAlive * 1500LL) {
+                disconnectClient(
+                    c, epollfd, mqttNowMs(),
+                    METRIC_MQTT_FINALIZATION_KEEP_ALIVE_TIMEOUT,
+                    METRIC_IO_NONE);
+            }
+#else
             if ((now - c->lastPubrelMs > pubrelInterval) || (timeSinceLastActivityMs > c->keepAlive * 1400)) {
                 bool success = sendPubrel(c, 1234);
                 c->lastActivityMs = now;
@@ -1149,14 +1685,27 @@ int main(int argc, char* argv[]) {
 
                 if(!success) {
                     fprintf(stderr, "Disconnecting client due to inactivity");
-                    disconnectClient(c, epollfd, now, "inactivity");
+                    disconnectClient(
+                        c, epollfd, mqttNowMs(),
+                        METRIC_MQTT_FINALIZATION_KEEP_ALIVE_TIMEOUT,
+                        METRIC_IO_NONE);
                     continue;
                 }
             }
+#endif
         }
     }
 
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+    while (clients != NULL) {
+        disconnectClient(
+            clients, epollfd, mqttNowMs(),
+            METRIC_MQTT_FINALIZATION_SERVER_SHUTDOWN,
+            METRIC_IO_NONE);
+    }
+#endif
     // closelog();
+    close(epollfd);
     close(serverSock);
     return 0;
 }
