@@ -112,6 +112,7 @@ static const char *telnetFinalizationName(
     return "bounded_policy";
 }
 
+#ifndef EVENTHORIZON_JSON_METRIC_EVENTS
 static const char *legacyTelnetFinalizationName(
     enum metric_telnet_finalization_reason reason) {
     if (reason == METRIC_TELNET_FINALIZATION_PEER_CLOSED) {
@@ -119,6 +120,7 @@ static const char *legacyTelnetFinalizationName(
     }
     return telnetFinalizationName(reason);
 }
+#endif
 
 static void completeTelnetSession(
     struct telnetAndUpnpClient *client,
