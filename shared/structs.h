@@ -13,6 +13,15 @@ enum Request { CONNECT, PING, SUBSCRIBE, PUBREC, PUBREL, DISCONNECT, PUBLISH, UN
 enum MqttVersion { V5, V311, V31 };
 enum ClientType { TELNET_CLIENT, COAP_CLIENT };
 
+#define MQTT_MAX_SUBSCRIPTIONS 8
+#define MQTT_MAX_TOPIC_FILTER_LENGTH 255
+
+struct mqttSubscription {
+    bool active;
+    uint16_t length;
+    char filter[MQTT_MAX_TOPIC_FILTER_LENGTH + 1];
+};
+
 struct baseClient {
     enum ClientType type;
     long long sendNext;
@@ -71,6 +80,7 @@ struct mqttClient {
     uint16_t qos2PacketId;
     uint16_t qos2PacketLength;
     uint8_t qos2Packet[1024];
+    struct mqttSubscription subscriptions[MQTT_MAX_SUBSCRIPTIONS];
     enum MqttVersion version;
     UT_hash_handle hh;
 };

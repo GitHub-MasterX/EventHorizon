@@ -55,6 +55,13 @@ enum mqttSendResult {
     MQTT_SEND_FATAL,
 };
 
+struct mqttParsedPublishData {
+    uint16_t topicLength;
+    char topic[256];
+    const uint8_t *payload;
+    uint32_t payloadLength;
+};
+
 static long long mqttNowMs(void) {
 #ifdef EVENTHORIZON_JSON_METRIC_EVENTS
     return currentMonotonicTimeMs();
@@ -632,11 +639,268 @@ static enum mqttSendResult sendMqttActionPacket(
     }
     return MQTT_SEND_COMPLETE;
 }
+
+enum mqttOperationParseResult {
+    MQTT_OPERATION_VALID,
+    MQTT_OPERATION_MALFORMED,
+    MQTT_OPERATION_REFUSED,
+};
+
+struct mqttParsedSubscribe {
+    uint16_t packetId;
+    uint8_t filterCount;
+    uint16_t filterLengths[MQTT_MAX_SUBSCRIPTIONS];
+    char filters[MQTT_MAX_SUBSCRIPTIONS]
+                [MQTT_MAX_TOPIC_FILTER_LENGTH + 1];
+    uint8_t results[MQTT_MAX_SUBSCRIPTIONS];
+};
+
+static bool mqttFilterContainsWildcard(const char *filter, uint16_t length) {
+    for (uint16_t index = 0; index < length; index++) {
+        if (filter[index] == '+' || filter[index] == '#') {
+            return true;
+        }
+    }
+    return false;
+}
+
+static enum mqttOperationParseResult parseMqttSubscribe(
+    const uint8_t *buffer,
+    uint32_t packetEnd,
+    uint32_t offset,
+    struct mqttParsedSubscribe *parsed) {
+    memset(parsed, 0, sizeof(*parsed));
+    if (offset + 2 > packetEnd) {
+        return MQTT_OPERATION_MALFORMED;
+    }
+    parsed->packetId = (buffer[offset] << 8) | buffer[offset + 1];
+    offset += 2;
+    if (parsed->packetId == 0) {
+        return MQTT_OPERATION_MALFORMED;
+    }
+
+    uint16_t totalFilters = 0;
+    while (offset < packetEnd) {
+        if (offset + 2 > packetEnd) {
+            return MQTT_OPERATION_MALFORMED;
+        }
+        uint16_t filterLength =
+            (buffer[offset] << 8) | buffer[offset + 1];
+        offset += 2;
+        if (filterLength == 0 ||
+            filterLength > MQTT_MAX_TOPIC_FILTER_LENGTH ||
+            offset + filterLength + 1 > packetEnd) {
+            return MQTT_OPERATION_MALFORMED;
+        }
+        for (uint16_t index = 0; index < filterLength; index++) {
+            if (buffer[offset + index] == 0) {
+                return MQTT_OPERATION_MALFORMED;
+            }
+        }
+        uint8_t options = buffer[offset + filterLength];
+        uint8_t requestedQos = options & 0x03;
+        if ((options & 0xfc) != 0 || requestedQos > 2) {
+            return MQTT_OPERATION_MALFORMED;
+        }
+        if (totalFilters < MQTT_MAX_SUBSCRIPTIONS) {
+            uint8_t resultIndex = (uint8_t)totalFilters;
+            parsed->filterLengths[resultIndex] = filterLength;
+            memcpy(
+                parsed->filters[resultIndex], buffer + offset,
+                filterLength);
+            parsed->filters[resultIndex][filterLength] = '\0';
+            parsed->results[resultIndex] = mqttFilterContainsWildcard(
+                parsed->filters[resultIndex], filterLength)
+                    ? 0x80
+                    : 0x00;
+        }
+        totalFilters += 1;
+        offset += filterLength + 1;
+    }
+    if (totalFilters == 0) {
+        return MQTT_OPERATION_MALFORMED;
+    }
+    if (totalFilters > MQTT_MAX_SUBSCRIPTIONS) {
+        return MQTT_OPERATION_REFUSED;
+    }
+    parsed->filterCount = (uint8_t)totalFilters;
+    return MQTT_OPERATION_VALID;
+}
+
+static bool mqttSubscriptionEquals(
+    const struct mqttSubscription *subscription,
+    const char *filter,
+    uint16_t length) {
+    return subscription->active && subscription->length == length &&
+           memcmp(subscription->filter, filter, length) == 0;
+}
+
+static bool storeMqttSubscriptions(
+    struct mqttClient *client,
+    const struct mqttParsedSubscribe *parsed) {
+    uint8_t neededSlots = 0;
+    uint8_t freeSlots = 0;
+    for (uint8_t subscriptionIndex = 0;
+         subscriptionIndex < MQTT_MAX_SUBSCRIPTIONS;
+         subscriptionIndex++) {
+        if (!client->subscriptions[subscriptionIndex].active) {
+            freeSlots += 1;
+        }
+    }
+    for (uint8_t filterIndex = 0;
+         filterIndex < parsed->filterCount;
+         filterIndex++) {
+        if (parsed->results[filterIndex] != 0x00) {
+            continue;
+        }
+        bool alreadyStored = false;
+        for (uint8_t subscriptionIndex = 0;
+             subscriptionIndex < MQTT_MAX_SUBSCRIPTIONS;
+             subscriptionIndex++) {
+            if (mqttSubscriptionEquals(
+                    &client->subscriptions[subscriptionIndex],
+                    parsed->filters[filterIndex],
+                    parsed->filterLengths[filterIndex])) {
+                alreadyStored = true;
+                break;
+            }
+        }
+        if (!alreadyStored) {
+            neededSlots += 1;
+        }
+    }
+    if (neededSlots > freeSlots) {
+        return false;
+    }
+
+    for (uint8_t filterIndex = 0;
+         filterIndex < parsed->filterCount;
+         filterIndex++) {
+        if (parsed->results[filterIndex] != 0x00) {
+            continue;
+        }
+        bool alreadyStored = false;
+        for (uint8_t subscriptionIndex = 0;
+             subscriptionIndex < MQTT_MAX_SUBSCRIPTIONS;
+             subscriptionIndex++) {
+            if (mqttSubscriptionEquals(
+                    &client->subscriptions[subscriptionIndex],
+                    parsed->filters[filterIndex],
+                    parsed->filterLengths[filterIndex])) {
+                alreadyStored = true;
+                break;
+            }
+        }
+        if (alreadyStored) {
+            continue;
+        }
+        for (uint8_t subscriptionIndex = 0;
+             subscriptionIndex < MQTT_MAX_SUBSCRIPTIONS;
+             subscriptionIndex++) {
+            struct mqttSubscription *subscription =
+                &client->subscriptions[subscriptionIndex];
+            if (!subscription->active) {
+                subscription->active = true;
+                subscription->length = parsed->filterLengths[filterIndex];
+                memcpy(
+                    subscription->filter,
+                    parsed->filters[filterIndex],
+                    subscription->length + 1);
+                break;
+            }
+        }
+    }
+    return true;
+}
+
+struct mqttParsedUnsubscribe {
+    uint16_t packetId;
+    uint8_t filterCount;
+    uint16_t filterLengths[MQTT_MAX_SUBSCRIPTIONS];
+    char filters[MQTT_MAX_SUBSCRIPTIONS]
+                [MQTT_MAX_TOPIC_FILTER_LENGTH + 1];
+};
+
+static enum mqttOperationParseResult parseMqttUnsubscribe(
+    const uint8_t *buffer,
+    uint32_t packetEnd,
+    uint32_t offset,
+    struct mqttParsedUnsubscribe *parsed) {
+    memset(parsed, 0, sizeof(*parsed));
+    if (offset + 2 > packetEnd) {
+        return MQTT_OPERATION_MALFORMED;
+    }
+    parsed->packetId = (buffer[offset] << 8) | buffer[offset + 1];
+    offset += 2;
+    if (parsed->packetId == 0) {
+        return MQTT_OPERATION_MALFORMED;
+    }
+
+    uint16_t totalFilters = 0;
+    while (offset < packetEnd) {
+        if (offset + 2 > packetEnd) {
+            return MQTT_OPERATION_MALFORMED;
+        }
+        uint16_t filterLength =
+            (buffer[offset] << 8) | buffer[offset + 1];
+        offset += 2;
+        if (filterLength == 0 ||
+            filterLength > MQTT_MAX_TOPIC_FILTER_LENGTH ||
+            offset + filterLength > packetEnd) {
+            return MQTT_OPERATION_MALFORMED;
+        }
+        for (uint16_t index = 0; index < filterLength; index++) {
+            if (buffer[offset + index] == 0) {
+                return MQTT_OPERATION_MALFORMED;
+            }
+        }
+        if (totalFilters < MQTT_MAX_SUBSCRIPTIONS) {
+            uint8_t filterIndex = (uint8_t)totalFilters;
+            parsed->filterLengths[filterIndex] = filterLength;
+            memcpy(
+                parsed->filters[filterIndex], buffer + offset,
+                filterLength);
+            parsed->filters[filterIndex][filterLength] = '\0';
+        }
+        totalFilters += 1;
+        offset += filterLength;
+    }
+    if (totalFilters == 0) {
+        return MQTT_OPERATION_MALFORMED;
+    }
+    if (totalFilters > MQTT_MAX_SUBSCRIPTIONS) {
+        return MQTT_OPERATION_REFUSED;
+    }
+    parsed->filterCount = (uint8_t)totalFilters;
+    return MQTT_OPERATION_VALID;
+}
+
+static void removeMqttSubscriptions(
+    struct mqttClient *client,
+    const struct mqttParsedUnsubscribe *parsed) {
+    for (uint8_t filterIndex = 0;
+         filterIndex < parsed->filterCount;
+         filterIndex++) {
+        for (uint8_t subscriptionIndex = 0;
+             subscriptionIndex < MQTT_MAX_SUBSCRIPTIONS;
+             subscriptionIndex++) {
+            struct mqttSubscription *subscription =
+                &client->subscriptions[subscriptionIndex];
+            if (mqttSubscriptionEquals(
+                    subscription,
+                    parsed->filters[filterIndex],
+                    parsed->filterLengths[filterIndex])) {
+                memset(subscription, 0, sizeof(*subscription));
+            }
+        }
+    }
+}
 #endif
 
 bool readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset,
                  uint8_t firstByte, struct mqttClient* client,
-                 uint8_t *parsedQos, uint16_t *parsedPacketId) {
+                 uint8_t *parsedQos, uint16_t *parsedPacketId,
+                 struct mqttParsedPublishData *parsedData) {
     if (offset + 2 > packetEnd) {
         fprintf(stderr, "PUBLISH packet too short for topic length");
         return false;
@@ -649,6 +913,11 @@ bool readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset,
         fprintf(stderr, "PUBLISH topic exceeds packet bounds");
         return false;
     }
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+    if (topicLen > MQTT_MAX_TOPIC_FILTER_LENGTH) {
+        return false;
+    }
+#endif
 
     char topic[256] = {0};
     memcpy(topic, &buffer[offset], topicLen < 255 ? topicLen : 255);
@@ -702,6 +971,13 @@ bool readPublish(uint8_t* buffer, uint32_t packetEnd, uint32_t offset,
     uint32_t copyLen = payloadLen < sizeof(payload) - 1 ? payloadLen : sizeof(payload) - 1;
     memcpy(payload, &buffer[offset], copyLen);
     payload[copyLen] = '\0';
+    if (parsedData) {
+        memset(parsedData, 0, sizeof(*parsedData));
+        parsedData->topicLength = topicLen;
+        memcpy(parsedData->topic, topic, topicLen + 1);
+        parsedData->payload = buffer + offset;
+        parsedData->payloadLength = payloadLen;
+    }
 
     char msg[256];
     snprintf(msg, sizeof(msg), "%s PUBLISH %.100s %d\n",
@@ -1077,6 +1353,103 @@ void disconnectClient(
     free(client);
 }
 
+#ifdef EVENTHORIZON_JSON_METRIC_EVENTS
+static bool mqttClientHasExactSubscription(
+    const struct mqttClient *client,
+    const char *topic,
+    uint16_t topicLength) {
+    for (uint8_t subscriptionIndex = 0;
+         subscriptionIndex < MQTT_MAX_SUBSCRIPTIONS;
+         subscriptionIndex++) {
+        if (mqttSubscriptionEquals(
+                &client->subscriptions[subscriptionIndex],
+                topic, topicLength)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static size_t encodeMqttQos0Publish(
+    uint8_t *packet,
+    size_t capacity,
+    const struct mqttParsedPublishData *publication) {
+    uint32_t remainingLength =
+        2U + publication->topicLength + publication->payloadLength;
+    uint8_t encodedLength[4];
+    size_t encodedLengthSize = 0;
+    uint32_t remaining = remainingLength;
+    do {
+        uint8_t encodedByte = remaining % 128U;
+        remaining /= 128U;
+        if (remaining > 0) {
+            encodedByte |= 0x80;
+        }
+        encodedLength[encodedLengthSize++] = encodedByte;
+    } while (remaining > 0 && encodedLengthSize < sizeof(encodedLength));
+
+    size_t totalLength = 1 + encodedLengthSize + remainingLength;
+    if (remaining > 0 || totalLength > capacity) {
+        return 0;
+    }
+    size_t offset = 0;
+    packet[offset++] = 0x30;
+    memcpy(packet + offset, encodedLength, encodedLengthSize);
+    offset += encodedLengthSize;
+    packet[offset++] = (uint8_t)(publication->topicLength >> 8);
+    packet[offset++] = (uint8_t)(publication->topicLength & 0xff);
+    memcpy(
+        packet + offset, publication->topic,
+        publication->topicLength);
+    offset += publication->topicLength;
+    memcpy(
+        packet + offset, publication->payload,
+        publication->payloadLength);
+    offset += publication->payloadLength;
+    return offset;
+}
+
+static bool deliverMqttPublication(
+    struct mqttClient *publisher,
+    int epollFd,
+    const struct mqttParsedPublishData *publication) {
+    uint8_t packet[1285];
+    size_t packetLength = encodeMqttQos0Publish(
+        packet, sizeof(packet), publication);
+    if (packetLength == 0) {
+        return true;
+    }
+
+    for (struct mqttClient *target = clients, *next = NULL;
+         target != NULL;
+         target = next) {
+        next = target->hh.next;
+        if (!target->connackSent ||
+            !mqttClientHasExactSubscription(
+                target, publication->topic,
+                publication->topicLength)) {
+            continue;
+        }
+        enum metric_io_reason deliveryFailureReason;
+        enum mqttSendResult deliveryResult = sendMqttActionPacket(
+            target, packet, packetLength,
+            METRIC_MQTT_ACTION_SUBSCRIPTION_PUBLISH_SENT,
+            &deliveryFailureReason);
+        if (deliveryResult == MQTT_SEND_FATAL) {
+            bool publisherFailed = target == publisher;
+            disconnectClient(
+                target, epollFd, mqttNowMs(),
+                METRIC_MQTT_FINALIZATION_WRITE_ERROR,
+                deliveryFailureReason);
+            if (publisherFailed) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+#endif
+
 enum Request determineRequest(uint8_t firstByte) {
     switch (firstByte >> 4)
     {
@@ -1294,6 +1667,9 @@ int main(int argc, char* argv[]) {
                 newClient->qos2PubrelReceived = false;
                 newClient->qos2PacketId = 0;
                 newClient->qos2PacketLength = 0;
+                memset(
+                    newClient->subscriptions, 0,
+                    sizeof(newClient->subscriptions));
                 session_events_make_id(newClient->sessionId, sizeof(newClient->sessionId), "mqtt", newClient->timeOfConnection, newClient->fd);
                 memset(newClient->buffer, 0, sizeof(newClient->buffer)); // Maybe not necessary
                 // ev.events = EPOLLIN | EPOLLET;
@@ -1512,21 +1888,77 @@ int main(int argc, char* argv[]) {
                             break;
                         case SUBSCRIBE:
 #ifdef EVENTHORIZON_JSON_METRIC_EVENTS
-                            if (client->buffer[processedPackets] != 0x82 ||
-                                !readSubscribe(
-                                    client->buffer, packetEnd, packetStart,
-                                    client)) {
+                            if (client->buffer[processedPackets] != 0x82) {
                                 disconnectClient(
                                     client, epollfd, mqttNowMs(),
                                     METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
                                     METRIC_IO_NONE);
-                            } else {
+                                clientDisconnected = true;
+                                break;
+                            }
+                            struct mqttParsedSubscribe parsedSubscribe;
+                            enum mqttOperationParseResult subscribeParseResult =
+                                parseMqttSubscribe(
+                                    client->buffer, packetEnd, packetStart,
+                                    &parsedSubscribe);
+                            if (subscribeParseResult ==
+                                MQTT_OPERATION_MALFORMED) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
+                            }
+                            if (subscribeParseResult ==
+                                    MQTT_OPERATION_REFUSED ||
+                                !storeMqttSubscriptions(
+                                    client, &parsedSubscribe)) {
                                 disconnectClient(
                                     client, epollfd, mqttNowMs(),
                                     METRIC_MQTT_FINALIZATION_OPERATION_REFUSED,
                                     METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
                             }
-                            clientDisconnected = true;
+                            interactionDepthObserveMqttOperation(
+                                &client->interactionDepth);
+                            char subscribeFields[64];
+                            snprintf(
+                                subscribeFields, sizeof(subscribeFields),
+                                "\"filter_count\":%u,\"interaction_depth\":%u",
+                                parsedSubscribe.filterCount,
+                                interactionDepthLevel(
+                                    &client->interactionDepth));
+                            emitMqttAction(
+                                client, "SUBSCRIBE", subscribeFields);
+                            if (mqttMetricEmitterReady) {
+                                (void)metric_event_mqtt_protocol_action(
+                                    METRIC_MQTT_ACTION_SUBSCRIBE_RECEIVED);
+                            }
+                            uint8_t suback[4 + MQTT_MAX_SUBSCRIPTIONS] = {
+                                0x90,
+                                (uint8_t)(2 + parsedSubscribe.filterCount),
+                                (uint8_t)(parsedSubscribe.packetId >> 8),
+                                (uint8_t)(parsedSubscribe.packetId & 0xff),
+                            };
+                            memcpy(
+                                suback + 4, parsedSubscribe.results,
+                                parsedSubscribe.filterCount);
+                            enum metric_io_reason subackFailureReason;
+                            enum mqttSendResult subackResult =
+                                sendMqttActionPacket(
+                                    client, suback,
+                                    4 + parsedSubscribe.filterCount,
+                                    METRIC_MQTT_ACTION_SUBACK_SENT,
+                                    &subackFailureReason);
+                            if (subackResult == MQTT_SEND_FATAL) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_WRITE_ERROR,
+                                    subackFailureReason);
+                                clientDisconnected = true;
+                            }
 #else
                             readSubscribe(client->buffer, packetEnd, packetStart, client);
 #endif
@@ -1623,10 +2055,12 @@ int main(int argc, char* argv[]) {
                                 break;
                             }
                             uint16_t publishPacketId = 0;
+                            struct mqttParsedPublishData parsedPublish;
                             if (!readPublish(
                                     client->buffer, packetEnd, packetStart,
                                     client->buffer[processedPackets], client,
-                                    &publishQos, &publishPacketId)) {
+                                    &publishQos, &publishPacketId,
+                                    &parsedPublish)) {
                                 disconnectClient(
                                     client, epollfd, mqttNowMs(),
                                     METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
@@ -1739,11 +2173,18 @@ int main(int argc, char* argv[]) {
                                     clientDisconnected = true;
                                 }
                             }
+                            if (!clientDisconnected &&
+                                newPublishOperation &&
+                                publishQos < 2 &&
+                                !deliverMqttPublication(
+                                    client, epollfd, &parsedPublish)) {
+                                clientDisconnected = true;
+                            }
 #else
                             (void)readPublish(
                                 client->buffer, packetEnd, packetStart,
                                 client->buffer[processedPackets], client,
-                                NULL, NULL);
+                                NULL, NULL, NULL);
 #endif
                             break;
                         case PUBCOMP:
@@ -1768,21 +2209,73 @@ int main(int argc, char* argv[]) {
                             break;
                         case UNSUBSCRIBE:
 #ifdef EVENTHORIZON_JSON_METRIC_EVENTS
-                            if (client->buffer[processedPackets] != 0xa2 ||
-                                !readUnsubscribe(
-                                    client->buffer, packetEnd, packetStart,
-                                    client)) {
+                            if (client->buffer[processedPackets] != 0xa2) {
                                 disconnectClient(
                                     client, epollfd, mqttNowMs(),
                                     METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
                                     METRIC_IO_NONE);
-                            } else {
+                                clientDisconnected = true;
+                                break;
+                            }
+                            struct mqttParsedUnsubscribe parsedUnsubscribe;
+                            enum mqttOperationParseResult unsubscribeParseResult =
+                                parseMqttUnsubscribe(
+                                    client->buffer, packetEnd, packetStart,
+                                    &parsedUnsubscribe);
+                            if (unsubscribeParseResult ==
+                                MQTT_OPERATION_MALFORMED) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_PROTOCOL_ERROR,
+                                    METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
+                            }
+                            if (unsubscribeParseResult ==
+                                MQTT_OPERATION_REFUSED) {
                                 disconnectClient(
                                     client, epollfd, mqttNowMs(),
                                     METRIC_MQTT_FINALIZATION_OPERATION_REFUSED,
                                     METRIC_IO_NONE);
+                                clientDisconnected = true;
+                                break;
                             }
-                            clientDisconnected = true;
+                            removeMqttSubscriptions(
+                                client, &parsedUnsubscribe);
+                            interactionDepthObserveMqttOperation(
+                                &client->interactionDepth);
+                            char unsubscribeFields[64];
+                            snprintf(
+                                unsubscribeFields,
+                                sizeof(unsubscribeFields),
+                                "\"filter_count\":%u,\"interaction_depth\":%u",
+                                parsedUnsubscribe.filterCount,
+                                interactionDepthLevel(
+                                    &client->interactionDepth));
+                            emitMqttAction(
+                                client, "UNSUBSCRIBE", unsubscribeFields);
+                            if (mqttMetricEmitterReady) {
+                                (void)metric_event_mqtt_protocol_action(
+                                    METRIC_MQTT_ACTION_UNSUBSCRIBE_RECEIVED);
+                            }
+                            uint8_t unsuback[4] = {
+                                0xb0, 0x02,
+                                (uint8_t)(parsedUnsubscribe.packetId >> 8),
+                                (uint8_t)(parsedUnsubscribe.packetId & 0xff),
+                            };
+                            enum metric_io_reason unsubackFailureReason;
+                            enum mqttSendResult unsubackResult =
+                                sendMqttActionPacket(
+                                    client, unsuback, sizeof(unsuback),
+                                    METRIC_MQTT_ACTION_UNSUBACK_SENT,
+                                    &unsubackFailureReason);
+                            if (unsubackResult == MQTT_SEND_FATAL) {
+                                disconnectClient(
+                                    client, epollfd, mqttNowMs(),
+                                    METRIC_MQTT_FINALIZATION_WRITE_ERROR,
+                                    unsubackFailureReason);
+                                clientDisconnected = true;
+                            }
 #else
                             readUnsubscribe(client->buffer, packetEnd, packetStart, client);
 #endif

@@ -908,3 +908,231 @@ func TestMQTTJSONProducerCompletesAcceptedQoS2PUBLISHFlow(t *testing.T) {
 		"depth_level": "2",
 	}, 1)
 }
+
+func TestMQTTJSONProducerAcceptsSUBSCRIBEAndWritesOrderedSUBACK(t *testing.T) {
+	fixture := startMQTTJSONProducerFixture(t)
+	connection := fixture.connect(t)
+	t.Cleanup(func() { _ = connection.Close() })
+
+	connectPacket := []byte{
+		0x10, 0x10,
+		0x00, 0x04, 'M', 'Q', 'T', 'T',
+		0x04, 0x02, 0x00, 0x0a,
+		0x00, 0x04, 'g', 's', 'o', 'c',
+	}
+	if _, err := connection.Write(connectPacket); err != nil {
+		t.Fatalf("write MQTT CONNECT: %v", err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set MQTT SUBSCRIBE response deadline: %v", err)
+	}
+	connack := make([]byte, 4)
+	if _, err := io.ReadFull(connection, connack); err != nil {
+		t.Fatalf("read MQTT CONNACK: %v", err)
+	}
+
+	subscribePacket := []byte{
+		0x82, 0x0e,
+		0x00, 0x07,
+		0x00, 0x01, 'a', 0x01,
+		0x00, 0x05, 'a', '/', '#', '/', 'b', 0x00,
+	}
+	if _, err := connection.Write(subscribePacket); err != nil {
+		t.Fatalf("write MQTT SUBSCRIBE: %v", err)
+	}
+	suback := make([]byte, 6)
+	if _, err := io.ReadFull(connection, suback); err != nil {
+		t.Fatalf("read ordered MQTT SUBACK: %v", err)
+	}
+	wantSuback := []byte{0x90, 0x04, 0x00, 0x07, 0x00, 0x80}
+	if !bytes.Equal(suback, wantSuback) {
+		t.Fatalf("SUBACK = %x, want %x", suback, wantSuback)
+	}
+
+	disconnectPacket := []byte{0xe0, 0x00}
+	if _, err := connection.Write(disconnectPacket); err != nil {
+		t.Fatalf("write MQTT DISCONNECT: %v", err)
+	}
+	if _, err := io.ReadAll(connection); err != nil {
+		t.Fatalf("read SUBSCRIBE fixture finalization: %v", err)
+	}
+
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_protocol_actions_total", map[string]string{
+		"protocol": "mqtt",
+		"action":   "subscribe_received",
+	}, 1)
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_protocol_actions_total", map[string]string{
+		"protocol": "mqtt",
+		"action":   "suback_sent",
+	}, 1)
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_bytes_received_total", map[string]string{
+		"protocol": "mqtt",
+	}, float64(len(connectPacket)+len(subscribePacket)+len(disconnectPacket)))
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_bytes_sent_total", map[string]string{
+		"protocol": "mqtt",
+	}, float64(len(connack)+len(suback)))
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_mqtt_network_connection_finalizations_total", map[string]string{
+		"finalization_reason": "disconnect_received",
+	}, 1)
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_mqtt_network_connection_interaction_depth_total", map[string]string{
+		"depth_level": "2",
+	}, 1)
+}
+
+func TestMQTTJSONProducerAcceptsUNSUBSCRIBEAndWritesUNSUBACK(t *testing.T) {
+	fixture := startMQTTJSONProducerFixture(t)
+	connection := fixture.connect(t)
+	t.Cleanup(func() { _ = connection.Close() })
+
+	connectPacket := []byte{
+		0x10, 0x10,
+		0x00, 0x04, 'M', 'Q', 'T', 'T',
+		0x04, 0x02, 0x00, 0x0a,
+		0x00, 0x04, 'g', 's', 'o', 'c',
+	}
+	if _, err := connection.Write(connectPacket); err != nil {
+		t.Fatalf("write MQTT CONNECT: %v", err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set MQTT subscription response deadline: %v", err)
+	}
+	connack := make([]byte, 4)
+	if _, err := io.ReadFull(connection, connack); err != nil {
+		t.Fatalf("read MQTT CONNACK: %v", err)
+	}
+
+	subscribePacket := []byte{
+		0x82, 0x06,
+		0x00, 0x07,
+		0x00, 0x01, 'a', 0x00,
+	}
+	if _, err := connection.Write(subscribePacket); err != nil {
+		t.Fatalf("write MQTT SUBSCRIBE: %v", err)
+	}
+	suback := make([]byte, 5)
+	if _, err := io.ReadFull(connection, suback); err != nil {
+		t.Fatalf("read MQTT SUBACK: %v", err)
+	}
+
+	unsubscribePacket := []byte{
+		0xa2, 0x05,
+		0x00, 0x08,
+		0x00, 0x01, 'a',
+	}
+	if _, err := connection.Write(unsubscribePacket); err != nil {
+		t.Fatalf("write MQTT UNSUBSCRIBE: %v", err)
+	}
+	unsuback := make([]byte, 4)
+	if _, err := io.ReadFull(connection, unsuback); err != nil {
+		t.Fatalf("read MQTT UNSUBACK: %v", err)
+	}
+	wantUnsuback := []byte{0xb0, 0x02, 0x00, 0x08}
+	if !bytes.Equal(unsuback, wantUnsuback) {
+		t.Fatalf("UNSUBACK = %x, want %x", unsuback, wantUnsuback)
+	}
+
+	disconnectPacket := []byte{0xe0, 0x00}
+	if _, err := connection.Write(disconnectPacket); err != nil {
+		t.Fatalf("write MQTT DISCONNECT: %v", err)
+	}
+	if _, err := io.ReadAll(connection); err != nil {
+		t.Fatalf("read UNSUBSCRIBE fixture finalization: %v", err)
+	}
+
+	for _, action := range []string{
+		"subscribe_received", "suback_sent",
+		"unsubscribe_received", "unsuback_sent",
+	} {
+		assertGatheredValueEventually(t, fixture.registry, "eventhorizon_protocol_actions_total", map[string]string{
+			"protocol": "mqtt",
+			"action":   action,
+		}, 1)
+	}
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_bytes_received_total", map[string]string{
+		"protocol": "mqtt",
+	}, float64(len(connectPacket)+len(subscribePacket)+len(unsubscribePacket)+len(disconnectPacket)))
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_bytes_sent_total", map[string]string{
+		"protocol": "mqtt",
+	}, float64(len(connack)+len(suback)+len(unsuback)))
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_mqtt_network_connection_finalizations_total", map[string]string{
+		"finalization_reason": "disconnect_received",
+	}, 1)
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_mqtt_network_connection_interaction_depth_total", map[string]string{
+		"depth_level": "3",
+	}, 1)
+}
+
+func TestMQTTJSONProducerDeliversToExactActiveSubscription(t *testing.T) {
+	fixture := startMQTTJSONProducerFixture(t)
+	connection := fixture.connect(t)
+	t.Cleanup(func() { _ = connection.Close() })
+
+	connectPacket := []byte{
+		0x10, 0x10,
+		0x00, 0x04, 'M', 'Q', 'T', 'T',
+		0x04, 0x02, 0x00, 0x0a,
+		0x00, 0x04, 'g', 's', 'o', 'c',
+	}
+	if _, err := connection.Write(connectPacket); err != nil {
+		t.Fatalf("write MQTT CONNECT: %v", err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set MQTT delivery response deadline: %v", err)
+	}
+	connack := make([]byte, 4)
+	if _, err := io.ReadFull(connection, connack); err != nil {
+		t.Fatalf("read MQTT CONNACK: %v", err)
+	}
+
+	subscribePacket := []byte{
+		0x82, 0x06,
+		0x00, 0x07,
+		0x00, 0x01, 'a', 0x00,
+	}
+	if _, err := connection.Write(subscribePacket); err != nil {
+		t.Fatalf("write MQTT SUBSCRIBE: %v", err)
+	}
+	suback := make([]byte, 5)
+	if _, err := io.ReadFull(connection, suback); err != nil {
+		t.Fatalf("read MQTT SUBACK: %v", err)
+	}
+
+	publishPacket := []byte{0x30, 0x04, 0x00, 0x01, 'a', 'x'}
+	if _, err := connection.Write(publishPacket); err != nil {
+		t.Fatalf("write matching MQTT PUBLISH: %v", err)
+	}
+	delivery := make([]byte, len(publishPacket))
+	if _, err := io.ReadFull(connection, delivery); err != nil {
+		t.Fatalf("read matching subscription delivery: %v", err)
+	}
+	if !bytes.Equal(delivery, publishPacket) {
+		t.Fatalf("subscription delivery = %x, want QoS 0 %x", delivery, publishPacket)
+	}
+
+	disconnectPacket := []byte{0xe0, 0x00}
+	if _, err := connection.Write(disconnectPacket); err != nil {
+		t.Fatalf("write MQTT DISCONNECT: %v", err)
+	}
+	if _, err := io.ReadAll(connection); err != nil {
+		t.Fatalf("read delivery fixture finalization: %v", err)
+	}
+
+	for _, action := range []string{
+		"subscribe_received", "suback_sent",
+		"publish_received", "subscription_publish_sent",
+	} {
+		assertGatheredValueEventually(t, fixture.registry, "eventhorizon_protocol_actions_total", map[string]string{
+			"protocol": "mqtt",
+			"action":   action,
+		}, 1)
+	}
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_bytes_received_total", map[string]string{
+		"protocol": "mqtt",
+	}, float64(len(connectPacket)+len(subscribePacket)+len(publishPacket)+len(disconnectPacket)))
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_bytes_sent_total", map[string]string{
+		"protocol": "mqtt",
+	}, float64(len(connack)+len(suback)+len(delivery)))
+	assertGatheredValueEventually(t, fixture.registry, "eventhorizon_mqtt_network_connection_interaction_depth_total", map[string]string{
+		"depth_level": "3",
+	}, 1)
+}
