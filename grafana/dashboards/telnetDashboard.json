@@ -20,6 +20,7 @@
   "graphTooltip": 0,
   "links": [],
   "panels": [
+    {"id": 14, "type": "text", "title": "Status of this dashboard", "gridPos": {"h": 4, "w": 24, "x": 0, "y": 0}, "options": {"mode": "markdown", "content": "## Preserved legacy dashboard — not the current Metric view\n\nKept for historical comparison and project continuity. It is **retained deliberately** and is pending a mentor decision on retirement.\n\nSeveral panels query metric families that were **removed** in the Metric MVP cutover and will render permanently empty: `total_trapped_time_ms` (Total wasted time), `tarpitted_clients` (Heatmap, Location). The geographic panels cannot be restored: no metric carries latitude, longitude, or country labels any more, by design.\n\nFor the current, validated view open **EventHorizon - Metrics**. Definitions: `METRICS.md`."}},
     {
       "datasource": {
         "type": "prometheus",
@@ -72,7 +73,7 @@
         "h": 7,
         "w": 10,
         "x": 0,
-        "y": 0
+        "y": 4
       },
       "id": 9,
       "options": {
@@ -147,7 +148,7 @@
         "h": 7,
         "w": 6,
         "x": 10,
-        "y": 0
+        "y": 4
       },
       "id": 7,
       "options": {
@@ -214,7 +215,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 0
+        "y": 4
       },
       "id": 5,
       "options": {
@@ -302,7 +303,7 @@
         "h": 7,
         "w": 16,
         "x": 0,
-        "y": 7
+        "y": 11
       },
       "id": 10,
       "options": {
@@ -373,7 +374,7 @@
         "h": 7,
         "w": 8,
         "x": 16,
-        "y": 7
+        "y": 11
       },
       "id": 6,
       "options": {
@@ -501,7 +502,7 @@
         "h": 10,
         "w": 24,
         "x": 0,
-        "y": 14
+        "y": 18
       },
       "id": 8,
       "options": {
@@ -585,7 +586,7 @@
         "h": 14,
         "w": 12,
         "x": 0,
-        "y": 24
+        "y": 28
       },
       "id": 1,
       "options": {
@@ -892,7 +893,7 @@
         "h": 14,
         "w": 12,
         "x": 12,
-        "y": 24
+        "y": 28
       },
       "id": 11,
       "options": {
@@ -979,7 +980,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 38
+        "y": 42
       },
       "id": 12,
       "options": {
@@ -1053,7 +1054,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 38
+        "y": 42
       },
       "id": 13,
       "options": {
@@ -1094,10 +1095,7 @@
   ],
   "preload": false,
   "schemaVersion": 42,
-  "tags": [
-    "eventhorizon",
-    "legacy"
-  ],
+  "tags": ["eventhorizon", "legacy"],
   "templating": {
     "list": []
   },
@@ -1107,8 +1105,8 @@
   },
   "timepicker": {"hidden": false, "quick_ranges": [{"display": "Last 15 minutes", "from": "now-15m", "to": "now"}, {"display": "Last 1 hour", "from": "now-1h", "to": "now"}, {"display": "Last 6 hours", "from": "now-6h", "to": "now"}, {"display": "Last 24 hours", "from": "now-24h", "to": "now"}, {"display": "Last 3 days", "from": "now-3d", "to": "now"}, {"display": "Last 7 days", "from": "now-7d", "to": "now"}]},
   "timezone": "utc",
-  "title": "Combined dashboard",
+  "title": "[LEGACY - pre-Metric MVP] Combined dashboard",
   "uid": "8b208313-2d3e-4365-bac2-a829beb62169",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }
