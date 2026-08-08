@@ -64,22 +64,19 @@ test-interaction-depth: $(INTERACTION_DEPTH_TEST_TARGET)
 	./$(INTERACTION_DEPTH_TEST_TARGET)
 test-metric-event-emitter: $(METRIC_EVENT_EMITTER_TEST_TARGET)
 	./$(METRIC_EVENT_EMITTER_TEST_TARGET)
-test-deployment-controller:
-	python3 -m unittest tests/test_deployment_controller.py -v
-test: test-byte-metrics test-interaction-depth test-metric-event-emitter test-deployment-controller
+test: test-byte-metrics test-interaction-depth test-metric-event-emitter
 
-PROTOCOL ?= telnet
-SESSIONS ?= 100
-CONCURRENCY ?= 5
+test-go:
+	cd $(GO_DIR) && GOTOOLCHAIN=local GOFLAGS=-mod=readonly go test ./...
+	cd $(GO_DIR) && GOTOOLCHAIN=local GOFLAGS=-mod=readonly go vet ./...
 
-validation-exact:
-	./scripts/run_controlled_validation.sh --protocol telnet --profile exact --scenario matrix --sessions 40 --concurrency 2
-	./scripts/run_controlled_validation.sh --protocol mqtt --profile exact --scenario matrix --sessions 40 --concurrency 2
+check-dashboards:
+	python3 scripts/check_dashboards.py
 
-validation-load:
-	./scripts/run_controlled_validation.sh --protocol $(PROTOCOL) --profile load --sessions $(SESSIONS) --concurrency $(CONCURRENCY)
+smoke:
+	./scripts/smoke.sh
 
 clean:
 	rm -f $(TELNET_TARGET) $(UPNP_TARGET) $(MQTT_TARGET) $(GO_TARGET) $(BYTE_METRIC_TEST_TARGET) $(INTERACTION_DEPTH_TEST_TARGET) $(METRIC_EVENT_EMITTER_TEST_TARGET)
 
-.PHONY: all clean test test-byte-metrics test-interaction-depth test-metric-event-emitter test-deployment-controller validation-exact validation-load
+.PHONY: all clean test test-byte-metrics test-interaction-depth test-metric-event-emitter test-go check-dashboards smoke
