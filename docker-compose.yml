@@ -98,7 +98,7 @@ services:
       - prometheus-exporter
 
   prometheus:
-    image: prom/prometheus
+    image: prom/prometheus:v3.13.2
     container_name: prometheus
     ports:
       - "127.0.0.1:9090:9090"
@@ -113,7 +113,7 @@ services:
       - prometheus-exporter
 
   grafana:
-    image: grafana/grafana-oss:latest
+    image: grafana/grafana-oss:13.0.2
     container_name: grafana
     ports:
       - "127.0.0.1:3000:3000"
