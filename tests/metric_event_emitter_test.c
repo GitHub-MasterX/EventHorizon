@@ -170,6 +170,32 @@ int main(void) {
     assert_datagram(receiver,
         "{\"v\":1,\"protocol\":\"upnp\",\"event\":\"write_error\",\"io_reason\":\"timeout\"}");
 
+    /* SSH: the integrated Endlessh tarpit emits exactly two boundaries. */
+    assert(metric_event_ssh_connection_accepted());
+    assert_datagram(receiver,
+        "{\"v\":1,\"protocol\":\"ssh\",\"event\":\"connection_accepted\"}");
+
+    assert(metric_event_ssh_tracked_client_finalized(
+        METRIC_SSH_OBSERVATION_END_WRITE_FAILED, 40012));
+    assert_datagram(receiver,
+        "{\"v\":1,\"protocol\":\"ssh\",\"event\":\"tracked_client_finalized\","
+        "\"observation_end_reason\":\"write_failed\",\"lifetime_ms\":40012}");
+
+    assert(metric_event_ssh_tracked_client_finalized(
+        METRIC_SSH_OBSERVATION_END_SERVER_SHUTDOWN, 0));
+    assert_datagram(receiver,
+        "{\"v\":1,\"protocol\":\"ssh\",\"event\":\"tracked_client_finalized\","
+        "\"observation_end_reason\":\"server_shutdown\",\"lifetime_ms\":0}");
+
+    assert(!metric_event_ssh_tracked_client_finalized(
+        (enum metric_ssh_observation_end_reason)99, 1));
+    assert_no_datagram(receiver);
+
+    assert(!metric_event_ssh_tracked_client_finalized(
+        METRIC_SSH_OBSERVATION_END_WRITE_FAILED,
+        METRIC_EVENT_MAX_EXACT_INTEGER + 1));
+    assert_no_datagram(receiver);
+
     assert(!metric_event_telnet_connection_finalized(
         (enum metric_telnet_finalization_reason)99,
         1,

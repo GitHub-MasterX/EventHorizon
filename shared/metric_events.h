@@ -72,6 +72,11 @@ enum metric_upnp_description_outcome {
     METRIC_UPNP_DESCRIPTION_TERMINATED,
 };
 
+enum metric_ssh_observation_end_reason {
+    METRIC_SSH_OBSERVATION_END_WRITE_FAILED = 0,
+    METRIC_SSH_OBSERVATION_END_SERVER_SHUTDOWN,
+};
+
 /* Call only after the operation is known to be an unrecoverable I/O failure. */
 enum metric_io_reason metric_io_reason_from_unrecoverable_errno(
     int error_number,
@@ -128,5 +133,10 @@ bool metric_event_upnp_description_response_finalized(
     uint64_t duration_ms,
     uint32_t active_count_after);
 bool metric_event_upnp_write_error(enum metric_io_reason io_reason);
+
+bool metric_event_ssh_connection_accepted(void);
+bool metric_event_ssh_tracked_client_finalized(
+    enum metric_ssh_observation_end_reason observation_end_reason,
+    uint64_t lifetime_ms);
 
 #endif

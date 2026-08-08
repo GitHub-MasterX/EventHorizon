@@ -219,6 +219,17 @@ static const char *upnp_description_outcome_name(
     return NULL;
 }
 
+static const char *ssh_observation_end_reason_name(
+    enum metric_ssh_observation_end_reason observation_end_reason) {
+    switch (observation_end_reason) {
+        case METRIC_SSH_OBSERVATION_END_WRITE_FAILED:
+            return "write_failed";
+        case METRIC_SSH_OBSERVATION_END_SERVER_SHUTDOWN:
+            return "server_shutdown";
+    }
+    return NULL;
+}
+
 static bool send_metric_event(const char *buffer, int encoded_length) {
     if (!buffer || encoded_length < 0 ||
         encoded_length > METRIC_EVENT_DATAGRAM_LIMIT) {
@@ -616,5 +627,31 @@ bool metric_event_upnp_write_error(enum metric_io_reason io_reason) {
         "{\"v\":1,\"protocol\":\"upnp\",\"event\":\"write_error\","
         "\"io_reason\":\"%s\"}",
         io_name);
+    return send_metric_event(buffer, encoded_length);
+}
+
+bool metric_event_ssh_connection_accepted(void) {
+    char buffer[METRIC_EVENT_DATAGRAM_LIMIT + 1];
+    int encoded_length = snprintf(
+        buffer, sizeof(buffer),
+        "{\"v\":1,\"protocol\":\"ssh\",\"event\":\"connection_accepted\"}");
+    return send_metric_event(buffer, encoded_length);
+}
+
+bool metric_event_ssh_tracked_client_finalized(
+    enum metric_ssh_observation_end_reason observation_end_reason,
+    uint64_t lifetime_ms) {
+    const char *reason_name =
+        ssh_observation_end_reason_name(observation_end_reason);
+    if (!reason_name || lifetime_ms > METRIC_EVENT_MAX_EXACT_INTEGER) {
+        return false;
+    }
+
+    char buffer[METRIC_EVENT_DATAGRAM_LIMIT + 1];
+    int encoded_length = snprintf(
+        buffer, sizeof(buffer),
+        "{\"v\":1,\"protocol\":\"ssh\",\"event\":\"tracked_client_finalized\","
+        "\"observation_end_reason\":\"%s\",\"lifetime_ms\":%" PRIu64 "}",
+        reason_name, lifetime_ms);
     return send_metric_event(buffer, encoded_length);
 }
