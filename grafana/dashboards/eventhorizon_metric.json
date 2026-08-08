@@ -3631,7 +3631,7 @@
           },
           "options": {
             "mode": "markdown",
-            "content": "This dashboard is a **supporting operational view**, not the source of truth.\n\n- Exact metric definitions, label schemas, histogram buckets, reconciliation contracts, and what each family does and does not prove: **`METRICS.md`** (repo root).\n- Domain vocabulary, and the terms this dashboard deliberately avoids: **`CONTEXT.md`** (repo root).\n- Deterministic validation results come from the evidence bundles under `validation-output/`, and from `VALIDATION.md` \u2014 not from this page.",
+            "content": "This dashboard is a **supporting operational view**, not the source of truth.\n\n- Exact metric definitions, label schemas, histogram buckets, reconciliation contracts, and what each family does and does not prove: **`METRICS.md`** (repo root).\n- Domain vocabulary, and the terms this dashboard deliberately avoids: **`CONTEXT.md`** (repo root).\n- Deterministic checks live in the repository's unit tests and `scripts/smoke.sh` \u2014 not on this page.",
             "code": {
               "language": "plaintext",
               "showLineNumbers": false,

@@ -12,63 +12,77 @@ This captures the essence of what the framework does: slowing, containing, and o
 
 ---
 
-
-
-## 🚀 How to Run
-
-### 1️⃣ Start all services
-The programs are run using Docker.  
-To start all components, simply run:
+## 🚀 Quick start
 
 ```bash
-docker compose up
+git clone https://github.com/<your-fork>/EventHorizon.git
+cd EventHorizon
+docker compose up -d --build
 ```
 
-## Validation
-
-Use the repository guides according to the task:
-
-- [`DEPLOYMENT.md`](DEPLOYMENT.md) is the canonical supported VPS operator guide,
-  including authorization, stop, recovery, and rollback.
-- [`VALIDATION.md`](VALIDATION.md) defines validation levels, invariants,
-  controlled traffic, evidence interpretation, and later observation stages.
-- [`WALKTHROUGH.md`](WALKTHROUGH.md) contains the Researcher John success and
-  injected-blocker cognitive walkthrough templates.
-
-### Supported exact-commit VPS workflow
-
-The supported deployment topology is one Linux operator workstation with Git,
-GitHub CLI, SSH, Bash-compatible tooling, Python 3.10+, and repository access,
-plus one authorized Linux VPS with Docker Compose. Raspberry Pi remains a
-validated test environment; it is not required for deployment.
-
-First prove that the full trusted-upstream SHA has the required successful push
-workflow:
+Then check that everything works:
 
 ```bash
-DEPLOY_COMMIT=<full-40-character-sha>
-./scripts/vps_field_deploy.sh --check-only --commit "$DEPLOY_COMMIT"
+./scripts/smoke.sh
 ```
 
-Copy `deploy/vps-field.env.example` to the ignored operator configuration,
-populate only its documented keys, and restrict it to the operator:
+The smoke test starts the stack, opens one Telnet connection, and confirms the
+exporter counted it. It prints `SMOKE PASSED` and leaves the stack running.
+
+Stop everything with `docker compose down`.
+
+## What you get
+
+| Service | Address | Purpose |
+| --- | --- | --- |
+| Grafana | http://127.0.0.1:3000 | Dashboards (`EventHorizon Metrics` is the current one) |
+| Prometheus | http://127.0.0.1:9090 | Metric storage |
+| Exporter | http://127.0.0.1:9101/metrics | Raw metrics from the tarpits |
+| Telnet tarpit | port 23 | |
+| MQTT tarpit | port 1883 | |
+| UPnP tarpit | ports 1900 (SSDP), 8080 (HTTP) | |
+| CoAP tarpit | port 5683 | |
+| SSH tarpit | port 22 | vendored `endlessh` |
+
+Ports and per-protocol limits live in [`.env`](.env). The tarpits default to the
+real service ports, because that is where scanners look for them — **if your own
+`sshd` listens on port 22, change `SSH_PORT` before starting the stack.** See
+[`DEPLOYMENT.md`](DEPLOYMENT.md).
+
+## Checking it by hand
+
+The smoke test is just these steps in a loop:
 
 ```bash
-cp deploy/vps-field.env.example deploy/vps-field.env
-chmod 0600 deploy/vps-field.env
+# The exporter is serving metrics
+curl -s http://127.0.0.1:9101/metrics | grep total_connects
+
+# Trap yourself in the Telnet tarpit (Ctrl-C to escape)
+nc 127.0.0.1 23
+
+# The connection was counted
+curl -s http://127.0.0.1:9101/metrics | grep 'total_connects{server="Telnet"}'
+
+# Prometheus and Grafana are healthy
+curl -s http://127.0.0.1:9090/-/healthy
+curl -s http://127.0.0.1:3000/api/health
 ```
 
-After reviewing target authorization and firewall policy, deploy the same SHA
-from an interactive terminal:
+[`METRICS.md`](METRICS.md) documents every metric the exporter publishes.
+
+## Development
 
 ```bash
-./scripts/vps_field_deploy.sh --commit "$DEPLOY_COMMIT" --env-file deploy/vps-field.env
+make all               # build the tarpit binaries and the Go exporter
+make test              # C unit tests
+make test-go           # Go exporter tests and vet
+make check-dashboards  # Grafana panels match the exporter's metric surface
+make smoke             # the smoke test above
 ```
 
-The command performs the documented preflight, exact-source deployment,
-runtime and port checks, deterministic Telnet/MQTT smoke, and final allowlisted
-evidence retrieval. A successful run reports `PASS` with highest proven state
-`ENVIRONMENT_VALIDATED` and leaves the six field services running in restricted
-validation posture. Evidence is retained under
-`validation-output/deployments/<run-id>/`; target values, credentials, raw
-traffic, source addresses, and unrestricted logs are excluded.
+CI runs exactly these checks plus the smoke test.
+
+## Deploying on a server
+
+See [`DEPLOYMENT.md`](DEPLOYMENT.md). EventHorizon is a honeypot: read the
+exposure warning there before putting it on a public IP.
