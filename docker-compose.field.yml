@@ -13,7 +13,6 @@ x-process-healthcheck: &process-healthcheck
 
 services:
   prometheus-exporter:
-    platform: linux/amd64
     restart: unless-stopped
     environment:
       EVENTHORIZON_FIELD_SAFE_MODE: "true"
@@ -25,7 +24,6 @@ services:
       org.eventhorizon.field.role: monitoring
 
   telnet_pit:
-    platform: linux/amd64
     restart: unless-stopped
     cpus: "${FIELD_TARPIT_CPU_LIMIT:-0.50}"
     mem_limit: "${FIELD_TARPIT_MEMORY_LIMIT:-0}"
@@ -42,7 +40,6 @@ services:
       org.eventhorizon.field.protocol: telnet
 
   mqtt_pit:
-    platform: linux/amd64
     restart: unless-stopped
     cpus: "${FIELD_TARPIT_CPU_LIMIT:-0.50}"
     mem_limit: "${FIELD_TARPIT_MEMORY_LIMIT:-0}"
@@ -59,8 +56,6 @@ services:
       org.eventhorizon.field.protocol: mqtt
 
   prometheus:
-    platform: linux/amd64
-    image: prom/prometheus:v3.5.0@sha256:8672a850efe2f9874702406c8318704edb363587f8c2ca88586b4c8fdb5cea24
     restart: unless-stopped
     ports: !override
       - "127.0.0.1:9090:9090"
@@ -70,8 +65,6 @@ services:
       org.eventhorizon.field.role: monitoring
 
   grafana:
-    platform: linux/amd64
-    image: grafana/grafana-oss:12.1.0@sha256:11c2e6c7993917ea89292b942e3428f73907b2809d554154bfb8b4ceb2301cc8
     restart: unless-stopped
     ports: !override
       - "127.0.0.1:3000:3000"
@@ -81,8 +74,7 @@ services:
       org.eventhorizon.field.role: monitoring
 
   cadvisor:
-    platform: linux/amd64
-    image: ghcr.io/google/cadvisor:v0.57.0@sha256:1742bab953d9d9ab166cba24604a9488efdff7d73dc6d18a087c09a1bcd6cb9d
+    image: ghcr.io/google/cadvisor:v0.57.0
     restart: unless-stopped
     ports: !override
       - "127.0.0.1:8081:8080"

@@ -20,7 +20,7 @@
   "graphTooltip": 0,
   "links": [],
   "panels": [
-    {"id": 14, "type": "text", "title": "Status of this dashboard", "gridPos": {"h": 4, "w": 24, "x": 0, "y": 0}, "options": {"mode": "markdown", "content": "## Preserved legacy dashboard — not the current Metric view\n\nKept for historical comparison and project continuity. It is **retained deliberately** and is pending a mentor decision on retirement.\n\nSeveral panels query metric families that were **removed** in the Metric MVP cutover and will render permanently empty: `total_trapped_time_ms` (Total wasted time), `tarpitted_clients` (Heatmap, Location). The geographic panels cannot be restored: no metric carries latitude, longitude, or country labels any more, by design.\n\nFor the current, validated view open **EventHorizon - Metrics**. Definitions: `METRICS.md`."}},
+    {"id": 14, "type": "text", "title": "Status of this dashboard", "gridPos": {"h": 4, "w": 24, "x": 0, "y": 0}, "options": {"mode": "markdown", "content": "## Preserved legacy dashboard — not the current Metric view\n\nKept for historical comparison and project continuity. It is **retained deliberately** and is pending a mentor decision on retirement.\n\nSeveral panels query metric families that were **removed** in the Metric MVP cutover and will render permanently empty: `total_trapped_time_ms` (Total wasted time), `tarpitted_clients` (Heatmap, Location). The geographic panels cannot be restored: no metric carries latitude, longitude, or country labels any more, by design.\n\nFor the current, validated view open **EventHorizon Metrics**. Definitions: `METRICS.md`."}},
     {
       "datasource": {
         "type": "prometheus",
