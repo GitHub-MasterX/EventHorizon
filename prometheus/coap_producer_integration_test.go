@@ -41,7 +41,7 @@ func startCoAPJSONProducerFixtureWithOptions(
 	options coapJSONProducerOptions,
 ) *coapJSONProducerFixture {
 	t.Helper()
-	testDirectory := t.TempDir()
+	testDirectory := shortTempDir(t)
 	binaryPath := filepath.Join(testDirectory, "coap_pit_json_mvp")
 	repositoryRoot, err := filepath.Abs("..")
 	if err != nil {

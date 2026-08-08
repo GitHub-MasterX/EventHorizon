@@ -25,7 +25,7 @@ type telnetJSONProducerFixture struct {
 
 func startTelnetJSONProducerFixture(t *testing.T, delayMilliseconds string) *telnetJSONProducerFixture {
 	t.Helper()
-	testDirectory := t.TempDir()
+	testDirectory := shortTempDir(t)
 	binaryPath := filepath.Join(testDirectory, "telnet_pit_json_mvp")
 	repositoryRoot, err := filepath.Abs("..")
 	if err != nil {

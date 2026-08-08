@@ -2,6 +2,7 @@ package main
 
 import (
 	"net"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -10,6 +11,22 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+// shortTempDir returns a temporary directory whose path is short enough to hold
+// a Unix datagram socket. Linux caps socket paths at 108 bytes; t.TempDir()
+// embeds the test name, which overflows that limit for the longer test names
+// here on Go toolchains that do not truncate the pattern.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	directory, err := os.MkdirTemp("", "eventhorizon")
+	if err != nil {
+		t.Fatalf("create temp directory: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.RemoveAll(directory)
+	})
+	return directory
+}
 
 type gatheredFamilyContract struct {
 	metricType string
@@ -26,7 +43,7 @@ func newMetricEventTestSocket(t *testing.T) metricEventTestSocket {
 	t.Helper()
 	registry := prometheus.NewRegistry()
 	metricState := newMetricEventMetrics(registry)
-	socketPath := filepath.Join(t.TempDir(), "metrics.sock")
+	socketPath := filepath.Join(shortTempDir(t), "metrics.sock")
 
 	server, err := startMetricEventServer(socketPath, metricState)
 	if err != nil {
@@ -55,7 +72,7 @@ func (socket metricEventTestSocket) write(t *testing.T, datagram string) {
 func TestMetricEventSocketAppliesTelnetConnectionAccepted(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	metricState := newMetricEventMetrics(registry)
-	socketPath := filepath.Join(t.TempDir(), "metrics.sock")
+	socketPath := filepath.Join(shortTempDir(t), "metrics.sock")
 
 	server, err := startMetricEventServer(socketPath, metricState)
 	if err != nil {
@@ -94,7 +111,7 @@ func TestMetricEventSocketAppliesTelnetConnectionAccepted(t *testing.T) {
 func TestMetricEventSocketRejectsDuplicateFieldWithoutBusinessMutation(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	metricState := newMetricEventMetrics(registry)
-	socketPath := filepath.Join(t.TempDir(), "metrics.sock")
+	socketPath := filepath.Join(shortTempDir(t), "metrics.sock")
 
 	server, err := startMetricEventServer(socketPath, metricState)
 	if err != nil {
@@ -129,7 +146,7 @@ func TestMetricEventSocketRejectsDuplicateFieldWithoutBusinessMutation(t *testin
 func TestMetricEventSocketRejectsInvalidUTF8BeforeSchemaValidation(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	metricState := newMetricEventMetrics(registry)
-	socketPath := filepath.Join(t.TempDir(), "metrics.sock")
+	socketPath := filepath.Join(shortTempDir(t), "metrics.sock")
 
 	server, err := startMetricEventServer(socketPath, metricState)
 	if err != nil {
@@ -163,7 +180,7 @@ func TestMetricEventSocketRejectsInvalidUTF8BeforeSchemaValidation(t *testing.T)
 func TestMetricEventSocketAppliesTelnetPositiveReadBytes(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	metricState := newMetricEventMetrics(registry)
-	socketPath := filepath.Join(t.TempDir(), "metrics.sock")
+	socketPath := filepath.Join(shortTempDir(t), "metrics.sock")
 
 	server, err := startMetricEventServer(socketPath, metricState)
 	if err != nil {
@@ -197,7 +214,7 @@ func TestMetricEventSocketAppliesTelnetPositiveReadBytes(t *testing.T) {
 func TestMetricEventSocketAppliesTelnetFirstPositiveWrite(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	metricState := newMetricEventMetrics(registry)
-	socketPath := filepath.Join(t.TempDir(), "metrics.sock")
+	socketPath := filepath.Join(shortTempDir(t), "metrics.sock")
 
 	server, err := startMetricEventServer(socketPath, metricState)
 	if err != nil {
@@ -229,7 +246,7 @@ func TestMetricEventSocketAppliesTelnetFirstPositiveWrite(t *testing.T) {
 func TestMetricEventSocketAppliesTelnetSubsequentPositiveWrite(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	metricState := newMetricEventMetrics(registry)
-	socketPath := filepath.Join(t.TempDir(), "metrics.sock")
+	socketPath := filepath.Join(shortTempDir(t), "metrics.sock")
 
 	server, err := startMetricEventServer(socketPath, metricState)
 	if err != nil {
@@ -265,7 +282,7 @@ func TestMetricEventSocketAppliesTelnetSubsequentPositiveWrite(t *testing.T) {
 func TestMetricEventSocketAppliesTelnetFinalization(t *testing.T) {
 	registry := prometheus.NewRegistry()
 	metricState := newMetricEventMetrics(registry)
-	socketPath := filepath.Join(t.TempDir(), "metrics.sock")
+	socketPath := filepath.Join(shortTempDir(t), "metrics.sock")
 
 	server, err := startMetricEventServer(socketPath, metricState)
 	if err != nil {

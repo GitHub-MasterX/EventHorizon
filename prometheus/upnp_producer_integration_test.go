@@ -46,7 +46,7 @@ func startUPnPJSONProducerFixtureWithOptions(
 	options upnpJSONProducerOptions,
 ) *upnpJSONProducerFixture {
 	t.Helper()
-	testDirectory := t.TempDir()
+	testDirectory := shortTempDir(t)
 	binaryPath := filepath.Join(testDirectory, "upnp_pit_json_mvp")
 	repositoryRoot, err := filepath.Abs("..")
 	if err != nil {
