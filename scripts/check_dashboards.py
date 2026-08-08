@@ -38,6 +38,7 @@ LIVE = {
     "eventhorizon_session_interaction_depth_total",
     "eventhorizon_telnet_first_write_delay_ms",
     "eventhorizon_telnet_inter_write_interval_ms",
+    "eventhorizon_ssh_tracked_client_lifetime_ms",
     "eventhorizon_mqtt_network_connection_finalizations_total",
     "eventhorizon_mqtt_network_connection_duration_ms",
     "eventhorizon_mqtt_network_connection_interaction_depth_total",
@@ -57,7 +58,7 @@ IO_REASONS = {"timeout", "reset", "closed", "other"}
 DEPTH = {"0", "1", "2", "3"}
 
 LABELS: dict[str, dict[str, set[str]]] = {
-    "total_connects": {"server": {"Telnet", "MQTT"}},
+    "total_connects": {"server": {"Telnet", "MQTT", "SSH"}},
     "current_connected_clients": {"server": {"Telnet", "MQTT"}},
     "eventhorizon_protocol_actions_total": {
         "protocol": {"upnp", "coap", "mqtt"},

@@ -64,6 +64,8 @@ const (
 	metricEventMutationUPnPDescriptionResponseStarted
 	metricEventMutationUPnPDescriptionResponseFinalized
 	metricEventMutationUPnPWriteError
+	metricEventMutationSSHConnectionAccepted
+	metricEventMutationSSHTrackedClientFinalized
 )
 
 type telnetFinalizationReason uint8
@@ -168,9 +170,22 @@ const (
 	upnpDescriptionOutcomeTerminated
 )
 
+type sshObservationEndReason uint8
+
+const (
+	sshObservationEndReasonInvalid sshObservationEndReason = iota
+	sshObservationEndReasonWriteFailed
+	sshObservationEndReasonServerShutdown
+)
+
 var upnpDescriptionOutcomes = [...]upnpDescriptionOutcome{
 	upnpDescriptionOutcomeCompleted,
 	upnpDescriptionOutcomeTerminated,
+}
+
+var sshObservationEndReasons = [...]sshObservationEndReason{
+	sshObservationEndReasonWriteFailed,
+	sshObservationEndReasonServerShutdown,
 }
 
 type protocolAction uint8
@@ -253,6 +268,7 @@ type metricEventMutation struct {
 	coapRequestOutcome        coapRequestOutcome
 	coapCONOutcome            coapCONOutcome
 	upnpDescriptionOutcome    upnpDescriptionOutcome
+	sshObservationEndReason   sshObservationEndReason
 }
 
 type metricEventMetrics struct {
@@ -281,13 +297,14 @@ type metricEventMetrics struct {
 	upnpDescriptionDuration   *prometheus.HistogramVec
 	telnetFirstWriteDelay     prometheus.Histogram
 	telnetInterWriteInterval  prometheus.Histogram
+	sshTrackedClientLifetime  *prometheus.HistogramVec
 }
 
 func newMetricEventMetrics(registerer prometheus.Registerer) *metricEventMetrics {
 	metricState := &metricEventMetrics{
 		totalConnects: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "total_connects",
-			Help: "Total accepted TCP connections tracked by the EventHorizon Telnet and MQTT servers.",
+			Help: "Total accepted TCP connections tracked by the EventHorizon Telnet and MQTT tarpits and by the integrated Endlessh SSH tarpit.",
 		}, []string{"server"}),
 		activeClients: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "current_connected_clients",
@@ -380,6 +397,11 @@ func newMetricEventMetrics(registerer prometheus.Registerer) *metricEventMetrics
 			Help:    "Duration in milliseconds from accepted Telnet TCP connection to its first positive server write.",
 			Buckets: []float64{10, 25, 50, 75, 100, 125, 150, 200, 250, 500, 1000, 2500, 5000, 10000},
 		}),
+		sshTrackedClientLifetime: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "eventhorizon_ssh_tracked_client_lifetime_ms",
+			Help:    "Observed lifetime in milliseconds of an Endlessh-tracked SSH client, from accepted TCP connection until removal from the tracked-client set.",
+			Buckets: []float64{1000, 5000, 10000, 20000, 30000, 60000, 120000, 300000, 600000, 1800000, 3600000, 21600000, 86400000, 604800000},
+		}, []string{"observation_end_reason"}),
 		telnetInterWriteInterval: prometheus.NewHistogram(prometheus.HistogramOpts{
 			Name:    "eventhorizon_telnet_inter_write_interval_ms",
 			Help:    "Duration in milliseconds between consecutive positive server writes on a tracked Telnet session.",
@@ -391,6 +413,7 @@ func newMetricEventMetrics(registerer prometheus.Registerer) *metricEventMetrics
 		metricState.totalConnects.WithLabelValues(server).Add(0)
 		metricState.activeClients.WithLabelValues(server).Set(0)
 	}
+	metricState.totalConnects.WithLabelValues("SSH").Add(0)
 	for _, protocol := range []string{"telnet", "mqtt"} {
 		metricState.bytesReceived.WithLabelValues(protocol).Add(0)
 		metricState.bytesSent.WithLabelValues(protocol).Add(0)
@@ -433,6 +456,9 @@ func newMetricEventMetrics(registerer prometheus.Registerer) *metricEventMetrics
 	for _, outcome := range upnpDescriptionOutcomes {
 		metricState.upnpDescriptionDuration.WithLabelValues(outcome.label())
 	}
+	for _, reason := range sshObservationEndReasons {
+		metricState.sshTrackedClientLifetime.WithLabelValues(reason.label())
+	}
 	for _, reason := range malformedReasons {
 		metricState.exporterMalformedMessages.WithLabelValues(string(reason)).Add(0)
 	}
@@ -461,6 +487,7 @@ func newMetricEventMetrics(registerer prometheus.Registerer) *metricEventMetrics
 		metricState.upnpDescriptionDuration,
 		metricState.telnetFirstWriteDelay,
 		metricState.telnetInterWriteInterval,
+		metricState.sshTrackedClientLifetime,
 	)
 	return metricState
 }
@@ -582,6 +609,10 @@ func (metricState *metricEventMetrics) applyMetricEvent(
 		metricState.upnpActiveDescriptions.Set(float64(mutation.activeCountAfter))
 	case metricEventMutationUPnPWriteError:
 		metricState.writeErrors.WithLabelValues("upnp", mutation.ioReason.label()).Inc()
+	case metricEventMutationSSHConnectionAccepted:
+		metricState.totalConnects.WithLabelValues("SSH").Inc()
+	case metricEventMutationSSHTrackedClientFinalized:
+		metricState.sshTrackedClientLifetime.WithLabelValues(mutation.sshObservationEndReason.label()).Observe(float64(mutation.durationMS))
 	}
 }
 
@@ -685,6 +716,8 @@ func decodeMetricEvent(datagram []byte) (metricEventMutation, malformedReason) {
 		return decodeCoAPMetricEvent(fields, event)
 	case "upnp":
 		return decodeUPnPMetricEvent(fields, event)
+	case "ssh":
+		return decodeSSHMetricEvent(fields, event)
 	default:
 		return metricEventMutation{}, malformedUnsupportedEvent
 	}
@@ -992,6 +1025,38 @@ func decodeCoAPMetricEvent(
 	}
 }
 
+func decodeSSHMetricEvent(
+	fields map[string]json.RawMessage,
+	event string,
+) (metricEventMutation, malformedReason) {
+	switch event {
+	case "connection_accepted":
+		if reason := validateExactFields(fields); reason != "" {
+			return metricEventMutation{}, reason
+		}
+		return metricEventMutation{kind: metricEventMutationSSHConnectionAccepted}, ""
+	case "tracked_client_finalized":
+		if reason := validateExactFields(fields, "observation_end_reason", "lifetime_ms"); reason != "" {
+			return metricEventMutation{}, reason
+		}
+		lifetime, lifetimeOK := parseMetricUint(fields["lifetime_ms"], 0, maxMetricEventInteger)
+		if !lifetimeOK {
+			return metricEventMutation{}, malformedInvalidNumber
+		}
+		reason, ok := parseSSHObservationEndReason(fields["observation_end_reason"])
+		if !ok {
+			return metricEventMutation{}, malformedUnsupportedEvent
+		}
+		return metricEventMutation{
+			kind:                    metricEventMutationSSHTrackedClientFinalized,
+			durationMS:              lifetime,
+			sshObservationEndReason: reason,
+		}, ""
+	default:
+		return metricEventMutation{}, malformedUnsupportedEvent
+	}
+}
+
 func decodeUPnPMetricEvent(
 	fields map[string]json.RawMessage,
 	event string,
@@ -1108,7 +1173,7 @@ func decodeTopLevelObject(datagram []byte) (map[string]json.RawMessage, error) {
 
 func supportedMetricProtocol(protocol string) bool {
 	switch protocol {
-	case "upnp", "coap", "telnet", "mqtt":
+	case "upnp", "coap", "telnet", "mqtt", "ssh":
 		return true
 	default:
 		return false
@@ -1499,6 +1564,32 @@ func parseUPnPDescriptionOutcome(raw json.RawMessage) (upnpDescriptionOutcome, b
 		return upnpDescriptionOutcomeTerminated, true
 	default:
 		return upnpDescriptionOutcomeInvalid, false
+	}
+}
+
+func parseSSHObservationEndReason(raw json.RawMessage) (sshObservationEndReason, bool) {
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return sshObservationEndReasonInvalid, false
+	}
+	switch value {
+	case "write_failed":
+		return sshObservationEndReasonWriteFailed, true
+	case "server_shutdown":
+		return sshObservationEndReasonServerShutdown, true
+	default:
+		return sshObservationEndReasonInvalid, false
+	}
+}
+
+func (reason sshObservationEndReason) label() string {
+	switch reason {
+	case sshObservationEndReasonWriteFailed:
+		return "write_failed"
+	case sshObservationEndReasonServerShutdown:
+		return "server_shutdown"
+	default:
+		panic("invalid SSH observation end reason")
 	}
 }
 

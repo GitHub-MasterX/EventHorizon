@@ -91,8 +91,8 @@ services:
       dockerfile: ./endlessh/Dockerfile
     ports:
       - "${SSH_PORT}:${SSH_PORT}"
-    # volumes:
-      # - tarpit-sock:/tmp  # Share socket with prometheus-exporter
+    volumes:
+      - tarpit-sock:/tmp  # Share socket with prometheus-exporter
     command: ["-${SSH_BIND_FAMILY}", "-d ${SSH_DELAY}", "-l ${SSH_MAX_LINE_LENGTH}", "-m ${SSH_MAX_CLIENTS}", "-p ${SSH_PORT}", "-v"]
     depends_on:
       - prometheus-exporter

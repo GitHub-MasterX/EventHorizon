@@ -671,7 +671,12 @@ func TestMetricEventMetricSurfaceIsFrozen(t *testing.T) {
 	expected := map[string]gatheredFamilyContract{
 		"total_connects": {
 			metricType: "COUNTER",
-			help:       "Total accepted TCP connections tracked by the EventHorizon Telnet and MQTT servers.",
+			help:       "Total accepted TCP connections tracked by the EventHorizon Telnet and MQTT tarpits and by the integrated Endlessh SSH tarpit.",
+			series:     3,
+		},
+		"eventhorizon_ssh_tracked_client_lifetime_ms": {
+			metricType: "HISTOGRAM",
+			help:       "Observed lifetime in milliseconds of an Endlessh-tracked SSH client, from accepted TCP connection until removal from the tracked-client set.",
 			series:     2,
 		},
 		"current_connected_clients": {
@@ -830,7 +835,7 @@ func TestMetricEventMetricSurfaceIsFrozen(t *testing.T) {
 	allowedLabels := map[string]struct{}{
 		"server": {}, "reason": {}, "protocol": {}, "action": {},
 		"disconnect_reason": {}, "depth_level": {}, "finalization_reason": {},
-		"outcome": {},
+		"outcome": {}, "observation_end_reason": {},
 	}
 	for _, family := range families {
 		for _, metric := range family.Metric {
@@ -916,8 +921,11 @@ func TestMetricEventMetricLabelsAreFrozen(t *testing.T) {
 	newMetricEventMetrics(registry)
 
 	expected := map[string][]string{
-		"total_connects":            {"server=MQTT", "server=Telnet"},
+		"total_connects":            {"server=MQTT", "server=SSH", "server=Telnet"},
 		"current_connected_clients": {"server=MQTT", "server=Telnet"},
+		"eventhorizon_ssh_tracked_client_lifetime_ms": {
+			"observation_end_reason=server_shutdown", "observation_end_reason=write_failed",
+		},
 		"eventhorizon_exporter_malformed_messages_total": {
 			"reason=empty_message", "reason=invalid_number", "reason=missing_fields",
 			"reason=unknown_format", "reason=unknown_server", "reason=unsupported_event",
