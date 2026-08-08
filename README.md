@@ -15,7 +15,7 @@ This captures the essence of what the framework does: slowing, containing, and o
 ## 🚀 Quick start
 
 ```bash
-git clone https://github.com/<your-fork>/EventHorizon.git
+git clone https://github.com/honeynet/EventHorizon.git
 cd EventHorizon
 docker compose up -d --build
 ```
@@ -26,8 +26,7 @@ Then check that everything works:
 ./scripts/smoke.sh
 ```
 
-The smoke test starts the stack, opens one Telnet connection, and confirms the
-exporter counted it. It prints `SMOKE PASSED` and leaves the stack running.
+The smoke test starts the stack, opens one Telnet connection, and confirms the exporter counted it. It prints `SMOKE PASSED` and leaves the stack running.
 
 Stop everything with `docker compose down`.
 
@@ -35,7 +34,7 @@ Stop everything with `docker compose down`.
 
 | Service | Address | Purpose |
 | --- | --- | --- |
-| Grafana | http://127.0.0.1:3000 | Dashboards (`EventHorizon Metrics` is the current one) |
+| Grafana | http://127.0.0.1:3000 | Dashboards |
 | Prometheus | http://127.0.0.1:9090 | Metric storage |
 | Exporter | http://127.0.0.1:9101/metrics | Raw metrics from the tarpits |
 | Telnet tarpit | port 23 | |
@@ -44,10 +43,19 @@ Stop everything with `docker compose down`.
 | CoAP tarpit | port 5683 | |
 | SSH tarpit | port 22 | vendored `endlessh` |
 
-Ports and per-protocol limits live in [`.env`](.env). The tarpits default to the
-real service ports, because that is where scanners look for them — **if your own
-`sshd` listens on port 22, change `SSH_PORT` before starting the stack.** See
-[`DEPLOYMENT.md`](DEPLOYMENT.md).
+Ports and per-protocol limits live in [`.env`](.env). The tarpits default to the real service ports, because that is where scanners look for them. 
+
+**Note**: if your own `sshd` listens on port 22, change `SSH_PORT` before starting the stack. See [`DEPLOYMENT.md`](DEPLOYMENT.md).
+
+## Dashboards
+
+| Dashboard | Role |
+| --- | --- |
+| **EventHorizon Metrics** | **Primary.** Current operational view: per-protocol lifecycle, durations, interaction depth |
+| EventHorizon - Reliability, Cost & Experiment | Optional supporting view: telemetry health, defender cost (needs the cAdvisor overlay), future experiment evidence |
+| `[SUPERSEDED …]` / `[LEGACY …]` | Retained dashboards for reference. They query metric families the exporter no longer publishes |
+
+Lifecycle accounting lives only in the primary dashboard. It is deliberately not duplicated into the supporting one, where mixing Telnet-only and MQTT metric families produced a permanent phantom gap.
 
 ## Checking it by hand
 
